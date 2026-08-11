@@ -1,0 +1,33 @@
+{
+	"name": "@earendil-works/pi-harness-runtime",
+	"version": "0.84.1",
+	"description": "Typed Harness session runtime and memory repository",
+	"type": "module",
+	"main": "./dist/index.js",
+	"types": "./dist/index.d.ts",
+	"exports": {
+		".": {
+			"types": "./dist/index.d.ts",
+			"import": "./dist/index.js"
+		}
+	},
+	"files": ["dist"],
+	"scripts": {
+		"clean": "shx rm -rf dist",
+		"build": "tsgo -p tsconfig.build.json",
+		"test": "vitest --run",
+		"prepublishOnly": "npm run build"
+	},
+	"dependencies": {
+		"@earendil-works/pi-ai": "^0.84.1",
+		"@earendil-works/pi-session-storage": "^0.84.1"
+	},
+	"devDependencies": {
+		"shx": "0.4.0",
+		"vitest": "4.1.9"
+	},
+	"engines": {
+		"node": ">=22.19.0"
+	},
+	"license": "MIT"
+}

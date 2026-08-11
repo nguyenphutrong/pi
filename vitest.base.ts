@@ -10,6 +10,7 @@ export const workspaceSourcePaths = {
 	aiProviders: fileURLToPath(new URL("./packages/ai/src/providers", import.meta.url)),
 	sessionStorageIndex: fileURLToPath(new URL("./packages/session-storage/src/index.ts", import.meta.url)),
 	sessionStorageTesting: fileURLToPath(new URL("./packages/session-storage/src/testing/index.ts", import.meta.url)),
+	harnessRuntimeIndex: fileURLToPath(new URL("./packages/harness-runtime/src/index.ts", import.meta.url)),
 	agentIndex: fileURLToPath(new URL("./packages/agent/src/index.ts", import.meta.url)),
 	codingAgentIndex: fileURLToPath(new URL("./packages/coding-agent/src/index.ts", import.meta.url)),
 	tuiIndex: fileURLToPath(new URL("./packages/tui/src/index.ts", import.meta.url)),
@@ -25,6 +26,7 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-ai\/oauth$/, replacement: workspaceSourcePaths.aiOAuth },
 			{ find: /^@earendil-works\/pi-session-storage$/, replacement: workspaceSourcePaths.sessionStorageIndex },
 			{ find: /^@earendil-works\/pi-session-storage\/testing$/, replacement: workspaceSourcePaths.sessionStorageTesting },
+			{ find: /^@earendil-works\/pi-harness-runtime$/, replacement: workspaceSourcePaths.harnessRuntimeIndex },
 			{
 				find: /^@earendil-works\/pi-ai\/providers\/(.+)$/,
 				replacement: `${workspaceSourcePaths.aiProviders}/$1.ts`,
