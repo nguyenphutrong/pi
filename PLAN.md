@@ -3,14 +3,14 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.5 — Implement the Phase 1 Harness runtime shell and pure next-action planner
-- Status: 1.4 design approved; B-004 resolved; implementation pending
+- Work item: 1.6 — Implement the pure next-action planner and stable one-step manual scheduler
+- Status: 1.5 durable codecs, bounded restore, and internal runtime attachment committed as `3dbf5d7c0`; independent conformance review PASS
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement canonical Phase 1 register codecs, the internal Session runtime port/mutation line, configuration seeding, and exclusive runtime attachment.
-2. Implement bounded restore, the pure next-action planner, and stable one-step manual scheduling with no provider effects.
+1. Implement the pure next-action planner over the detached runtime attachment and immutable live-effect keys.
+2. Add stable `peekAction()` and one-step `executeAction()` scheduling with no provider effects.
 3. Add Tier A planner/recovery and transition-writer tests for every Phase 1 state and crash boundary owned by the shell.
 4. Add the upstream-mergeable `Models.lease` API, then implement no-tool prompt/provider/final-response intent, settlement, and terminal cleanup.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.

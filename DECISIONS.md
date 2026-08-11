@@ -192,7 +192,7 @@ Assistant intent durably reserves a response entry ID and a usage-row ID. Recove
 
 - Date: 2026-08-11
 - Phase: 1
-- Status: accepted after design and independent architecture review
+- Status: implemented by `3dbf5d7c0` after independent conformance review
 - References: mission §§0–2; `packages/agent/docs/harness-v3.md` §§2.3, 2.8, 3.1–3.7, 4.1–4.5, 5.1–5.2, 8–9; D-004–D-009
 
 ### Options

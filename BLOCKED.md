@@ -1,5 +1,9 @@
 # Harness Rewrite Blockers
 
+## Current status
+
+No active blockers as of Phase 1 work item 1.5 (`3dbf5d7c0`).
+
 ## Resolved B-004 — Restore cannot validate a reserved usage ID with the current Storage contract
 
 - Date: 2026-08-11
