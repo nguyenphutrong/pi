@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.9 — Dispatch the retained assistant provider lease without a registry reread
-- Status: 1.8 completed by `32ef80020` and `2eca9c11f`; design the provider execution boundary
+- Status: D-014 approved; implement separate provider dispatch and await actions, stopping before durable settlement
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue

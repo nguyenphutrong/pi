@@ -303,3 +303,34 @@ Identity preflight is not retained as the later request lease. Increment 1.8b sn
 After a successful intent commit, the shell synchronously retains the complete process-local assistant plan under `assistant:{operationId}:{stepId}:{attempt}`. The plan contains the exact lease, projected request context, effective options, and durable correlation ids. It is never persisted or exported, and future dispatch must use it without rereading the provider registry. A failed commit installs no live key. Reopen has the durable pending intent but no process-local plan, so the pure planner selects uncertain-effect recovery rather than claiming that dispatch never started.
 
 Every newly minted id is checked pairwise and through exact entry, usage-row, and relevant operation-register lookups before commit; backend uniqueness remains the final atomic guard. No provider request, auth resolution, hook, public Harness API, Storage contract, history scan, or record/reducer compatibility path is added by this work item. Provider dispatch and atomic response/usage settlement remain later increments.
+
+## D-014 — Separate assistant dispatch, await, and settlement boundaries
+
+- Date: 2026-08-11
+- Phase: 1
+- Status: accepted after design and independent architecture review
+- References: D-010–D-013; `packages/agent/docs/harness-v3.md` §§3.7, 4.1–4.8, 5.2, 9.3
+
+### Options
+
+1. Track one discriminated process-local assistant effect as `planned`, `running`, or `settled`, with separate dispatch, await, and settlement actions.
+2. Keep separate planned, running, and settled maps.
+3. Let one existing await action both dispatch and wait for the provider result.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The three local states match the interpreter boundaries without adding durable state. A pending durable intent with an exact local `planned` value exposes `dispatch_assistant_effect`; `running` exposes `await_assistant_effect`; `settled` exposes a parked `settle_assistant_effect`; an absent exact key exposes uncertain recovery. Matching materialized reservations retain precedence over every local state. The pure planner receives only each key's status, never leases, promises, controllers, contexts, options, or messages.
+
+Dispatch publishes a harness-owned controller in the running state before synchronously invoking the exact retained `lease.streamSimple(context, {...options, signal})`. It installs fulfillment and rejection observation in the same turn and returns without awaiting. Await waits only that observed promise, validates and detaches the terminal assistant message, then replaces running with settled without a storage write. Provider `error` and `aborted` terminal messages remain valid in-band outputs; durable settlement is a later transition.
+
+No provider registry, current model lookup, credential helper, or auth surface is consulted after the lease captured in 1.8b. The retained context is passed by identity, retained options remain unmodified, and the harness adds only its own signal at dispatch.
+
+Close seals new admission, notifies parked await work, and aborts running controllers immediately. It drains already-admitted scheduler work, aborts again to cover a delayed admitted dispatch, clears every local assistant state, and closes Session without writing. The serialized provider-start check is later than shell action admission: close that wins it prevents the provider call and rejects the dispatch as closed; provider start that wins may run once and is then signalled. Close never waits for provider cooperation, so a provider that ignores abort cannot deadlock Session closure.
+
+A synchronous stream throw, rejected result promise, malformed terminal message, or pending terminal message violates the `pi-ai` stream contract. It removes the local proof, faults and seals the current shell, aborts other effects, preserves the durable `effect_pending` prefix, and rejects pending/future local calls. The same handle must not execute recovery after an invariant fault; only close/reopen may observe the absent key and apply uncertain-effect policy.
+
+Work item 1.9 stops at the process-local settled state. `settle_assistant_effect` remains stable and write-free but unavailable until the response/usage/classification transaction lands. No public API, Storage schema, provider adapter, event/hook surface, or completion promise changes.
