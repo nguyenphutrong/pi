@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.6 — Implement the pure next-action planner and stable one-step manual scheduler
-- Status: 1.5 durable codecs, bounded restore, and internal runtime attachment committed as `3dbf5d7c0`; independent conformance review PASS
+- Status: D-011 planner/manual-scheduler design approved; implementation pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
