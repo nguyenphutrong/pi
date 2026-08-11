@@ -145,3 +145,24 @@ Option 1.
 ### Rationale
 
 The state token exposes only handle creation, and native privacy prevents JavaScript callers from bypassing a closed handle to commit or read through its core. It is the smallest implementation that preserves the repository-owned state and disposable-handle design.
+
+## D-008 — Let Storage validate exact-ID lists before Session reads
+
+- Date: 2026-08-11
+- Phase: 1
+- Status: confirmed by human after B-003 escalation
+- References: D-004–D-006; `packages/agent/docs/harness-v3.md` §§1.5, 2.8
+
+### Options
+
+1. Pass exact-ID lists directly to `Storage.getEntries()`, whose contract validates and does not mutate them.
+2. Duplicate the exact-list validator in Session before cloning.
+3. Allow malformed non-cloneable lists to surface as generic storage errors.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Structural query validation has one authority. Session maps Storage's typed `invalid_query` result while retaining ownership of entry payload decoding; no pre-validation clone can change error classification or bypass the shared backend contract.

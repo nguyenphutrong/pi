@@ -1,12 +1,13 @@
 # Harness Rewrite Blockers
 
-## B-003 — Exact-ID query validation runs after an unsafe clone
+## Resolved B-003 — Exact-ID query validation runs after an unsafe clone
 
 - Date: 2026-08-11
+- Resolved: 2026-08-11 — human selected option 1; recorded in D-008 and implemented by `c4506dbd5`
 - Phase: 1
 - Work item: 1.3, increment B — typed Memory Session/repository
 - Trigger: two independent review rejections for the same runtime input-validation reason
-- Status: awaiting human choice
+- Status: resolved; storage tests 30/30, Session tests 26/26, `npm run check` PASS, independent review PASS
 
 ### Context
 

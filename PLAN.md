@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.3 — Implement the Memory-only Session tree/repository and typed codec boundary
-- Status: blocked by B-003 after two Session input-validation review rejections
+- Work item: 1.4 — Design the Phase 1 Harness runtime shell and pure next-action planner
+- Status: Session/repository prerequisite complete; runtime-shell design pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement `harness-runtime` with a Memory-only Session repository, one `main` lane, and typed built-in-message codecs.
-2. Add Session/repository tests for atomic initialization, context projection, active-handle exclusion, and close/reopen.
-3. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
+1. Design and independently approve the Phase 1 Harness runtime shell, total register schemas, and pure next-action planner.
+2. Implement the runtime shell, lane mutation line, manual scheduler, restore validation, and no-effect parked state.
+3. Add Tier A planner/recovery tests for every Phase 1 state and deterministic next actions.
 4. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
