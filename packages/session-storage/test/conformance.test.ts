@@ -1,9 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import {
 	assertEntry,
 	assertRegister,
 	assertUsageRow,
+	createIdGenerator,
 	MemoryStorage,
+	MemoryStorageState,
 	StorageError,
 	type Transaction,
 } from "../src/index.ts";
@@ -188,5 +190,110 @@ describe("MemoryStorage conformance", () => {
 		await expect(storage.commit(duplicate)).rejects.toEqual(expect.any(StorageError));
 		expect(storage.attempts.at(-1)?.status).toBe("rejected");
 		expect(storage.committedTransactions).toEqual([duplicate]);
+	});
+});
+
+describe("MemoryStorage shared state", () => {
+	it("exposes only the storage factory", () => {
+		expectTypeOf<keyof MemoryStorageState>().toEqualTypeOf<"createStorage">();
+	});
+
+	it("keeps the shared core private on storage handles", () => {
+		const storage = new MemoryStorageState().createStorage();
+		expect(Object.hasOwn(storage, "core")).toBe(false);
+		expect("core" in storage).toBe(false);
+		expect(storage.commit).toEqual(expect.any(Function));
+		expect(storage.close).toEqual(expect.any(Function));
+	});
+
+	it("reopens committed entries, registers, usage stats, and sequence allocation", async () => {
+		const state = new MemoryStorageState();
+		const storageA = state.createStorage();
+		const ids = createIdGenerator();
+		const entryId = ids.next();
+		const usageId = ids.next();
+		const usage = {
+			input: 1,
+			output: 2,
+			cacheRead: 3,
+			cacheWrite: 4,
+			cacheWrite1h: 5,
+			reasoning: 6,
+			totalTokens: 7,
+			cost: { input: 1, output: 2, cacheRead: 3, cacheWrite: 4, total: 5 },
+		};
+
+		const first = await storageA.commit({
+			writes: [
+				{ kind: "entry", entry: { id: entryId, parentId: null, type: "message", payload: { text: "persisted" } } },
+				{ kind: "register", op: "set", namespace: "facts", key: "name", value: "session" },
+				{ kind: "usage", row: { id: usageId, entryId, adjustment: false, usage } },
+			],
+		});
+		const entries = await storageA.scanEntries();
+		const registers = await storageA.listRegisters("facts");
+		const stats = await storageA.getStats();
+		await storageA.close();
+
+		const storageB = state.createStorage();
+		expect(await storageB.scanEntries()).toEqual(entries);
+		expect(await storageB.listRegisters("facts")).toEqual(registers);
+		expect(await storageB.getStats()).toEqual(stats);
+		expect(first.seqs).toEqual([1, 2, 3]);
+
+		await expect(
+			storageB.commit({
+				writes: [
+					{ kind: "entry", entry: { id: ids.next(), parentId: entryId, type: "message", payload: {} } },
+					{ kind: "entry", entry: { id: "bad", parentId: entryId, type: "message", payload: {} } },
+				],
+			}),
+		).rejects.toMatchObject({ code: "invalid_id" });
+		await storageB.close();
+
+		const storageC = state.createStorage();
+		const next = await storageC.commit({
+			writes: [{ kind: "register", op: "set", namespace: "facts", key: "reopened", value: true }],
+		});
+		expect(next.firstSeq).toBe(4);
+		await storageC.close();
+	});
+
+	it("keeps a closed handle sealed while a new handle remains usable", async () => {
+		const state = new MemoryStorageState();
+		const storageA = state.createStorage();
+		await storageA.close();
+		const storageB = state.createStorage();
+		const id = createIdGenerator().next();
+		const closedOperations = [
+			storageA.commit({ writes: [{ kind: "register", op: "set", namespace: "n", key: "k", value: 1 }] }),
+			storageA.getEntries([id]),
+			storageA.getRegister("n", "k"),
+			storageA.listRegisters("n"),
+			storageA.scanBranch({ start: id }),
+			storageA.scanBranchStructure({ start: id }),
+			storageA.scanEntries(),
+			storageA.getStats(),
+		];
+		for (const operation of closedOperations) await expect(operation).rejects.toMatchObject({ code: "closed" });
+
+		await storageB.commit({ writes: [{ kind: "register", op: "set", namespace: "n", key: "k", value: 1 }] });
+		expect((await storageB.getRegister("n", "k"))?.value).toBe(1);
+		await storageB.close();
+	});
+
+	it("close drains commits admitted by the closing handle before reopen", async () => {
+		const state = new MemoryStorageState();
+		const storageA = state.createStorage();
+		const id = createIdGenerator().next();
+		const admitted = storageA.commit({
+			writes: [{ kind: "entry", entry: { id, parentId: null, type: "message", payload: { pending: true } } }],
+		});
+
+		await storageA.close();
+		await expect(admitted).resolves.toMatchObject({ firstSeq: 1 });
+		const storageB = state.createStorage();
+		expect((await storageB.getEntries([id])).get(id)).toMatchObject({ id, seq: 1, payload: { pending: true } });
+		await storageB.close();
 	});
 });

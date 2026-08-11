@@ -50,20 +50,17 @@ function registerId(namespace: string, key: string): string {
 	return `${namespace}\u0000${key}`;
 }
 
-export class MemoryStorage implements Storage {
+class MemoryStorageCore {
 	private entries = new Map<string, Entry>();
 	private registers = new Map<string, Register>();
 	private usage = new Map<string, UsageRow>();
 	private stats: SessionStats = { messageCount: 0, usage: structuredClone(ZERO_USAGE) };
 	private nextSeq = 1;
 	private queue: Promise<void> = Promise.resolve();
-	private sealed = false;
-	private closePromise: Promise<void> | undefined;
 
 	commit(tx: Transaction): Promise<CommitResult> {
 		let admitted: Transaction;
 		try {
-			this.assertOpen();
 			assertTransaction(tx);
 			admitted = structuredClone(tx);
 		} catch (error) {
@@ -82,7 +79,6 @@ export class MemoryStorage implements Storage {
 	}
 
 	async getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
-		this.assertOpen();
 		assertIdList(ids);
 		const result = new Map<string, Entry>();
 		for (const id of ids) {
@@ -94,7 +90,6 @@ export class MemoryStorage implements Storage {
 	}
 
 	async getRegister(namespace: string, key: string): Promise<Register | undefined> {
-		this.assertOpen();
 		assertQueryText(namespace, "namespace");
 		assertQueryText(key, "key");
 		assertText(namespace, "namespace", "invalid_query");
@@ -104,7 +99,6 @@ export class MemoryStorage implements Storage {
 	}
 
 	async listRegisters(namespace: string): Promise<Register[]> {
-		this.assertOpen();
 		assertQueryText(namespace, "namespace");
 		assertText(namespace, "namespace", "invalid_query");
 		return [...this.registers.values()]
@@ -114,13 +108,11 @@ export class MemoryStorage implements Storage {
 	}
 
 	async scanBranch(query: BranchScan): Promise<Entry[]> {
-		this.assertOpen();
 		assertBranchScan(query);
 		return this.branch(query).map((entry) => structuredClone(entry));
 	}
 
 	async scanBranchStructure(query: BranchScan): Promise<EntryStructure[]> {
-		this.assertOpen();
 		assertBranchScan(query);
 		return this.branch(query).map(({ id, parentId, seq, timestamp, type, customType }) => ({
 			id,
@@ -133,7 +125,6 @@ export class MemoryStorage implements Storage {
 	}
 
 	async scanEntries(query: EntryScan = {}): Promise<Entry[]> {
-		this.assertOpen();
 		assertEntryScan(query);
 		assertLimit(query.limit);
 		if (query.fromSeq !== undefined && (!Number.isSafeInteger(query.fromSeq) || query.fromSeq < 0))
@@ -155,19 +146,11 @@ export class MemoryStorage implements Storage {
 	}
 
 	async getStats(): Promise<SessionStats> {
-		this.assertOpen();
 		return structuredClone(this.stats);
 	}
 
-	close(): Promise<void> {
-		if (this.closePromise) return this.closePromise;
-		this.sealed = true;
-		this.closePromise = this.queue;
-		return this.closePromise;
-	}
-
-	private assertOpen(): void {
-		if (this.sealed) throw new StorageError("closed", "Storage is closed");
+	drain(): Promise<void> {
+		return this.queue;
 	}
 
 	private applyCommit(tx: Transaction): CommitResult {
@@ -270,5 +253,87 @@ export class MemoryStorage implements Storage {
 		);
 		if (query.limit !== undefined) result = result.slice(0, query.limit);
 		return result;
+	}
+}
+
+const memoryStorageCores = new WeakMap<MemoryStorageState, MemoryStorageCore>();
+
+/** Repository-owned durable state shared by disposable MemoryStorage handles. */
+export class MemoryStorageState {
+	constructor() {
+		memoryStorageCores.set(this, new MemoryStorageCore());
+	}
+
+	createStorage(): MemoryStorage {
+		return new MemoryStorage(this);
+	}
+}
+
+export class MemoryStorage implements Storage {
+	readonly #core: MemoryStorageCore;
+	private sealed = false;
+	private closePromise: Promise<void> | undefined;
+
+	constructor(state: MemoryStorageState = new MemoryStorageState()) {
+		const core = memoryStorageCores.get(state);
+		if (!core) throw new TypeError("Invalid MemoryStorageState");
+		this.#core = core;
+	}
+
+	commit(tx: Transaction): Promise<CommitResult> {
+		try {
+			this.assertOpen();
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		return this.#core.commit(tx);
+	}
+
+	getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
+		return this.call(() => this.#core.getEntries(ids));
+	}
+
+	getRegister(namespace: string, key: string): Promise<Register | undefined> {
+		return this.call(() => this.#core.getRegister(namespace, key));
+	}
+
+	listRegisters(namespace: string): Promise<Register[]> {
+		return this.call(() => this.#core.listRegisters(namespace));
+	}
+
+	scanBranch(query: BranchScan): Promise<Entry[]> {
+		return this.call(() => this.#core.scanBranch(query));
+	}
+
+	scanBranchStructure(query: BranchScan): Promise<EntryStructure[]> {
+		return this.call(() => this.#core.scanBranchStructure(query));
+	}
+
+	scanEntries(query: EntryScan = {}): Promise<Entry[]> {
+		return this.call(() => this.#core.scanEntries(query));
+	}
+
+	getStats(): Promise<SessionStats> {
+		return this.call(() => this.#core.getStats());
+	}
+
+	close(): Promise<void> {
+		if (this.closePromise) return this.closePromise;
+		this.sealed = true;
+		this.closePromise = this.#core.drain();
+		return this.closePromise;
+	}
+
+	private call<T>(operation: () => Promise<T>): Promise<T> {
+		try {
+			this.assertOpen();
+			return operation();
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	private assertOpen(): void {
+		if (this.sealed) throw new StorageError("closed", "Storage is closed");
 	}
 }
