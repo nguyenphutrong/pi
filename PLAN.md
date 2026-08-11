@@ -3,17 +3,17 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.3 — Design the Memory-only Session tree/repository and typed codec boundary
-- Status: design pending
+- Work item: 1.3 — Implement the Memory-only Session tree/repository and typed codec boundary
+- Status: design approved by independent review; implementation pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Design and implement a Memory-only Session tree/repository with one `main` lane, typed codecs, and reopen support.
-2. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
-3. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
-4. Add close/reopen and kill-at-every-boundary recovery coverage.
-5. Run independent Phase 1 done-bar review and recovery QA.
+1. Implement a Memory-only Session tree/repository with one `main` lane, typed built-in-message codecs, and reopen support.
+2. Add Session/repository conformance, atomic initialization, context projection, and close/reopen tests.
+3. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
+4. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
+5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
 ## Phase order
 
@@ -51,3 +51,4 @@
 - Postgres partitioning and retention daemon.
 - Precise rewrite and general settlement-kernel migrations.
 - Multi-lane, queues, tools, compaction, navigation, and serving concerns until their ordered phases.
+- Canonical extensible `AgentMessage` ownership and custom-role schemas until before custom messages or the product shell.

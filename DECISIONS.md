@@ -101,3 +101,26 @@ Option 1.
 ### Rationale
 
 Storage owns structural envelope invariants, including storage-assigned sequence and timestamp fields. Harness remains responsible for semantic payload and typed register namespace validation. This keeps Memory and SQLite on one decoded-envelope contract without importing Harness types into either backend.
+
+## D-006 — Put typed Session semantics in `harness-runtime` over reopenable Memory handles
+
+- Date: 2026-08-11
+- Phase: 1
+- Status: accepted after design and independent architecture review
+- References: `packages/agent/docs/harness-v3.md` §§2.1–2.8, 3.1–3.7, 8 slices 3–5, 9; D-004–D-005
+
+### Options
+
+1. Put the typed Session and repository directly in `session-storage` through generic injected codecs.
+2. Add a separate `session-domain` package for entries, registers, Session, and repositories.
+3. Put Harness-specific Session, repository, and codecs in `harness-runtime`, while `session-storage` supplies domain-neutral durable Memory state and disposable handles.
+
+### Choice
+
+Option 3.
+
+### Rationale
+
+The Session boundary owns Harness semantics without making storage know about messages, lanes, or operations, and it avoids a new package before there is demonstrated reuse. A Memory repository owns metadata and durable in-process state, enforces one active handle per session, and creates a fresh handle on reopen; closing a handle seals and drains it without destroying that state. Session creation publishes exactly one transaction containing `lane.leaf/main = null` and idle `lane.state/main`, with no lane configuration.
+
+Phase 1 keeps its built-in `pi-ai` message codecs package-internal. Canonical extensible `AgentMessage` ownership is deferred until before custom messages or the product shell; this does not change the domain-neutral durable envelope. The Session item includes typed main-lane append, branch reads, and no-compaction context projection, but defers provider execution and operation registers to the runtime/planner item.
