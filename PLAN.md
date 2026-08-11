@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.2 — Implement the domain-neutral `session-storage` contract and Memory backend
-- Status: implementation pending; design approved in D-004
+- Status: blocked after the second independent review; see `BLOCKED.md`
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
