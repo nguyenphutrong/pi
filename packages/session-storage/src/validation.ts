@@ -291,7 +291,12 @@ export function assertBranchScan(value: unknown): asserts value is BranchScan {
 export function assertIdList(value: unknown): asserts value is string[] {
 	guard("invalid_query", () => {
 		denseArray(value, "invalid_query", "ids");
-		for (const id of value) string(id, "invalid_query", "entry id");
+		const seen = new Set<string>();
+		for (const id of value) {
+			string(id, "invalid_query", "entry id");
+			if (seen.has(id)) invalid("invalid_query", "entry ids must be unique");
+			seen.add(id);
+		}
 	});
 }
 

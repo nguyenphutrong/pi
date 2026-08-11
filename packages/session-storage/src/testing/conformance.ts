@@ -542,6 +542,7 @@ export function createStorageConformance(factory: StorageConformanceFixtureFacto
 				Object.defineProperty(hiddenIds, "extra", { value: true });
 				for (const value of [null, "bad", [1], sparseIds, symbolIds, hiddenIds])
 					await rejects(storage.getEntries(value as string[]), assertCode("invalid_query"));
+				await rejects(storage.getEntries([ids[0], ids[0]]), assertCode("invalid_query"));
 				await rejects(storage.getRegister(1 as unknown as string, "k"), assertCode("invalid_query"));
 				await rejects(storage.listRegisters(null as unknown as string), assertCode("invalid_query"));
 			},
