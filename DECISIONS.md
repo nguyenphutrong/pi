@@ -281,7 +281,7 @@ The first implementation review rejected exporting the low-level `resolveProvide
 
 - Date: 2026-08-11
 - Phase: 1
-- Status: 1.8a implemented by `32ef80020`; 1.8b pending
+- Status: implemented by `32ef80020` and `2eca9c11f`; independent conformance review PASS
 - References: D-010–D-012; `packages/agent/docs/harness-v3.md` §§3.3–3.7, 4.1–4.5, 5.1, 9.3
 
 ### Options

@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.8 — Add prompt acceptance and durable assistant-effect intent before provider dispatch
-- Status: 1.8a prompt acceptance committed as `32ef80020`; implement 1.8b provider lease plus durable intent
+- Work item: 1.9 — Dispatch the retained assistant provider lease without a registry reread
+- Status: 1.8 completed by `32ef80020` and `2eca9c11f`; design the provider execution boundary
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement and independently verify 1.8b provider lease capture, complete process-local effect plan, and durable intent before dispatch.
-2. Bind the retained `ModelRequestLease` to effect execution without persisting, exposing, or rereading it.
-3. Implement provider settlement, response/usage commit, classification, and terminal cleanup.
+1. Bind the retained `ModelRequestLease` to provider execution without persisting, exposing, or rereading it.
+2. Implement provider settlement with one atomic response/usage/classification commit.
+3. Implement terminal cleanup and the internal no-tool completion result.
 4. Add close/reopen Tier A coverage for every resulting action and transition boundary.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
