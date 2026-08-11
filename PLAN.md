@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.7 — Add the upstream-mergeable `Models.lease` prerequisite for provider dispatch
-- Status: D-012 lease design approved after independent architecture review; implementation and focused tests next
+- Status: first implementation review blocked an auth-boundary leak; lease-bound header-binder rework independently approved
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
