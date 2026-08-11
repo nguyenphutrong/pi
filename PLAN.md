@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.7 — Add the upstream-mergeable `Models.lease` prerequisite for provider dispatch
-- Status: 1.6 pure planner and one-step manual scheduler committed as `0ba92a6a8`; independent conformance review PASS
+- Status: D-012 lease design approved after independent architecture review; implementation and focused tests next
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
