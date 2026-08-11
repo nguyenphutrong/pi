@@ -124,3 +124,24 @@ Option 3.
 The Session boundary owns Harness semantics without making storage know about messages, lanes, or operations, and it avoids a new package before there is demonstrated reuse. A Memory repository owns metadata and durable in-process state, enforces one active handle per session, and creates a fresh handle on reopen; closing a handle seals and drains it without destroying that state. Session creation publishes exactly one transaction containing `lane.leaf/main = null` and idle `lane.state/main`, with no lane configuration.
 
 Phase 1 keeps its built-in `pi-ai` message codecs package-internal. Canonical extensible `AgentMessage` ownership is deferred until before custom messages or the product shell; this does not change the domain-neutral durable envelope. The Session item includes typed main-lane append, branch reads, and no-compaction context projection, but defers provider execution and operation registers to the runtime/planner item.
+
+## D-007 — Keep shared Memory state inaccessible behind runtime-private handles
+
+- Date: 2026-08-11
+- Phase: 1
+- Status: confirmed by human after B-002 escalation
+- References: D-006; `packages/agent/docs/harness-v3.md` §§1.4, 2.8
+
+### Options
+
+1. Store the shared core in a native runtime-private `#core` field.
+2. Rely on a TypeScript `private` field, which is erased at runtime.
+3. Associate handles and cores through another module-private `WeakMap`.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The state token exposes only handle creation, and native privacy prevents JavaScript callers from bypassing a closed handle to commit or read through its core. It is the smallest implementation that preserves the repository-owned state and disposable-handle design.

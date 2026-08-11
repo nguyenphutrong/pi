@@ -1,12 +1,13 @@
 # Harness Rewrite Blockers
 
-## B-002 — Memory handle still exposes its core at runtime
+## Resolved B-002 — Memory handle still exposes its core at runtime
 
 - Date: 2026-08-11
+- Resolved: 2026-08-11 — human selected option 1; recorded in D-007 and implemented by `48dfa1e0f`
 - Phase: 1
 - Work item: 1.3, increment A — reopenable Memory storage handles
 - Trigger: two independent review rejections for the same lifecycle-encapsulation reason
-- Status: awaiting human choice
+- Status: resolved; package tests 30/30, `npm run check` PASS, independent review PASS
 
 ### Context
 

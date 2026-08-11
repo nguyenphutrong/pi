@@ -4,13 +4,13 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.3 — Implement the Memory-only Session tree/repository and typed codec boundary
-- Status: blocked by B-002 after two lifecycle-encapsulation review rejections
+- Status: reopenable Memory handles complete; typed Session/repository implementation pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement a Memory-only Session tree/repository with one `main` lane, typed built-in-message codecs, and reopen support.
-2. Add Session/repository conformance, atomic initialization, context projection, and close/reopen tests.
+1. Implement `harness-runtime` with a Memory-only Session repository, one `main` lane, and typed built-in-message codecs.
+2. Add Session/repository tests for atomic initialization, context projection, active-handle exclusion, and close/reopen.
 3. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
 4. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
