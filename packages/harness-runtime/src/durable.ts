@@ -44,6 +44,11 @@ export interface StreamOptions {
 	deferred?: boolean | { window?: "15m" | "1h" | "24h" };
 }
 
+export interface NormalizedRetryPolicy {
+	maxAttempts: number;
+	baseDelayMs: number;
+}
+
 export interface GenerationContext {
 	stepId: string;
 	triggerEntryId: string;
@@ -274,8 +279,17 @@ function generationContext(value: unknown): GenerationContext {
 	} catch (error) {
 		throw new SessionError("corruption", "streamOptions must be JSON-safe data", error);
 	}
+	decodeStreamOptions(context.streamOptions);
+	const retry = object(context.retryPolicy, ["maxAttempts", "baseDelayMs"], "retryPolicy");
+	safe(retry.maxAttempts, "maxAttempts", 1);
+	safe(retry.baseDelayMs, "baseDelayMs");
+	if (context.overflowRecoveryUsed !== false) fail("Phase 1 overflowRecoveryUsed must be false");
+	return context as unknown as GenerationContext;
+}
+
+function decodeStreamOptions(value: unknown): StreamOptions {
 	const stream = optionalObject(
-		context.streamOptions,
+		value,
 		[],
 		["transport", "timeoutMs", "maxRetries", "maxRetryDelayMs", "headers", "metadata", "cacheRetention", "deferred"],
 		"streamOptions",
@@ -298,11 +312,29 @@ function generationContext(value: unknown): GenerationContext {
 		fail("Headers must contain strings");
 	if (stream.metadata !== undefined) semanticObject(stream.metadata, "metadata");
 	if (stream.deferred !== undefined && stream.deferred !== false) fail("Phase 1 deferred must be absent or false");
-	const retry = object(context.retryPolicy, ["maxAttempts", "baseDelayMs"], "retryPolicy");
-	safe(retry.maxAttempts, "maxAttempts", 1);
-	safe(retry.baseDelayMs, "baseDelayMs");
-	if (context.overflowRecoveryUsed !== false) fail("Phase 1 overflowRecoveryUsed must be false");
-	return context as unknown as GenerationContext;
+	return stream as unknown as StreamOptions;
+}
+
+export function encodeStreamOptions(value: StreamOptions): StreamOptions {
+	try {
+		assertJsonValue(value);
+		const candidate = structuredClone(value);
+		decodeStreamOptions(candidate);
+		return Object.freeze(candidate);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Stream options must be detached JSON-safe data", error);
+	}
+}
+
+export function encodeRunState(value: RunState, operationId: string): JsonValue {
+	try {
+		assertJsonValue(value);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Run state must be detached JSON-safe data", error);
+	}
+	return structuredClone(
+		decodeRunStateRegister({ namespace: "op.state", key: operationId, seq: 1, value }, operationId).value,
+	) as unknown as JsonValue;
 }
 
 export function decodeRunStateRegister(candidate: unknown, operationId: string): CurrentRegister<RunState> {

@@ -18,10 +18,13 @@ import {
 	decodeRunOperationRegister,
 	decodeRunStateRegister,
 	encodeLaneConfiguration,
+	encodeRunState,
 	type LaneConfiguration,
 	type LaneState,
+	type NormalizedRetryPolicy,
 	type RunOperation,
 	type RunState,
+	type StreamOptions,
 } from "./durable.ts";
 import {
 	type BranchBounds,
@@ -271,6 +274,21 @@ export interface RuntimeAttachment {
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
 }
 
+export interface StartAssistantStepTransition {
+	readonly operationId: string;
+	readonly triggerEntryId: string;
+	readonly expectedOperationStateSeq: number;
+	readonly expectedLaneStateSeq: number;
+	readonly expectedConfigurationSeq: number;
+	readonly streamOptions: StreamOptions;
+	readonly retryPolicy: NormalizedRetryPolicy;
+}
+
+export interface RuntimeTransitionResult {
+	readonly committed: boolean;
+	readonly attachment: RuntimeAttachment;
+}
+
 export class MemorySession implements Session {
 	readonly metadata: SessionMetadata;
 	readonly idGenerator: IdGenerator;
@@ -344,6 +362,109 @@ export class MemorySession implements Session {
 			}
 			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
 			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	startAssistantStep(transition: StartAssistantStepTransition): Promise<RuntimeTransitionResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let state: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
+				state = decodeRunStateRegister(stateCandidate, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, state);
+			const phase = state?.value.phase;
+			const current =
+				configuration.seq === transition.expectedConfigurationSeq &&
+				laneState.seq === transition.expectedLaneStateSeq &&
+				currentOperationId === transition.operationId &&
+				state?.seq === transition.expectedOperationStateSeq &&
+				phase?.kind === "checkpoint" &&
+				phase.continuation.kind === "need_assistant" &&
+				phase.triggerEntryId === transition.triggerEntryId;
+			if (!current) {
+				return Object.freeze({
+					committed: false,
+					attachment: Object.freeze({
+						laneConfiguration: configuration,
+						laneState,
+						mainLeaf,
+						runOperation,
+						runState: state,
+						...hydrated,
+					}),
+				});
+			}
+			if (!state || !runOperation || phase?.kind !== "checkpoint" || phase.continuation.kind !== "need_assistant")
+				throw new SessionError("corruption", "Validated assistant-step trigger changed inside the mutation line");
+			const stepId = this.idGenerator.next();
+			const nextState: RunState = {
+				...state.value,
+				phase: {
+					kind: "assistant",
+					generation: {
+						status: "ready",
+						context: {
+							stepId,
+							triggerEntryId: transition.triggerEntryId,
+							configuration: structuredClone(configuration.value),
+							streamOptions: structuredClone(transition.streamOptions),
+							retryPolicy: structuredClone(transition.retryPolicy),
+							overflowRecoveryUsed: phase.continuation.overflowRecoveryUsed,
+						},
+						nextAttempt: 1,
+					},
+				},
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: transition.operationId,
+						value: encodeRunState(nextState, transition.operationId),
+					},
+				],
+			});
+			const runState = Object.freeze({ seq: committed.seqs[0], value: structuredClone(nextState) });
+			return Object.freeze({
+				committed: true,
+				attachment: Object.freeze({
+					laneConfiguration: configuration,
+					laneState,
+					mainLeaf,
+					runOperation,
+					runState,
+					...hydrated,
+				}),
+			});
 		});
 		this.#mutationLine = operation.then(
 			() => undefined,
