@@ -19,6 +19,7 @@ import {
 	type DeferredHandle,
 	lazyStream,
 	type Model,
+	type ModelRequestLease,
 	type Models,
 	type ModelsApiStreamOptions,
 	type ModelsDeferredCancelOptions,
@@ -165,7 +166,21 @@ export class ModelRuntime implements Models {
 		this.modelNetworkEnabled = modelNetworkEnabled;
 		this.defaultBuiltins = new Map(providers.map((provider) => [provider.id, provider]));
 		for (const [providerId, provider] of this.defaultBuiltins) this.builtins.set(providerId, provider);
-		this.models = createModels({ credentials, modelsStore });
+		this.models = createModels({
+			credentials,
+			modelsStore,
+			bindLeaseRequestHeaders: (provider, model) => {
+				const config = this.config.getProvider(provider.id);
+				const extension = this.extensionProviders.get(provider.id);
+				const hasConfiguredHeaders =
+					config?.modelOverrides?.[model.id]?.headers !== undefined ||
+					config?.models?.some((entry) => entry.id === model.id && entry.headers !== undefined) === true ||
+					extension?.models?.some((entry) => entry.id === model.id && entry.headers !== undefined) === true;
+				if (!hasConfiguredHeaders) return undefined;
+				return (headers, { env }) =>
+					mergeHeaders(headers, resolveConfiguredModelHeaders(model, config, extension, env)) ?? {};
+			},
+		});
 		this.rebuildProviders();
 	}
 
@@ -395,6 +410,10 @@ export class ModelRuntime implements Models {
 
 	getModel(providerId: string, modelId: string): Model<Api> | undefined {
 		return this.models.getModel(providerId, modelId);
+	}
+
+	lease(providerId: string, modelId: string): ModelRequestLease | undefined {
+		return this.models.lease(providerId, modelId);
 	}
 
 	async checkAuth(providerId: string, options?: AuthOperationOptions): Promise<AuthCheck | undefined> {

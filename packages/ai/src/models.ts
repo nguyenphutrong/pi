@@ -26,6 +26,7 @@ import type {
 	Model,
 	ModelCostRates,
 	ModelThinkingLevel,
+	ProviderEnv,
 	ProviderHeaders,
 	ProviderRequestOptions,
 	ProviderStreams,
@@ -84,6 +85,23 @@ export type ModelsApiStreamOptions<TApi extends Api> = ApiStreamOptions<TApi> & 
 export type ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsRequestTransforms;
 export type ModelsDeferredFetchOptions = DeferredFetchOptions & ModelsRequestTransforms;
 export type ModelsDeferredCancelOptions = DeferredCancelOptions & ModelsRequestTransforms;
+
+export interface LeaseRequestHeadersContext {
+	readonly env?: ProviderEnv;
+}
+
+export type LeaseRequestHeadersTransform = (
+	headers: ProviderHeaders,
+	context: LeaseRequestHeadersContext,
+) => ProviderHeaders | Promise<ProviderHeaders>;
+
+export interface ModelRequestLease {
+	readonly model: Model<Api>;
+	stream(context: Context, options?: ModelsApiStreamOptions<Api>): AssistantMessageEventStream;
+	streamSimple(context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream;
+	fetchDeferred(handle: DeferredHandle, options?: ModelsDeferredFetchOptions): Promise<AssistantMessage>;
+	cancelDeferred(handle: DeferredHandle, options?: ModelsDeferredCancelOptions): Promise<void>;
+}
 
 /**
  * A provider is the concrete runtime unit. It owns id/name/base metadata,
@@ -169,6 +187,8 @@ export interface Models {
 	 */
 	getModel(provider: string, id: string): Model<Api> | undefined;
 
+	lease(provider: string, modelId: string): ModelRequestLease | undefined;
+
 	/**
 	 * Refresh selected configured dynamic providers concurrently (all when `providers` is omitted).
 	 * Provider errors and cancellation are returned without rejecting; static, unknown, and
@@ -233,6 +253,7 @@ export interface CreateModelsOptions {
 	credentials?: CredentialStore;
 	modelsStore?: ModelsStore;
 	authContext?: AuthContext;
+	bindLeaseRequestHeaders?: (provider: Provider, model: Model<Api>) => LeaseRequestHeadersTransform | undefined;
 }
 
 function mergeHeaders(
@@ -256,6 +277,9 @@ class ModelsImpl implements MutableModels {
 	private credentials: CredentialStore;
 	private modelsStore: ModelsStore;
 	private authContext: AuthContext;
+	private bindLeaseRequestHeaders:
+		| ((provider: Provider, model: Model<Api>) => LeaseRequestHeadersTransform | undefined)
+		| undefined;
 	private refreshGenerations = new Map<string, number>();
 	private refreshControllers = new Map<string, AbortController>();
 	private publicationChains = new Map<string, Promise<unknown>>();
@@ -264,6 +288,7 @@ class ModelsImpl implements MutableModels {
 		this.credentials = options?.credentials ?? new InMemoryCredentialStore();
 		this.modelsStore = options?.modelsStore ?? new InMemoryModelsStore();
 		this.authContext = options?.authContext ?? defaultAuthContext();
+		this.bindLeaseRequestHeaders = options?.bindLeaseRequestHeaders;
 	}
 
 	setProvider(provider: Provider): void {
@@ -315,6 +340,29 @@ class ModelsImpl implements MutableModels {
 
 	getModel(provider: string, id: string): Model<Api> | undefined {
 		return this.getModels(provider).find((model) => model.id === id);
+	}
+
+	lease(providerId: string, modelId: string): ModelRequestLease | undefined {
+		const provider = this.providers.get(providerId);
+		if (!provider) return undefined;
+		let model: Model<Api> | undefined;
+		try {
+			model = provider.getModels().find((entry) => entry.id === modelId);
+		} catch {
+			return undefined;
+		}
+		if (!model) return undefined;
+		const transformHeaders = this.bindLeaseRequestHeaders?.(provider, model);
+		return {
+			model,
+			stream: (context, options) => this.streamWithProvider(provider, model, transformHeaders, context, options),
+			streamSimple: (context, options) =>
+				this.streamSimpleWithProvider(provider, model, transformHeaders, context, options),
+			fetchDeferred: (handle, options) =>
+				this.fetchDeferredWithProvider(provider, model, transformHeaders, handle, options),
+			cancelDeferred: (handle, options) =>
+				this.cancelDeferredWithProvider(provider, model, transformHeaders, handle, options),
+		};
 	}
 
 	private supersedeProviderRefresh(providerId: string): number {
@@ -634,14 +682,15 @@ class ModelsImpl implements MutableModels {
 	}
 
 	private async applyAuth<TOptions extends ProviderRequestOptions & ModelsRequestTransforms>(
+		provider: Provider,
 		model: Model<Api>,
 		options: TOptions | undefined,
+		leaseTransformHeaders?: LeaseRequestHeadersTransform,
 	): Promise<{
 		requestModel: Model<Api>;
 		requestOptions: Omit<TOptions, "transformHeaders"> & ProviderRequestOptions;
 	}> {
-		this.requireProvider(model);
-		const resolution = await this.getAuth(model, {
+		const resolution = await resolveProviderAuth(provider, this.credentials, this.authContext, {
 			apiKey: options?.apiKey,
 			env: options?.env,
 			signal: options?.signal,
@@ -649,13 +698,18 @@ class ModelsImpl implements MutableModels {
 		if (!resolution) {
 			throw new ModelsError("auth", `Provider is not configured: ${model.provider}`);
 		}
-		const auth = resolution.auth;
+		const auth = {
+			...resolution.auth,
+			headers: mergeHeaders(resolution.auth.headers, model.headers),
+		};
 
-		// Explicit request options win per-field; the Models-only transform runs last.
+		// Explicit request options win per-field; the caller transform runs last.
 		const apiKey = options?.apiKey ?? auth.apiKey;
-		let headers = mergeHeaders(auth.headers, options?.headers);
-		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 		const env = resolution.env || options?.env ? { ...(resolution.env ?? {}), ...(options?.env ?? {}) } : undefined;
+		let headers = auth.headers;
+		if (leaseTransformHeaders) headers = await leaseTransformHeaders(headers ?? {}, { env });
+		headers = mergeHeaders(headers, options?.headers);
+		if (options?.transformHeaders) headers = await options.transformHeaders(headers ?? {});
 		const requestModel = auth.baseUrl ? { ...model, baseUrl: auth.baseUrl } : model;
 		const { transformHeaders: _transformHeaders, ...providerOptions } = options ?? {};
 		const requestOptions = { ...providerOptions, apiKey, headers, env } as Omit<TOptions, "transformHeaders"> &
@@ -672,10 +726,34 @@ class ModelsImpl implements MutableModels {
 		return lazyStream(model, async () => {
 			const provider = this.requireProvider(model);
 			const { requestModel, requestOptions } = await this.applyAuth(
+				provider,
 				model,
 				options as ModelsApiStreamOptions<Api> | undefined,
 			);
 			return provider.stream(requestModel as Model<TApi>, context, requestOptions as ApiStreamOptions<TApi>);
+		});
+	}
+
+	private streamWithProvider<TApi extends Api>(
+		provider: Provider,
+		model: Model<TApi>,
+		transformHeaders: LeaseRequestHeadersTransform | undefined,
+		context: Context,
+		options?: ModelsApiStreamOptions<TApi>,
+	): AssistantMessageEventStream {
+		return lazyStream(model, async () => {
+			const { requestModel, requestOptions } = await this.applyAuth(
+				provider,
+				model,
+				options as ModelsApiStreamOptions<Api> | undefined,
+				transformHeaders,
+			);
+			return provider.stream.call(
+				provider,
+				requestModel as Model<TApi>,
+				context,
+				requestOptions as ApiStreamOptions<TApi>,
+			);
 		});
 	}
 
@@ -690,8 +768,21 @@ class ModelsImpl implements MutableModels {
 	streamSimple(model: Model<Api>, context: Context, options?: ModelsSimpleStreamOptions): AssistantMessageEventStream {
 		return lazyStream(model, async () => {
 			const provider = this.requireProvider(model);
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
+			const { requestModel, requestOptions } = await this.applyAuth(provider, model, options);
 			return provider.streamSimple(requestModel, context, requestOptions as SimpleStreamOptions);
+		});
+	}
+
+	private streamSimpleWithProvider(
+		provider: Provider,
+		model: Model<Api>,
+		transformHeaders: LeaseRequestHeadersTransform | undefined,
+		context: Context,
+		options?: ModelsSimpleStreamOptions,
+	): AssistantMessageEventStream {
+		return lazyStream(model, async () => {
+			const { requestModel, requestOptions } = await this.applyAuth(provider, model, options, transformHeaders);
+			return provider.streamSimple.call(provider, requestModel, context, requestOptions as SimpleStreamOptions);
 		});
 	}
 
@@ -713,8 +804,24 @@ class ModelsImpl implements MutableModels {
 			if (!provider.fetchDeferred) {
 				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 			}
-			const { requestModel, requestOptions } = await this.applyAuth(model, options);
+			const { requestModel, requestOptions } = await this.applyAuth(provider, model, options);
 			return provider.fetchDeferred(requestModel, handle, requestOptions as DeferredFetchOptions);
+		}).result();
+	}
+
+	private async fetchDeferredWithProvider(
+		provider: Provider,
+		model: Model<Api>,
+		transformHeaders: LeaseRequestHeadersTransform | undefined,
+		handle: DeferredHandle,
+		options?: ModelsDeferredFetchOptions,
+	): Promise<AssistantMessage> {
+		return lazyStream(model, async () => {
+			if (!provider.fetchDeferred) {
+				throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+			}
+			const { requestModel, requestOptions } = await this.applyAuth(provider, model, options, transformHeaders);
+			return provider.fetchDeferred.call(provider, requestModel, handle, requestOptions as DeferredFetchOptions);
 		}).result();
 	}
 
@@ -727,8 +834,22 @@ class ModelsImpl implements MutableModels {
 		if (!provider.cancelDeferred) {
 			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
 		}
-		const { requestModel, requestOptions } = await this.applyAuth(model, options);
+		const { requestModel, requestOptions } = await this.applyAuth(provider, model, options);
 		await provider.cancelDeferred(requestModel, handle, requestOptions);
+	}
+
+	private async cancelDeferredWithProvider(
+		provider: Provider,
+		model: Model<Api>,
+		transformHeaders: LeaseRequestHeadersTransform | undefined,
+		handle: DeferredHandle,
+		options?: ModelsDeferredCancelOptions,
+	): Promise<void> {
+		if (!provider.cancelDeferred) {
+			throw new ModelsError("provider", `Provider ${model.provider} does not support deferred responses`);
+		}
+		const { requestModel, requestOptions } = await this.applyAuth(provider, model, options, transformHeaders);
+		await provider.cancelDeferred.call(provider, requestModel, handle, requestOptions);
 	}
 }
 

@@ -2,12 +2,14 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+	type Api,
 	createAssistantMessageEventStream,
 	type DeferredCancelOptions,
 	type DeferredFetchOptions,
 	InMemoryModelsStore,
 	type Model,
 	type Provider,
+	type SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
 import { describe, expect, it } from "vitest";
 import { AuthStorage } from "../src/core/auth-storage.ts";
@@ -290,6 +292,77 @@ describe("extension provider model lifecycle", () => {
 		await runtime.refresh({ allowNetwork: false });
 		expect(runtime.getModel("extension-dynamic", "live")).toBeDefined();
 		expect(await modelsStore.read("extension-dynamic")).toBeUndefined();
+	});
+
+	it("keeps an extension request lease bound across unregister and re-register", async () => {
+		const runtime = await ModelRuntime.create({
+			credentials: AuthStorage.inMemory(),
+			modelsStore: new InMemoryModelsStore(),
+			modelsPath: null,
+			allowModelNetwork: false,
+		});
+		let capturedModel: Model<Api> | undefined;
+		let capturedOptions: SimpleStreamOptions | undefined;
+		const originalModel = {
+			...model("leased"),
+			provider: "leased-extension",
+			headers: { "x-model": "$LEASE_MODEL_HEADER" },
+		};
+		runtime.registerProvider("leased-extension", {
+			baseUrl: "https://original.test/v1",
+			apiKey: "$LEASE_API_KEY",
+			headers: { "x-config": "$LEASE_HEADER", "x-shared": "config" },
+			api: "openai-completions",
+			models: [originalModel],
+			streamSimple: (requestModel, _context, options) => {
+				capturedModel = requestModel;
+				capturedOptions = options;
+				throw new Error("captured original extension");
+			},
+		});
+		const lease = runtime.lease("leased-extension", "leased");
+		expect(lease).toBeDefined();
+
+		runtime.unregisterProvider("leased-extension");
+		runtime.registerProvider("leased-extension", {
+			baseUrl: "https://replacement.test/v1",
+			apiKey: "replacement-key",
+			headers: { "x-config": "replacement" },
+			api: "openai-completions",
+			models: [model("replacement")],
+			streamSimple: () => {
+				throw new Error("replacement must not run");
+			},
+		});
+
+		const result = await lease!
+			.streamSimple(
+				{ messages: [] },
+				{
+					env: {
+						LEASE_API_KEY: "request-key",
+						LEASE_HEADER: "request-header",
+						LEASE_MODEL_HEADER: "request-model-header",
+					},
+					headers: { "X-Shared": "explicit" },
+					transformHeaders: (headers) => ({ ...headers, "x-transformed": "yes" }),
+				},
+			)
+			.result();
+
+		expect(result.stopReason).toBe("error");
+		expect(result.errorMessage).toContain("captured original extension");
+		expect(capturedModel).toMatchObject({ id: "leased", baseUrl: "https://example.test/v1" });
+		expect(capturedOptions).toMatchObject({
+			apiKey: "request-key",
+			headers: {
+				"x-config": "request-header",
+				"x-model": "request-model-header",
+				"X-Shared": "explicit",
+				"x-transformed": "yes",
+			},
+		});
+		expect(capturedOptions).not.toHaveProperty("transformHeaders");
 	});
 
 	it("applies legacy OAuth modifyModels after async credential initialization", async () => {

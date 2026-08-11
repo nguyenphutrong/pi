@@ -3,7 +3,16 @@ import { InMemoryCredentialStore } from "../src/auth/credential-store.ts";
 import type { ApiKeyAuth, CredentialStore, OAuthAuth, OAuthCredential, ProviderAuth } from "../src/auth/types.ts";
 import { calculateCost, createModels, createProvider, hasApi, type Provider } from "../src/models.ts";
 import { InMemoryModelsStore, type ModelsStore, type ModelsStoreEntry } from "../src/models-store.ts";
-import type { Api, AssistantMessage, Context, Model, SimpleStreamOptions, StreamOptions, Usage } from "../src/types.ts";
+import type {
+	Api,
+	AssistantMessage,
+	Context,
+	DeferredHandle,
+	Model,
+	SimpleStreamOptions,
+	StreamOptions,
+	Usage,
+} from "../src/types.ts";
 import { AssistantMessageEventStream } from "../src/utils/event-stream.ts";
 
 function testModel(provider: string, id: string): Model<Api> {
@@ -196,6 +205,157 @@ describe("Models runtime", () => {
 			const _typed: Model<"test-api"> = found;
 			expect(_typed.id).toBe("m3");
 		}
+	});
+
+	it("leases only an existing model synchronously without resolving auth", () => {
+		let authResolutions = 0;
+		const selected = testModel("p1", "selected");
+		const models = createModels();
+		models.setProvider(
+			testProvider({
+				id: "p1",
+				models: [selected],
+				auth: {
+					apiKey: {
+						name: "Observed auth",
+						resolve: async () => {
+							authResolutions++;
+							return { auth: { apiKey: "key" } };
+						},
+					},
+				},
+			}),
+		);
+		models.setProvider(
+			testProvider({
+				id: "broken",
+				getModels: () => {
+					throw new Error("broken catalog");
+				},
+				auth: {
+					apiKey: {
+						name: "Must not run",
+						resolve: async () => {
+							authResolutions++;
+							return { auth: {} };
+						},
+					},
+				},
+			}),
+		);
+
+		const lease = models.lease("p1", "selected");
+		expect(lease?.model).toBe(selected);
+		expect(models.lease("p1", "missing")).toBeUndefined();
+		expect(models.lease("missing", "selected")).toBeUndefined();
+		expect(models.lease("broken", "selected")).toBeUndefined();
+		expect(authResolutions).toBe(0);
+	});
+
+	it("keeps leased stream methods bound to the captured provider and model", async () => {
+		const selected = testModel("captured", "model-a");
+		const calls: string[] = [];
+		const captured = testProvider({ id: "captured", models: [selected] });
+		captured.stream = function (requestModel) {
+			calls.push(`${this === captured}:stream:${requestModel === selected}`);
+			return testProvider({ id: "response" }).stream(requestModel, context);
+		};
+		captured.streamSimple = function (requestModel) {
+			calls.push(`${this === captured}:simple:${requestModel === selected}`);
+			return testProvider({ id: "response" }).streamSimple(requestModel, context);
+		};
+		const models = createModels();
+		models.setProvider(captured);
+		const lease = models.lease("captured", "model-a");
+		expect(lease).toBeDefined();
+
+		models.setProvider(testProvider({ id: "captured", models: [testModel("captured", "replacement")] }));
+		await lease!.stream(context).result();
+		models.deleteProvider("captured");
+		await lease!.streamSimple(context).result();
+		models.clearProviders();
+		await lease!.stream(context).result();
+
+		expect(calls).toEqual(["true:stream:true", "true:simple:true", "true:stream:true"]);
+	});
+
+	it("defers leased auth and keeps the captured provider auth after replacement", async () => {
+		const credentials = new InMemoryCredentialStore();
+		await credentials.modify("p1", async () => ({ type: "api_key", key: "before" }));
+		const calls: ProviderCall[] = [];
+		const models = createModels({ credentials });
+		models.setProvider(testProvider({ id: "p1", auth: { apiKey: envKeyAuth(undefined) }, calls }));
+		const lease = models.lease("p1", "model-a");
+		expect(lease).toBeDefined();
+
+		await credentials.modify("p1", async () => ({ type: "api_key", key: "after" }));
+		models.setProvider(
+			testProvider({
+				id: "p1",
+				auth: {
+					apiKey: {
+						name: "Replacement must not resolve",
+						resolve: async () => {
+							throw new Error("replacement auth must not run");
+						},
+					},
+				},
+			}),
+		);
+		await lease!.streamSimple(context).result();
+
+		expect(calls[0].options?.apiKey).toBe("after");
+	});
+
+	it("captures the direct stream provider during synchronous setup", async () => {
+		const calls: string[] = [];
+		const selected = testModel("direct", "model-a");
+		const models = createModels();
+		const providerA = testProvider({ id: "direct", models: [selected] });
+		providerA.streamSimple = (requestModel) => {
+			calls.push(`a:${requestModel === selected}`);
+			return testProvider({ id: "response" }).streamSimple(requestModel, context);
+		};
+		models.setProvider(providerA);
+		const stream = models.streamSimple(selected, context);
+		const providerB = testProvider({ id: "direct", models: [selected] });
+		providerB.streamSimple = (requestModel) => {
+			calls.push(`b:${requestModel === selected}`);
+			return testProvider({ id: "response" }).streamSimple(requestModel, context);
+		};
+		models.setProvider(providerB);
+
+		await stream.result();
+		expect(calls).toEqual(["a:true"]);
+	});
+
+	it("keeps leased deferred methods bound and reports unsupported capabilities consistently", async () => {
+		const selected = testModel("deferred", "model-a");
+		const calls: string[] = [];
+		const captured = testProvider({ id: "deferred", models: [selected] });
+		captured.fetchDeferred = function (requestModel) {
+			calls.push(`${this === captured}:fetch:${requestModel === selected}`);
+			return testProvider({ id: "response" }).streamSimple(requestModel, context);
+		};
+		captured.cancelDeferred = async function (requestModel) {
+			calls.push(`${this === captured}:cancel:${requestModel === selected}`);
+		};
+		const handle: DeferredHandle = { provider: "deferred", modelId: "model-a", api: "test-api", id: "job" };
+		const models = createModels();
+		models.setProvider(captured);
+		const lease = models.lease("deferred", "model-a");
+		models.setProvider(testProvider({ id: "deferred" }));
+
+		expect((await lease!.fetchDeferred(handle)).stopReason).toBe("stop");
+		await lease!.cancelDeferred(handle);
+		expect(calls).toEqual(["true:fetch:true", "true:cancel:true"]);
+
+		models.setProvider(testProvider({ id: "unsupported" }));
+		const unsupported = models.lease("unsupported", "model-a");
+		expect((await unsupported!.fetchDeferred({ ...handle, provider: "unsupported" })).stopReason).toBe("error");
+		await expect(unsupported!.cancelDeferred({ ...handle, provider: "unsupported" })).rejects.toMatchObject({
+			code: "provider",
+		});
 	});
 
 	it("swallows provider source failures for both all-provider and single-provider listing", () => {
