@@ -3,14 +3,14 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.7 — Add the upstream-mergeable `Models.lease` prerequisite for provider dispatch
-- Status: first implementation review blocked an auth-boundary leak; lease-bound header-binder rework independently approved
+- Work item: 1.8 — Add prompt acceptance and durable assistant-effect intent before provider dispatch
+- Status: 1.7 provider request leases committed as `c9e561a3c`; independent final review PASS
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Add and independently review the additive upstream-mergeable `Models.lease` API.
-2. Implement no-tool prompt acceptance and durable assistant-effect intent before provider dispatch.
+1. Design and implement no-tool prompt acceptance plus durable assistant-effect intent before dispatch.
+2. Bind the captured `ModelRequestLease` to effect execution without persisting or exposing it.
 3. Implement provider settlement, response/usage commit, classification, and terminal cleanup.
 4. Add close/reopen Tier A coverage for every resulting action and transition boundary.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
