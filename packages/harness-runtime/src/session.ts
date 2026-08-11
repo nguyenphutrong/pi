@@ -18,6 +18,7 @@ import {
 	decodeRunOperationRegister,
 	decodeRunStateRegister,
 	encodeLaneConfiguration,
+	encodeRunOperation,
 	encodeRunState,
 	type LaneConfiguration,
 	type LaneState,
@@ -284,6 +285,20 @@ export interface StartAssistantStepTransition {
 	readonly retryPolicy: NormalizedRetryPolicy;
 }
 
+export interface AcceptPromptTransition {
+	readonly messages: readonly Message[];
+	readonly expectedConfigurationSeq: number;
+	readonly expectedLaneStateSeq: number;
+	readonly expectedLeafSeq: number;
+	readonly expectedProvider: string;
+	readonly expectedModelId: string;
+	readonly identityAvailable: boolean;
+}
+
+export type AcceptPromptResult =
+	| { readonly status: "committed"; readonly attachment: RuntimeAttachment }
+	| { readonly status: "stale" | "busy" | "unavailable"; readonly attachment: RuntimeAttachment };
+
 export interface RuntimeTransitionResult {
 	readonly committed: boolean;
 	readonly attachment: RuntimeAttachment;
@@ -463,6 +478,171 @@ export class MemorySession implements Session {
 					runOperation,
 					runState,
 					...hydrated,
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	acceptPrompt(transition: AcceptPromptTransition): Promise<AcceptPromptResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		if (transition.messages.length === 0)
+			return Promise.reject(new SessionError("invalid_query", "Prompt must contain at least one message"));
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			let currentRunOperation: CurrentRegister<RunOperation> | undefined;
+			let currentRunState: CurrentRegister<RunState> | undefined;
+			if (laneState.value.currentOperationId !== null) {
+				const operationId = laneState.value.currentOperationId;
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", operationId),
+					this.#storage.getRegister("op.state", operationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				currentRunOperation = decodeRunOperationRegister(metadataCandidate, operationId);
+				currentRunState = decodeRunStateRegister(stateCandidate, operationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, currentRunOperation, currentRunState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation: currentRunOperation,
+				runState: currentRunState,
+				...hydrated,
+			});
+			const expectedIdentity =
+				configuration.value.model.provider === transition.expectedProvider &&
+				configuration.value.model.modelId === transition.expectedModelId;
+			if (
+				configuration.seq !== transition.expectedConfigurationSeq ||
+				laneState.seq !== transition.expectedLaneStateSeq ||
+				mainLeaf.seq !== transition.expectedLeafSeq ||
+				!expectedIdentity
+			)
+				return Object.freeze({ status: "stale" as const, attachment });
+			if (laneState.value.currentOperationId !== null) return Object.freeze({ status: "busy" as const, attachment });
+			if (!transition.identityAvailable) return Object.freeze({ status: "unavailable" as const, attachment });
+
+			const operationId = this.idGenerator.next();
+			const entryIds = transition.messages.map(() => this.idGenerator.next());
+			const candidates = [operationId, ...entryIds];
+			if (new Set(candidates).size !== candidates.length)
+				throw new SessionError("storage", "Generated prompt acceptance IDs are not unique");
+			const [occupiedEntries, occupiedUsageRows, ...occupiedRegisters] = await Promise.all([
+				this.#storage.getEntries(candidates),
+				this.#storage.getUsageRows(candidates),
+				...candidates.flatMap((id) => [
+					this.#storage.getRegister("op.meta", id),
+					this.#storage.getRegister("op.state", id),
+				]),
+			]);
+			if (occupiedEntries.size > 0 || occupiedUsageRows.size > 0 || occupiedRegisters.some(Boolean))
+				throw new SessionError("storage", "Generated prompt acceptance ID is already occupied");
+
+			const runOperation: RunOperation = {
+				operationId,
+				lane: "main",
+				sourceLeafId: mainLeaf.value,
+				startedAt: Date.now(),
+				intent: { kind: "run", promptEntryIds: entryIds },
+			};
+			const runState: RunState = {
+				kind: "run",
+				control: { status: "running" },
+				settings: {
+					compaction: { enabled: false, reserveTokens: 0, keepRecentTokens: 0 },
+					steeringMode: "all",
+					followUpMode: "all",
+					toolExecution: "sequential",
+				},
+				phase: {
+					kind: "checkpoint",
+					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+					triggerEntryId: entryIds.at(-1)!,
+				},
+				inbox: { steer: [], followUp: [], writes: [] },
+				latestAssistantEntryId: null,
+			};
+			const writes = transition.messages.map((message, index) => ({
+				kind: "entry" as const,
+				entry: {
+					id: entryIds[index],
+					parentId: index === 0 ? mainLeaf.value : entryIds[index - 1],
+					type: "message" as const,
+					payload: encodeMessage(message),
+				},
+			}));
+			const committed = await this.#storage.commit({
+				writes: [
+					...writes,
+					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: entryIds.at(-1)! },
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.meta",
+						key: operationId,
+						value: encodeRunOperation(runOperation),
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: operationId,
+						value: encodeRunState(runState, operationId),
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: STATE_NAMESPACE,
+						key: MAIN,
+						value: { currentOperationId: operationId, pendingNextRun: [] },
+					},
+				],
+			});
+			const entries = new Map(hydrated.entries);
+			for (let index = 0; index < transition.messages.length; index++)
+				entries.set(
+					entryIds[index],
+					Object.freeze({
+						id: entryIds[index],
+						parentId: index === 0 ? mainLeaf.value : entryIds[index - 1],
+						seq: committed.seqs[index],
+						timestamp: committed.timestamp,
+						type: "message" as const,
+						message: structuredClone(transition.messages[index]),
+					}),
+				);
+			const offset = transition.messages.length;
+			return Object.freeze({
+				status: "committed" as const,
+				attachment: Object.freeze({
+					laneConfiguration: configuration,
+					laneState: Object.freeze({
+						seq: committed.seqs[offset + 3],
+						value: { currentOperationId: operationId, pendingNextRun: [] },
+					}),
+					mainLeaf: Object.freeze({ seq: committed.seqs[offset], value: entryIds.at(-1)! }),
+					runOperation: Object.freeze({ seq: committed.seqs[offset + 1], value: structuredClone(runOperation) }),
+					runState: Object.freeze({ seq: committed.seqs[offset + 2], value: structuredClone(runState) }),
+					entries,
+					usageRows: hydrated.usageRows,
 				}),
 			});
 		});

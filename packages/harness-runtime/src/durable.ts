@@ -265,6 +265,18 @@ export function decodeRunOperationRegister(candidate: unknown, operationId: stri
 	});
 }
 
+export function encodeRunOperation(value: RunOperation): JsonValue {
+	try {
+		assertJsonValue(value);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Run operation must be detached JSON-safe data", error);
+	}
+	return structuredClone(
+		decodeRunOperationRegister({ namespace: "op.meta", key: value.operationId, seq: 1, value }, value.operationId)
+			.value,
+	) as unknown as JsonValue;
+}
+
 function generationContext(value: unknown): GenerationContext {
 	const context = object(
 		value,

@@ -1,5 +1,7 @@
 import type { LaneConfiguration } from "./durable.ts";
 import {
+	type AcceptPromptResult,
+	type AcceptPromptTransition,
 	MemorySession,
 	type RuntimeAttachment,
 	type RuntimeTransitionResult,
@@ -21,4 +23,10 @@ export function startAssistantStep(
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.startAssistantStep(transition);
+}
+
+export function acceptPrompt(session: Session, transition: AcceptPromptTransition): Promise<AcceptPromptResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.acceptPrompt(transition);
 }
