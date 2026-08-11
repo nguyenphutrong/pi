@@ -1,8 +1,11 @@
 # Harness Rewrite Blockers
 
-## B-001 — Confirm ownership of decoded durable-envelope validation
+No current blockers.
+
+## Resolved B-001 — Confirm ownership of decoded durable-envelope validation
 
 - Date: 2026-08-11
+- Resolved: 2026-08-11 — human selected option 1; recorded in D-005
 - Phase/work item: 1 / 1.2 — `session-storage` contract and Memory backend
 - Trigger: §6 repeated review rejection. Review pass 1 rejected incomplete runtime structural validation; after that was expanded and regression-tested, review pass 2 rejected the same boundary for lacking validators for complete decoded durable envelopes.
 - State: implementation and tests are uncommitted. Focused/package tests pass 22/22, but one current branch-order expectation is now known to encode incorrect `oldestFirst` stop behavior. No flagged code may be committed.

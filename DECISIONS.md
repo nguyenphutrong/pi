@@ -81,3 +81,23 @@ Option 3.
 ### Rationale
 
 Storage must not know agents, lanes, or conversations, and the spec assigns complete semantic validation to Session before storage admission. A domain-neutral envelope keeps dependencies pointing from `harness-runtime` and `session-sqlite` into `session-storage`, while typed decoding prevents malformed persisted data from reaching Harness code. Storage conformance covers atomicity, identity, sequence, register, query, stats, and close behavior; Harness codec conformance separately covers entry and register schemas.
+
+## D-005 — Validate complete durable envelopes in `session-storage`
+
+- Date: 2026-08-11
+- Phase: 1
+- Status: confirmed by human after B-001 escalation
+- References: `packages/agent/docs/harness-v3.md` §§1.1, 1.4–1.5, 2.8, 9.3; D-004
+
+### Options
+
+1. Add reusable structural validators for complete backend-read `Entry`, `UsageRow`, and `Register` envelopes in `session-storage`.
+2. Defer complete-envelope validation to the Harness Session codec.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Storage owns structural envelope invariants, including storage-assigned sequence and timestamp fields. Harness remains responsible for semantic payload and typed register namespace validation. This keeps Memory and SQLite on one decoded-envelope contract without importing Harness types into either backend.
