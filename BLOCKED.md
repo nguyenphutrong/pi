@@ -1,6 +1,26 @@
 # Harness Rewrite Blockers
 
-No current blockers.
+## B-002 — Memory handle still exposes its core at runtime
+
+- Date: 2026-08-11
+- Phase: 1
+- Work item: 1.3, increment A — reopenable Memory storage handles
+- Trigger: two independent review rejections for the same lifecycle-encapsulation reason
+- Status: awaiting human choice
+
+### Context
+
+The first review rejected an exported `MemoryStorageState` that publicly exposed commit/read/drain operations. The rework moved those operations into a module-private core and limited `MemoryStorageState` to `createStorage()`. The second review found that `MemoryStorage` still stores the core in a TypeScript `private` field; that modifier is erased, so JavaScript can access `storage.core.commit(...)` after close and bypass handle admission.
+
+Current uncommitted implementation and tests otherwise pass 29/29 package tests and `npm run check`.
+
+### Decision needed
+
+1. **Recommended:** approve replacing the TypeScript-private field with native runtime-private `#core`, then re-run review.
+2. Accept TypeScript-private encapsulation as sufficient for this non-security API and proceed despite the review finding.
+3. Use a module-private `WeakMap<MemoryStorage, Core>` instead of a native private field.
+
+Reply with `1`, `2`, or `3`.
 
 ## Resolved B-001 — Confirm ownership of decoded durable-envelope validation
 

@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.3 — Implement the Memory-only Session tree/repository and typed codec boundary
-- Status: design approved by independent review; implementation pending
+- Status: blocked by B-002 after two lifecycle-encapsulation review rejections
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
