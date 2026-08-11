@@ -3,16 +3,16 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.6 — Implement the pure next-action planner and stable one-step manual scheduler
-- Status: D-011 planner/manual-scheduler design approved; implementation pending
+- Work item: 1.7 — Add the upstream-mergeable `Models.lease` prerequisite for provider dispatch
+- Status: 1.6 pure planner and one-step manual scheduler committed as `0ba92a6a8`; independent conformance review PASS
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement the pure next-action planner over the detached runtime attachment and immutable live-effect keys.
-2. Add stable `peekAction()` and one-step `executeAction()` scheduling with no provider effects.
-3. Add Tier A planner/recovery and transition-writer tests for every Phase 1 state and crash boundary owned by the shell.
-4. Add the upstream-mergeable `Models.lease` API, then implement no-tool prompt/provider/final-response intent, settlement, and terminal cleanup.
+1. Add and independently review the additive upstream-mergeable `Models.lease` API.
+2. Implement no-tool prompt acceptance and durable assistant-effect intent before provider dispatch.
+3. Implement provider settlement, response/usage commit, classification, and terminal cleanup.
+4. Add close/reopen Tier A coverage for every resulting action and transition boundary.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
 ## Phase order

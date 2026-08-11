@@ -227,7 +227,7 @@ The mission's phase order controls implementation sequencing: hooks, events, and
 
 - Date: 2026-08-11
 - Phase: 1
-- Status: accepted after independent design review
+- Status: implemented by `0ba92a6a8` after independent conformance review
 - References: D-010; `packages/agent/docs/harness-v3.md` §§3.5–3.7, 4.1–4.5, 4.7, 5.1, 9.3
 
 ### Options

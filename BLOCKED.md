@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers as of the Phase 1 work item 1.6 design (`59cd1bed5`).
+No active blockers as of Phase 1 work item 1.6 (`0ba92a6a8`).
 
 ## Resolved B-004 — Restore cannot validate a reserved usage ID with the current Storage contract
 
