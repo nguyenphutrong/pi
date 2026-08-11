@@ -198,12 +198,17 @@ describe("MemoryStorage shared state", () => {
 		expectTypeOf<keyof MemoryStorageState>().toEqualTypeOf<"createStorage">();
 	});
 
-	it("keeps the shared core private on storage handles", () => {
+	it("keeps shared core and lifecycle state private on fresh and closed storage handles", async () => {
 		const storage = new MemoryStorageState().createStorage();
-		expect(Object.hasOwn(storage, "core")).toBe(false);
-		expect("core" in storage).toBe(false);
-		expect(storage.commit).toEqual(expect.any(Function));
-		expect(storage.close).toEqual(expect.any(Function));
+		for (const state of ["fresh", "closed"] as const) {
+			for (const field of ["core", "sealed", "closePromise"] as const) {
+				expect(Object.hasOwn(storage, field), `${state} handle must not own ${field}`).toBe(false);
+				expect(field in storage, `${state} handle must not expose ${field}`).toBe(false);
+			}
+			expect(storage.commit).toEqual(expect.any(Function));
+			expect(storage.close).toEqual(expect.any(Function));
+			if (state === "fresh") await storage.close();
+		}
 	});
 
 	it("reopens committed entries, registers, usage stats, and sequence allocation", async () => {

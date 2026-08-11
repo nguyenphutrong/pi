@@ -271,8 +271,8 @@ export class MemoryStorageState {
 
 export class MemoryStorage implements Storage {
 	readonly #core: MemoryStorageCore;
-	private sealed = false;
-	private closePromise: Promise<void> | undefined;
+	#sealed = false;
+	#closePromise: Promise<void> | undefined;
 
 	constructor(state: MemoryStorageState = new MemoryStorageState()) {
 		const core = memoryStorageCores.get(state);
@@ -318,10 +318,10 @@ export class MemoryStorage implements Storage {
 	}
 
 	close(): Promise<void> {
-		if (this.closePromise) return this.closePromise;
-		this.sealed = true;
-		this.closePromise = this.#core.drain();
-		return this.closePromise;
+		if (this.#closePromise) return this.#closePromise;
+		this.#sealed = true;
+		this.#closePromise = this.#core.drain();
+		return this.#closePromise;
 	}
 
 	private call<T>(operation: () => Promise<T>): Promise<T> {
@@ -334,6 +334,6 @@ export class MemoryStorage implements Storage {
 	}
 
 	private assertOpen(): void {
-		if (this.sealed) throw new StorageError("closed", "Storage is closed");
+		if (this.#sealed) throw new StorageError("closed", "Storage is closed");
 	}
 }
