@@ -1,8 +1,15 @@
-import type { Message, Models, RetryPolicy } from "@earendil-works/pi-ai";
+import type {
+	Context,
+	Message,
+	ModelRequestLease,
+	Models,
+	ModelsSimpleStreamOptions,
+	RetryPolicy,
+} from "@earendil-works/pi-ai";
 import { encodeMessage } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
-import { type ActionInfo, type PlannedAction, planAction } from "./planner.ts";
-import { acceptPrompt, attachRuntime, startAssistantStep } from "./runtime-port.ts";
+import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction } from "./planner.ts";
+import { acceptPrompt, attachRuntime, prepareAssistantEffect, startAssistantStep } from "./runtime-port.ts";
 import { RuntimeSettingsOwner } from "./runtime-settings.ts";
 import type { RuntimeAttachment } from "./session.ts";
 import type { Session } from "./types.ts";
@@ -25,11 +32,25 @@ export interface RuntimeShellOptions {
 	readonly models?: Models;
 }
 
+interface AssistantEffectPlan {
+	readonly key: string;
+	readonly lease: ModelRequestLease;
+	readonly context: Context;
+	readonly options: ModelsSimpleStreamOptions;
+	readonly operationId: string;
+	readonly stepId: string;
+	readonly attempt: number;
+	readonly responseEntryId: string;
+	readonly usageId: string;
+	readonly intendedOutputLimit: number;
+	readonly contextWindow: number;
+}
+
 export class RuntimeShell {
 	readonly #session: Session;
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
-	readonly #liveEffectKeys = new Set<string>();
+	readonly #assistantEffects = new Map<string, AssistantEffectPlan>();
 	#current: RuntimeAttachment;
 	#sealed = false;
 	#admissionLine: Promise<void> = Promise.resolve();
@@ -45,7 +66,7 @@ export class RuntimeShell {
 	#plan(): PlannedAction | undefined {
 		return planAction(this.#current, {
 			settingsRevision: this.#settings.peek().revision,
-			liveEffectKeys: this.#liveEffectKeys,
+			assistantEffects: this.#assistantEffects,
 		});
 	}
 
@@ -67,12 +88,88 @@ export class RuntimeShell {
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
-			if (action.info.kind !== "start_assistant_step")
+			if (action.info.kind !== "start_assistant_step" && action.info.kind !== "prepare_assistant_effect")
 				throw new RuntimeShellError("unavailable", `Action ${action.info.kind} is not executable in Phase 1`);
 			const info = action.info;
 			return this.#settings.withSnapshot(async (settings) => {
 				if (settings.revision !== action.expected.settingsRevision)
 					throw new RuntimeShellError("stale", "Runtime settings changed before action execution");
+				if (info.kind === "prepare_assistant_effect") {
+					const state = this.#current.runState?.value;
+					const operation = this.#current.runOperation?.value;
+					const phase = state?.phase;
+					if (!operation || phase?.kind !== "assistant" || phase.generation.status !== "ready")
+						throw new RuntimeShellError("stale", "Assistant generation is no longer ready");
+					const generation = phase.generation;
+					const provider = generation.context.configuration.model.provider;
+					const modelId = generation.context.configuration.model.modelId;
+					let lease: ModelRequestLease | undefined;
+					try {
+						lease = this.#models?.lease(provider, modelId);
+					} catch {
+						lease = undefined;
+					}
+					const model = lease?.model;
+					const intendedOutputLimit = model?.maxTokens;
+					const contextWindow = model?.contextWindow;
+					if (
+						!lease ||
+						!model ||
+						model.provider !== provider ||
+						model.id !== modelId ||
+						typeof intendedOutputLimit !== "number" ||
+						!Number.isSafeInteger(intendedOutputLimit) ||
+						intendedOutputLimit <= 0 ||
+						typeof contextWindow !== "number" ||
+						!Number.isSafeInteger(contextWindow) ||
+						contextWindow <= 0
+					)
+						throw new RuntimeShellError("unavailable", "Captured provider/model lease is unavailable");
+					const messages = structuredClone(await this.#session.projectBuiltinContext());
+					const context: Context = {
+						messages,
+						...(operation.intent.systemPromptOverride === undefined
+							? {}
+							: { systemPrompt: operation.intent.systemPromptOverride }),
+					};
+					const options: ModelsSimpleStreamOptions = {
+						...structuredClone(generation.context.streamOptions),
+						...(generation.context.configuration.thinkingLevel === "off"
+							? {}
+							: { reasoning: generation.context.configuration.thinkingLevel }),
+					};
+					const result = await prepareAssistantEffect(this.#session, {
+						operationId: info.operationId,
+						stepId: info.stepId,
+						attempt: info.nextAttempt,
+						expectedOperationStateSeq: action.expected.operationStateSeq,
+						expectedLaneStateSeq: action.expected.laneStateSeq,
+						expectedConfigurationSeq: action.expected.configurationSeq,
+						expectedLeafSeq: this.#current.mainLeaf.seq,
+						expectedLeafId: this.#current.mainLeaf.value,
+						expectedProvider: provider,
+						expectedModelId: modelId,
+						intendedOutputLimit,
+						contextWindow,
+					});
+					this.#current = result.attachment;
+					if (!result.committed) throw new RuntimeShellError("stale", "Action no longer matches durable state");
+					const key = assistantEffectKey(info.operationId, info.stepId, info.nextAttempt);
+					this.#assistantEffects.set(key, {
+						key,
+						lease,
+						context,
+						options,
+						operationId: info.operationId,
+						stepId: info.stepId,
+						attempt: info.nextAttempt,
+						responseEntryId: result.responseEntryId,
+						usageId: result.usageId,
+						intendedOutputLimit,
+						contextWindow,
+					});
+					return info;
+				}
 				const result = await startAssistantStep(this.#session, {
 					operationId: info.operationId,
 					triggerEntryId: info.triggerEntryId,
@@ -135,7 +232,10 @@ export class RuntimeShell {
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#sealed = true;
-		this.#closePromise = this.#admissionLine.then(() => this.#session.close());
+		this.#closePromise = this.#admissionLine.then(() => {
+			this.#assistantEffects.clear();
+			return this.#session.close();
+		});
 		return this.#closePromise;
 	}
 }

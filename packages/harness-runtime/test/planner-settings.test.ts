@@ -97,14 +97,16 @@ function attachment(position: "idle" | "need" | "ready" | "pending" | "finish", 
 
 describe("pure Phase 1 action planner", () => {
 	it("covers every durable position and hides correctness tokens from ActionInfo", () => {
-		expect(planAction(attachment("idle").value, { settingsRevision: 0, liveEffectKeys: new Set() })).toBeUndefined();
+		expect(
+			planAction(attachment("idle").value, { settingsRevision: 0, assistantEffects: new Map() }),
+		).toBeUndefined();
 		for (const [position, kind] of [
 			["need", "start_assistant_step"],
 			["ready", "prepare_assistant_effect"],
 			["finish", "finish_run"],
 		] as const) {
 			const fixture = attachment(position);
-			const plan = planAction(fixture.value, { settingsRevision: 7, liveEffectKeys: new Set() })!;
+			const plan = planAction(fixture.value, { settingsRevision: 7, assistantEffects: new Map() })!;
 			expect(plan.info.kind).toBe(kind);
 			expect(Reflect.ownKeys(plan.info)).not.toContain("expectedOperationStateSeq");
 			expect(plan.expected).toEqual({
@@ -119,7 +121,9 @@ describe("pure Phase 1 action planner", () => {
 	it("prioritizes matching materialized reservations over a live key", () => {
 		const fixture = attachment("pending", true);
 		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
-		expect(planAction(fixture.value, { settingsRevision: 0, liveEffectKeys: new Set([key]) })?.info).toEqual({
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffects: new Map([[key, true]]) })?.info,
+		).toEqual({
 			kind: "repair_materialized_assistant",
 			operationId: fixture.operationId,
 			responseEntryId: fixture.responseEntryId,
@@ -130,21 +134,30 @@ describe("pure Phase 1 action planner", () => {
 	it("awaits only the exact deterministic live key and otherwise recovers", () => {
 		const fixture = attachment("pending");
 		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
-		expect(planAction(fixture.value, { settingsRevision: 0, liveEffectKeys: new Set([key]) })?.info.kind).toBe(
-			"await_assistant_effect",
-		);
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffects: new Map([[key, true]]) })?.info.kind,
+		).toBe("await_assistant_effect");
 		for (const keys of [new Set<string>(), new Set([`${key}:bad`]), new Set(["malformed"])])
-			expect(planAction(fixture.value, { settingsRevision: 0, liveEffectKeys: keys })?.info.kind).toBe(
-				"recover_assistant_effect",
-			);
+			expect(
+				planAction(fixture.value, {
+					settingsRevision: 0,
+					assistantEffects: new Map([...keys].map((key) => [key, true])),
+				})?.info.kind,
+			).toBe("recover_assistant_effect");
 	});
 
 	it("is repeatable and does not mutate attachments, maps, or the input set", () => {
 		const fixture = attachment("pending");
 		const keys = new Set(["unrelated"]);
 		const before = structuredClone({ attachment: fixture.value, keys: [...keys] });
-		const first = planAction(fixture.value, { settingsRevision: 3, liveEffectKeys: keys });
-		const second = planAction(fixture.value, { settingsRevision: 3, liveEffectKeys: keys });
+		const first = planAction(fixture.value, {
+			settingsRevision: 3,
+			assistantEffects: new Map([...keys].map((key) => [key, true])),
+		});
+		const second = planAction(fixture.value, {
+			settingsRevision: 3,
+			assistantEffects: new Map([...keys].map((key) => [key, true])),
+		});
 		expect(second).toEqual(first);
 		expect({ attachment: fixture.value, keys: [...keys] }).toEqual(before);
 	});

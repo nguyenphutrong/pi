@@ -24,7 +24,7 @@ export function assistantEffectKey(operationId: string, stepId: string, attempt:
 
 export function planAction(
 	attachment: RuntimeAttachment,
-	inputs: { readonly settingsRevision: number; readonly liveEffectKeys: ReadonlySet<string> },
+	inputs: { readonly settingsRevision: number; readonly assistantEffects: Readonly<{ has(key: string): boolean }> },
 ): PlannedAction | undefined {
 	const operation = attachment.runOperation;
 	const state = attachment.runState;
@@ -63,7 +63,7 @@ export function planAction(
 				responseEntryId: generation.responseEntryId,
 				usageId: generation.usageId,
 			};
-		} else if (inputs.liveEffectKeys.has(key)) {
+		} else if (inputs.assistantEffects.has(key)) {
 			info = { kind: "await_assistant_effect", operationId: operation.value.operationId, effectKey: key };
 		} else {
 			info = {

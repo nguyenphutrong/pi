@@ -152,7 +152,7 @@ async function rooted(position: "idle" | "need" | "ready" | "pending" | "finish"
 		);
 	}
 	await storage.commit({ writes });
-	return { storage, operationId, prompt, source };
+	return { storage, operationId, prompt, source, stepId };
 }
 
 function session(storage: Storage) {
@@ -163,9 +163,12 @@ function session(storage: Storage) {
 	);
 }
 
-function availableModels() {
+function availableModels(
+	limits: { maxTokens: number; contextWindow: number } = { maxTokens: 4096, contextWindow: 8192 },
+) {
 	const models = createModels();
 	const lease = {
+		model: { provider: "test", id: "current", ...limits },
 		stream: vi.fn(),
 		streamSimple: vi.fn(),
 		fetchDeferred: vi.fn(),
@@ -175,7 +178,306 @@ function availableModels() {
 	return { models, lease, leaseSpy };
 }
 
+function expectLeaseUnused(lease: ModelRequestLease): void {
+	expect(lease.stream).not.toHaveBeenCalled();
+	expect(lease.streamSimple).not.toHaveBeenCalled();
+	expect(lease.fetchDeferred).not.toHaveBeenCalled();
+	expect(lease.cancelDeferred).not.toHaveBeenCalled();
+}
+
 describe("Phase 1 runtime shell", () => {
+	it("prepares one detached durable assistant intent and parks the retained live plan", async () => {
+		const fixture = await rooted("ready");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const responseEntryId = id();
+		const usageId = id();
+		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(responseEntryId).mockReturnValueOnce(usageId);
+		const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+		const { models, lease, leaseSpy } = availableModels({ maxTokens: 321, contextWindow: 654 });
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+
+		await expect(shell.executeAction()).resolves.toMatchObject({
+			kind: "prepare_assistant_effect",
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			nextAttempt: 1,
+		});
+		expect(leaseSpy).toHaveBeenCalledExactlyOnceWith("test", "current");
+		expect(projection).toHaveBeenCalledTimes(1);
+		expectLeaseUnused(lease);
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(instrumented.committedTransactions[0].writes).toEqual([
+			expect.objectContaining({ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId }),
+		]);
+		const durable = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value;
+		expect(durable).toMatchObject({
+			phase: {
+				kind: "assistant",
+				generation: {
+					status: "effect_pending",
+					attempt: 1,
+					responseEntryId,
+					usageId,
+					intendedOutputLimit: 321,
+					contextWindow: 654,
+					context: { configuration: config(), streamOptions: {} },
+				},
+			},
+		});
+		const serialized = JSON.stringify(durable);
+		for (const forbidden of ["lease", "messages", "streamSimple", "fetchDeferred", "cancelDeferred", "reasoning"])
+			expect(serialized).not.toContain(forbidden);
+		expect(await shell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
+		const beforePark = instrumented.committedTransactions.length;
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		expect(instrumented.committedTransactions).toHaveLength(beforePark);
+		expect(projection).toHaveBeenCalledTimes(1);
+		expectLeaseUnused(lease);
+		await shell.close();
+	});
+
+	it.each([
+		["missing", undefined],
+		["throwing", undefined],
+		["provider mismatch", { provider: "other", id: "current", maxTokens: 1, contextWindow: 2 }],
+		["model mismatch", { provider: "test", id: "other", maxTokens: 1, contextWindow: 2 }],
+		["zero max", { provider: "test", id: "current", maxTokens: 0, contextWindow: 2 }],
+		["fractional context", { provider: "test", id: "current", maxTokens: 1, contextWindow: 2.5 }],
+	] as const)("rejects %s assistant leases before projection, IDs, or writes", async (name, model) => {
+		const fixture = await rooted("ready");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const next = vi.spyOn(runtimeSession.idGenerator, "next");
+		const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+		const models = createModels();
+		const lease =
+			model === undefined
+				? undefined
+				: ({
+						model,
+						stream: vi.fn(),
+						streamSimple: vi.fn(),
+						fetchDeferred: vi.fn(),
+						cancelDeferred: vi.fn(),
+					} as unknown as ModelRequestLease);
+		const leaseSpy = vi.spyOn(models, "lease");
+		if (name === "throwing")
+			leaseSpy.mockImplementation(() => {
+				throw new Error("lease failed");
+			});
+		else leaseSpy.mockReturnValue(lease);
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		expect(projection).not.toHaveBeenCalled();
+		expect(next).not.toHaveBeenCalled();
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		if (lease) expectLeaseUnused(lease);
+		expect(await shell.peekAction()).toMatchObject({ kind: "prepare_assistant_effect" });
+		await shell.close();
+	});
+
+	it("snapshots limits before blocked projection and retains a replaced registry lease", async () => {
+		const fixture = await rooted("ready");
+		const runtimeSession = session(fixture.storage);
+		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
+		const { models, lease, leaseSpy } = availableModels({ maxTokens: 100, contextWindow: 200 });
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const projected = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
+		vi.spyOn(runtimeSession, "projectBuiltinContext").mockImplementation(async () => {
+			entered();
+			await blocked;
+			return originalProjection();
+		});
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const execute = shell.executeAction();
+		await projected;
+		Object.assign(lease.model, { maxTokens: 999, contextWindow: 999 });
+		leaseSpy.mockImplementation(() => {
+			throw new Error("registry replaced");
+		});
+		release();
+		await execute;
+		const state = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value as Record<
+			string,
+			JsonValue
+		>;
+		const generation = (state.phase as Record<string, JsonValue>).generation as Record<string, JsonValue>;
+		expect(generation).toMatchObject({ intendedOutputLimit: 100, contextWindow: 200 });
+		expect(leaseSpy).toHaveBeenCalledTimes(1);
+		expectLeaseUnused(lease);
+		await shell.close();
+	});
+
+	it.each(["op.state", "lane.state", "lane.config", "lane.leaf"] as const)(
+		"discards the prepared plan when canonical %s sequence changes after projection",
+		async (namespace) => {
+			const fixture = await rooted("ready");
+			const instrumented = instrumentStorage(fixture.storage);
+			const runtimeSession = session(instrumented);
+			const next = vi.spyOn(runtimeSession.idGenerator, "next");
+			const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
+			const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+			const { models, leaseSpy } = availableModels();
+			const shell = await createRuntimeShell(runtimeSession, config(), { models });
+			const key = namespace === "op.state" ? fixture.operationId : "main";
+			const current = await fixture.storage.getRegister(namespace, key);
+			projection.mockImplementationOnce(async () => {
+				await fixture.storage.commit({
+					writes: [{ kind: "register", op: "set", namespace, key, value: current!.value }],
+				});
+				return originalProjection();
+			});
+			const before = instrumented.committedTransactions.length;
+			await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+			expect(leaseSpy).toHaveBeenCalledTimes(1);
+			expect(next).not.toHaveBeenCalled();
+			expect(instrumented.committedTransactions).toHaveLength(before);
+			expect(await shell.peekAction()).toMatchObject({ kind: "prepare_assistant_effect" });
+			expect(leaseSpy).toHaveBeenCalledTimes(1);
+			await shell.close();
+		},
+	);
+
+	it("retains the ready generation model after a stale configuration refresh", async () => {
+		const fixture = await rooted("ready");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const next = vi.spyOn(runtimeSession.idGenerator, "next");
+		const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+		const { models, lease, leaseSpy } = availableModels();
+		const replacement: LaneConfiguration = { ...config(), model: { provider: "test", modelId: "replacement" } };
+		const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
+		projection.mockImplementationOnce(async () => {
+			await fixture.storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.config",
+						key: "main",
+						value: replacement as unknown as JsonValue,
+					},
+				],
+			});
+			return originalProjection();
+		});
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+		expect(next).not.toHaveBeenCalled();
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		expect(await shell.peekAction()).toMatchObject({ kind: "prepare_assistant_effect" });
+
+		const responseEntryId = id();
+		const usageId = id();
+		next.mockReturnValueOnce(responseEntryId).mockReturnValueOnce(usageId);
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "prepare_assistant_effect" });
+		expect(leaseSpy.mock.calls).toEqual([
+			["test", "current"],
+			["test", "current"],
+		]);
+		expectLeaseUnused(lease);
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		const durable = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value;
+		expect(durable).toMatchObject({
+			phase: {
+				kind: "assistant",
+				generation: {
+					status: "effect_pending",
+					responseEntryId,
+					usageId,
+					context: { configuration: config() },
+				},
+			},
+		});
+		await shell.close();
+	});
+
+	it("rejects rooted closure corruption after projection before IDs, write, or live plan", async () => {
+		const fixture = await rooted("ready");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const next = vi.spyOn(runtimeSession.idGenerator, "next");
+		const { models } = availableModels();
+		vi.spyOn(runtimeSession, "projectBuiltinContext").mockImplementationOnce(async () => {
+			await fixture.storage.commit({
+				writes: [{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: fixture.source }],
+			});
+			return [user("projected")];
+		});
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const before = instrumented.committedTransactions.length;
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "corruption" });
+		expect(next).not.toHaveBeenCalled();
+		expect(instrumented.committedTransactions).toHaveLength(before);
+		await shell.close();
+	});
+
+	it.each(["same", "operation", "step", "prompt", "entry", "usage", "op.meta", "op.state"] as const)(
+		"rejects assistant reservation collision with %s without changing ready state",
+		async (kind) => {
+			const fixture = await rooted("ready");
+			const collision = id();
+			if (["entry", "usage", "op.meta", "op.state"].includes(kind)) {
+				const owner = id();
+				await fixture.storage.commit({
+					writes:
+						kind === "entry"
+							? [
+									{
+										kind: "entry",
+										entry: {
+											id: collision,
+											parentId: null,
+											type: "message",
+											payload: json(user("occupied")),
+										},
+									},
+								]
+							: kind === "usage"
+								? [
+										{
+											kind: "entry",
+											entry: { id: owner, parentId: null, type: "message", payload: json(user("owner")) },
+										},
+										{
+											kind: "usage",
+											row: { id: collision, entryId: owner, adjustment: false, usage: ZERO_USAGE },
+										},
+									]
+								: [{ kind: "register", op: "set", namespace: kind, key: collision, value: null }],
+				});
+			}
+			const instrumented = instrumentStorage(fixture.storage);
+			const runtimeSession = session(instrumented);
+			const first =
+				kind === "operation"
+					? fixture.operationId
+					: kind === "step"
+						? fixture.stepId
+						: kind === "prompt"
+							? fixture.prompt
+							: collision;
+			vi.spyOn(runtimeSession.idGenerator, "next")
+				.mockReturnValueOnce(first)
+				.mockReturnValueOnce(kind === "same" ? first : id());
+			const { models } = availableModels();
+			const shell = await createRuntimeShell(runtimeSession, config(), { models });
+			const before = instrumented.committedTransactions.length;
+			await expect(shell.executeAction()).rejects.toMatchObject({ code: "storage" });
+			expect(instrumented.committedTransactions).toHaveLength(before);
+			expect(await shell.peekAction()).toMatchObject({ kind: "prepare_assistant_effect" });
+			await shell.close();
+		},
+	);
 	it("accepts an ordered multi-role prompt as one atomic canonical run and detaches caller data", async () => {
 		const fixture = await rooted("idle");
 		const priorLeafId = id();
@@ -597,6 +899,43 @@ describe("Phase 1 runtime shell", () => {
 		]);
 	});
 
+	it("lets an admitted assistant preparation commit before close drains", async () => {
+		const fixture = await rooted("ready");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const original = instrumented.getRegister.bind(instrumented);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const insideSession = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let gate = true;
+		instrumented.getRegister = async (namespace, key) => {
+			if (gate && namespace === "lane.config" && key === "main") {
+				gate = false;
+				entered();
+				await blocked;
+			}
+			return original(namespace, key);
+		};
+		const execute = shell.executeAction();
+		await insideSession;
+		const close = shell.close();
+		release();
+		await expect(execute).resolves.toMatchObject({ kind: "prepare_assistant_effect" });
+		await close;
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(instrumented.committedTransactions[0].writes).toEqual([
+			expect.objectContaining({ namespace: "op.state", key: fixture.operationId }),
+		]);
+	});
+
 	it("lets an admitted prompt finish while close drains it", async () => {
 		const fixture = await rooted("idle");
 		const instrumented = instrumentStorage(fixture.storage);
@@ -685,6 +1024,92 @@ describe("Phase 1 runtime shell", () => {
 		expect(entryLookups).toEqual([[promptId]]);
 		expect(usageLookups).toEqual([[]]);
 		expect(await reopened.peekAction()).toMatchObject({ kind: "start_assistant_step", operationId });
+		await reopened.close();
+	});
+
+	it("reopens a pending assistant without a live plan or model lookup using exact hydration only", async () => {
+		const state = new MemoryStorageState();
+		const firstStorage = state.createStorage();
+		const fixture = await rooted("ready");
+		const seeded = await fixture.storage.getRegister("lane.config", "main");
+		const sourceEntry = (await fixture.storage.getEntries([fixture.source])).get(fixture.source)!;
+		const promptEntry = (await fixture.storage.getEntries([fixture.prompt])).get(fixture.prompt)!;
+		const laneLeaf = await fixture.storage.getRegister("lane.leaf", "main");
+		const laneState = await fixture.storage.getRegister("lane.state", "main");
+		const operation = await fixture.storage.getRegister("op.meta", fixture.operationId);
+		const runState = await fixture.storage.getRegister("op.state", fixture.operationId);
+		await firstStorage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: {
+						id: sourceEntry.id,
+						parentId: sourceEntry.parentId,
+						type: sourceEntry.type,
+						payload: sourceEntry.payload,
+					},
+				},
+				{
+					kind: "entry",
+					entry: {
+						id: promptEntry.id,
+						parentId: promptEntry.parentId,
+						type: promptEntry.type,
+						payload: promptEntry.payload,
+					},
+				},
+				{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: seeded!.value },
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: laneLeaf!.value },
+				{ kind: "register", op: "set", namespace: "lane.state", key: "main", value: laneState!.value },
+				{ kind: "register", op: "set", namespace: "op.meta", key: fixture.operationId, value: operation!.value },
+				{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: runState!.value },
+			],
+		});
+		const firstSession = session(firstStorage);
+		vi.spyOn(firstSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
+		const { models } = availableModels();
+		const firstShell = await createRuntimeShell(firstSession, config(), { models });
+		await firstShell.executeAction();
+		expect(await firstShell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
+		await firstShell.close();
+
+		const reopenedStorage = state.createStorage();
+		const entryLookups: string[][] = [];
+		const usageLookups: string[][] = [];
+		const getEntries = reopenedStorage.getEntries.bind(reopenedStorage);
+		const getUsageRows = reopenedStorage.getUsageRows.bind(reopenedStorage);
+		reopenedStorage.getEntries = async (ids) => {
+			entryLookups.push([...ids]);
+			return getEntries(ids);
+		};
+		reopenedStorage.getUsageRows = async (ids) => {
+			usageLookups.push([...ids]);
+			return getUsageRows(ids);
+		};
+		reopenedStorage.listRegisters = async () => {
+			throw new Error("register scan forbidden");
+		};
+		reopenedStorage.scanEntries = async () => {
+			throw new Error("entry scan forbidden");
+		};
+		reopenedStorage.scanBranch = async () => {
+			throw new Error("branch scan forbidden");
+		};
+		reopenedStorage.scanBranchStructure = async () => {
+			throw new Error("branch structure scan forbidden");
+		};
+		reopenedStorage.getStats = async () => {
+			throw new Error("usage scan forbidden");
+		};
+		const reopenedModels = createModels();
+		const lease = vi.spyOn(reopenedModels, "lease");
+		const reopened = await createRuntimeShell(session(reopenedStorage), config(), { models: reopenedModels });
+		expect(entryLookups).toHaveLength(1);
+		expect(usageLookups).toHaveLength(1);
+		expect(lease).not.toHaveBeenCalled();
+		expect(await reopened.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
+		await expect(reopened.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		expect(lease).not.toHaveBeenCalled();
 		await reopened.close();
 	});
 

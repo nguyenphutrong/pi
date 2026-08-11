@@ -304,6 +304,35 @@ export interface RuntimeTransitionResult {
 	readonly attachment: RuntimeAttachment;
 }
 
+export interface PrepareAssistantEffectTransition {
+	readonly operationId: string;
+	readonly stepId: string;
+	readonly attempt: number;
+	readonly expectedOperationStateSeq: number;
+	readonly expectedLaneStateSeq: number;
+	readonly expectedConfigurationSeq: number;
+	readonly expectedLeafSeq: number;
+	readonly expectedLeafId: string | null;
+	readonly expectedProvider: string;
+	readonly expectedModelId: string;
+	readonly intendedOutputLimit: number;
+	readonly contextWindow: number;
+}
+
+export type PrepareAssistantEffectResult =
+	| {
+			readonly committed: true;
+			readonly attachment: RuntimeAttachment;
+			readonly responseEntryId: string;
+			readonly usageId: string;
+	  }
+	| {
+			readonly committed: false;
+			readonly attachment: RuntimeAttachment;
+			readonly responseEntryId?: undefined;
+			readonly usageId?: undefined;
+	  };
+
 export class MemorySession implements Session {
 	readonly metadata: SessionMetadata;
 	readonly idGenerator: IdGenerator;
@@ -478,6 +507,137 @@ export class MemorySession implements Session {
 					runOperation,
 					runState,
 					...hydrated,
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	prepareAssistantEffect(transition: PrepareAssistantEffectTransition): Promise<PrepareAssistantEffectResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		if (
+			!Number.isSafeInteger(transition.intendedOutputLimit) ||
+			transition.intendedOutputLimit <= 0 ||
+			!Number.isSafeInteger(transition.contextWindow) ||
+			transition.contextWindow <= 0
+		)
+			return Promise.reject(
+				new SessionError("invalid_query", "Assistant effect limits must be positive safe integers"),
+			);
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
+				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			const phase = runState?.value.phase;
+			const generation = phase?.kind === "assistant" ? phase.generation : undefined;
+			const current =
+				configuration.seq === transition.expectedConfigurationSeq &&
+				laneState.seq === transition.expectedLaneStateSeq &&
+				mainLeaf.seq === transition.expectedLeafSeq &&
+				mainLeaf.value === transition.expectedLeafId &&
+				currentOperationId === transition.operationId &&
+				runState?.seq === transition.expectedOperationStateSeq &&
+				generation?.status === "ready" &&
+				generation.context.stepId === transition.stepId &&
+				generation.nextAttempt === transition.attempt &&
+				generation.context.configuration.model.provider === transition.expectedProvider &&
+				generation.context.configuration.model.modelId === transition.expectedModelId;
+			if (!current) return Object.freeze({ committed: false as const, attachment });
+			if (!runOperation || !runState || generation?.status !== "ready")
+				throw new SessionError("corruption", "Validated assistant effect changed inside the mutation line");
+
+			const responseEntryId = this.idGenerator.next();
+			const usageId = this.idGenerator.next();
+			const directlyNamed = new Set([
+				transition.operationId,
+				transition.stepId,
+				generation.context.triggerEntryId,
+				...(runOperation.value.sourceLeafId === null ? [] : [runOperation.value.sourceLeafId]),
+				...runOperation.value.intent.promptEntryIds,
+				...(runState.value.latestAssistantEntryId === null ? [] : [runState.value.latestAssistantEntryId]),
+			]);
+			if (responseEntryId === usageId || directlyNamed.has(responseEntryId) || directlyNamed.has(usageId))
+				throw new SessionError("storage", "Generated assistant effect IDs are not unique");
+			const ids = [responseEntryId, usageId];
+			const [occupiedEntries, occupiedUsageRows, ...occupiedRegisters] = await Promise.all([
+				this.#storage.getEntries(ids),
+				this.#storage.getUsageRows(ids),
+				...ids.flatMap((id) => [
+					this.#storage.getRegister("op.meta", id),
+					this.#storage.getRegister("op.state", id),
+				]),
+			]);
+			if (occupiedEntries.size > 0 || occupiedUsageRows.size > 0 || occupiedRegisters.some(Boolean))
+				throw new SessionError("storage", "Generated assistant effect ID is already occupied");
+
+			const nextState: RunState = {
+				...runState.value,
+				phase: {
+					kind: "assistant",
+					generation: {
+						status: "effect_pending",
+						context: structuredClone(generation.context),
+						attempt: transition.attempt,
+						responseEntryId,
+						usageId,
+						intendedOutputLimit: transition.intendedOutputLimit,
+						contextWindow: transition.contextWindow,
+					},
+				},
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: transition.operationId,
+						value: encodeRunState(nextState, transition.operationId),
+					},
+				],
+			});
+			return Object.freeze({
+				committed: true as const,
+				responseEntryId,
+				usageId,
+				attachment: Object.freeze({
+					...attachment,
+					runState: Object.freeze({ seq: committed.seqs[0], value: structuredClone(nextState) }),
 				}),
 			});
 		});

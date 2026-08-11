@@ -3,6 +3,8 @@ import {
 	type AcceptPromptResult,
 	type AcceptPromptTransition,
 	MemorySession,
+	type PrepareAssistantEffectResult,
+	type PrepareAssistantEffectTransition,
 	type RuntimeAttachment,
 	type RuntimeTransitionResult,
 	type StartAssistantStepTransition,
@@ -29,4 +31,13 @@ export function acceptPrompt(session: Session, transition: AcceptPromptTransitio
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.acceptPrompt(transition);
+}
+
+export function prepareAssistantEffect(
+	session: Session,
+	transition: PrepareAssistantEffectTransition,
+): Promise<PrepareAssistantEffectResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.prepareAssistantEffect(transition);
 }
