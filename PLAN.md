@@ -4,16 +4,16 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.8 — Add prompt acceptance and durable assistant-effect intent before provider dispatch
-- Status: 1.7 provider request leases committed as `c9e561a3c`; independent final review PASS
+- Status: D-013 approved; implement 1.8a spec-conformant idle prompt acceptance, then 1.8b provider lease plus durable intent
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Design and implement no-tool prompt acceptance plus durable assistant-effect intent before dispatch.
-2. Bind the captured `ModelRequestLease` to effect execution without persisting or exposing it.
-3. Implement provider settlement, response/usage commit, classification, and terminal cleanup.
-4. Add close/reopen Tier A coverage for every resulting action and transition boundary.
-5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
+1. Implement and independently verify 1.8a idle prompt acceptance with pre-acceptance identity resolution and one atomic operation transaction.
+2. Implement and independently verify 1.8b provider lease capture, complete process-local effect plan, and durable intent before dispatch.
+3. Bind the retained `ModelRequestLease` to effect execution without persisting, exposing, or rereading it.
+4. Implement provider settlement, response/usage commit, classification, and terminal cleanup.
+5. Add close/reopen and kill-at-every-boundary Tier A coverage, then run independent Phase 1 review and recovery QA.
 
 ## Phase order
 
