@@ -3,17 +3,17 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.2 — Implement the domain-neutral `session-storage` contract and Memory backend
-- Status: rework in progress after human resolution D-005
+- Work item: 1.3 — Design the Memory-only Session tree/repository and typed codec boundary
+- Status: design pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement the domain-neutral storage envelopes, transaction API, UUIDv7/follower ids, and atomic Memory backend.
-2. Add the shared storage conformance suite and instrumented commit decorator.
-3. Implement a Memory-only session tree/repository with one configured `main` lane and reopen support.
-4. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
-5. Implement and crash-test the no-tool prompt/provider/final-response flow, then run independent phase review and QA.
+1. Design and implement a Memory-only Session tree/repository with one `main` lane, typed codecs, and reopen support.
+2. Design and implement the Phase 1 Harness runtime shell and pure next-action planner.
+3. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
+4. Add close/reopen and kill-at-every-boundary recovery coverage.
+5. Run independent Phase 1 done-bar review and recovery QA.
 
 ## Phase order
 
