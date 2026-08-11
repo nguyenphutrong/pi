@@ -1,5 +1,27 @@
 # Harness Rewrite Blockers
 
+## B-003 — Exact-ID query validation runs after an unsafe clone
+
+- Date: 2026-08-11
+- Phase: 1
+- Work item: 1.3, increment B — typed Memory Session/repository
+- Trigger: two independent review rejections for the same runtime input-validation reason
+- Status: awaiting human choice
+
+### Context
+
+The first review rejected incomplete exact validation for Session query objects and repository metadata. That was corrected and covered by table-driven tests. The second review found that `Session.getEntries()` still calls `structuredClone(ids)` before the Storage contract validates the list. A malformed list containing a symbol, accessor, or other non-cloneable value can therefore throw `DataCloneError`, which becomes `SessionError("storage")` instead of `SessionError("invalid_query")`.
+
+Current uncommitted implementation otherwise passes session-storage 30/30, harness-runtime 26/26, and `npm run check`.
+
+### Decision needed
+
+1. **Recommended:** pass `ids` directly to `Storage.getEntries()`, whose contract already performs exact structural validation and does not mutate input; add Session-level malformed-list regressions, then re-review.
+2. Add a duplicate exact-list validator in Session before cloning.
+3. Accept generic `storage` classification for non-cloneable malformed lists.
+
+Reply with `1`, `2`, or `3`.
+
 ## Resolved B-002 — Memory handle still exposes its core at runtime
 
 - Date: 2026-08-11

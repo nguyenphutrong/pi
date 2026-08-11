@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.3 — Implement the Memory-only Session tree/repository and typed codec boundary
-- Status: reopenable Memory handles complete; typed Session/repository implementation pending
+- Status: blocked by B-003 after two Session input-validation review rejections
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
