@@ -1,5 +1,28 @@
 # Harness Rewrite Blockers
 
+## Resolved B-004 — Restore cannot validate a reserved usage ID with the current Storage contract
+
+- Date: 2026-08-11
+- Resolved: 2026-08-11 — human selected option 1; recorded in D-009 and implemented by `8f31fd0ba`
+- Phase: 1
+- Work item: 1.4 — Phase 1 runtime shell and pure next-action planner
+- Trigger: §6 hard-to-reverse storage-contract decision found by independent architecture review
+- Status: resolved; storage tests 31/31, `npm run check` PASS, independent implementation review PASS
+
+### Context
+
+An assistant `effect_pending` state durably reserves both a response entry ID and a usage-row ID. At escalation time, recovery could validate the response ID through the bounded `Storage.getEntries(ids)` query, but the domain-neutral Storage contract had no equivalent exact usage-row lookup. It therefore could not enforce `harness-v3.md` §3.3's requirement that a reserved usage ID, if already materialized, has the expected identity.
+
+Normal atomic settlement cannot create a usage row without its response entry, but imported or corrupted durable state can. Inferring from absence or scanning the ledger is forbidden.
+
+### Decision
+
+The human selected option 1:
+
+1. **Selected:** add a domain-neutral bounded `Storage.getUsageRows(ids)` point query, with the same exact-ID validation and immutable-map semantics as `getEntries`, then extend the shared Memory/SQLite conformance contract.
+2. Narrow Phase 1 restore validation to entries/registers and rely on settlement atomicity plus ID uniqueness; explicitly defer exact reserved-usage validation. This is smaller now but does not fully satisfy the current §3.3 text.
+3. Replace the separate exact lookups with a broader cross-kind item lookup. This is more invasive and is not recommended.
+
 ## Resolved B-003 — Exact-ID query validation runs after an unsafe clone
 
 - Date: 2026-08-11

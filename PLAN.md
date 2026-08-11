@@ -3,16 +3,16 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.4 — Design the Phase 1 Harness runtime shell and pure next-action planner
-- Status: Session/repository prerequisite complete; runtime-shell design pending
+- Work item: 1.5 — Implement the Phase 1 Harness runtime shell and pure next-action planner
+- Status: 1.4 design approved; B-004 resolved; implementation pending
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Design and independently approve the Phase 1 Harness runtime shell, total register schemas, and pure next-action planner.
-2. Implement the runtime shell, lane mutation line, manual scheduler, restore validation, and no-effect parked state.
-3. Add Tier A planner/recovery tests for every Phase 1 state and deterministic next actions.
-4. Implement the no-tool prompt/provider/final-response flow with durable intent and settlement.
+1. Implement canonical Phase 1 register codecs, the internal Session runtime port/mutation line, configuration seeding, and exclusive runtime attachment.
+2. Implement bounded restore, the pure next-action planner, and stable one-step manual scheduling with no provider effects.
+3. Add Tier A planner/recovery and transition-writer tests for every Phase 1 state and crash boundary owned by the shell.
+4. Add the upstream-mergeable `Models.lease` API, then implement no-tool prompt/provider/final-response intent, settlement, and terminal cleanup.
 5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
 ## Phase order
