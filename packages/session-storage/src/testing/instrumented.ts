@@ -49,6 +49,7 @@ export class InstrumentedStorage implements Storage {
 	}
 
 	getEntries: Storage["getEntries"] = (ids) => this.delegate.getEntries(ids);
+	getUsageRows: Storage["getUsageRows"] = (ids) => this.delegate.getUsageRows(ids);
 	getRegister: Storage["getRegister"] = (namespace, key) => this.delegate.getRegister(namespace, key);
 	listRegisters: Storage["listRegisters"] = (namespace) => this.delegate.listRegisters(namespace);
 	scanBranch: Storage["scanBranch"] = (query) => this.delegate.scanBranch(query);

@@ -109,6 +109,45 @@ export function createStorageConformance(factory: StorageConformanceFixtureFacto
 				);
 			},
 		),
+		testCase(
+			factory,
+			"queries",
+			"looks up exact usage rows by id and detaches returned values",
+			async ({ storage }) => {
+				await storage.commit({
+					writes: [
+						entry(ids[0]),
+						{
+							kind: "usage",
+							row: {
+								id: ids[1],
+								entryId: ids[0],
+								adjustment: false,
+								usage: usage(),
+								details: { provider: "test" },
+							},
+						},
+					],
+				});
+				const requestedIds = [ids[1], ids[2]];
+				const rows = await storage.getUsageRows(requestedIds);
+				deepStrictEqual(requestedIds, [ids[1], ids[2]]);
+				deepStrictEqual([...rows.keys()], [ids[1]]);
+				const row = rows.get(ids[1]);
+				ok(row);
+				row.usage.cost.total = 999;
+				if (row.details && typeof row.details === "object" && !Array.isArray(row.details))
+					row.details.provider = "mutated";
+				deepStrictEqual((await storage.getUsageRows([ids[1]])).get(ids[1]), {
+					id: ids[1],
+					entryId: ids[0],
+					seq: 2,
+					adjustment: false,
+					usage: usage(),
+					details: { provider: "test" },
+				});
+			},
+		),
 		testCase(factory, "references", "allows only earlier entry parents and usage references", async ({ storage }) => {
 			await storage.commit({
 				writes: [
@@ -540,9 +579,13 @@ export function createStorageConformance(factory: StorageConformanceFixtureFacto
 				Object.defineProperty(symbolIds, Symbol("extra"), { value: true });
 				const hiddenIds = [ids[0]];
 				Object.defineProperty(hiddenIds, "extra", { value: true });
-				for (const value of [null, "bad", [1], sparseIds, symbolIds, hiddenIds])
+				for (const value of [null, "bad", [1], sparseIds, symbolIds, hiddenIds]) {
 					await rejects(storage.getEntries(value as string[]), assertCode("invalid_query"));
+					await rejects(storage.getUsageRows(value as string[]), assertCode("invalid_query"));
+				}
 				await rejects(storage.getEntries([ids[0], ids[0]]), assertCode("invalid_query"));
+				await rejects(storage.getUsageRows([ids[0], ids[0]]), assertCode("invalid_query"));
+				await rejects(storage.getUsageRows(["bad"]), assertCode("invalid_query"));
 				await rejects(storage.getRegister(1 as unknown as string, "k"), assertCode("invalid_query"));
 				await rejects(storage.listRegisters(null as unknown as string), assertCode("invalid_query"));
 			},
@@ -565,6 +608,7 @@ export function createStorageConformance(factory: StorageConformanceFixtureFacto
 				strictEqual(first, second);
 				await Promise.all([commit, first]);
 				await rejects(storage.commit({ writes: [entry(ids[1])] }), assertCode("closed"));
+				await rejects(storage.getUsageRows([ids[1]]), assertCode("closed"));
 				await rejects(storage.getStats(), assertCode("closed"));
 			},
 		),

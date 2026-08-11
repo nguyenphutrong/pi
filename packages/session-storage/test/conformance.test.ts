@@ -243,6 +243,7 @@ describe("MemoryStorage shared state", () => {
 		const storageB = state.createStorage();
 		expect(await storageB.scanEntries()).toEqual(entries);
 		expect(await storageB.listRegisters("facts")).toEqual(registers);
+		expect((await storageB.getUsageRows([usageId])).get(usageId)).toMatchObject({ id: usageId, entryId, seq: 3 });
 		expect(await storageB.getStats()).toEqual(stats);
 		expect(first.seqs).toEqual([1, 2, 3]);
 
@@ -273,6 +274,7 @@ describe("MemoryStorage shared state", () => {
 		const closedOperations = [
 			storageA.commit({ writes: [{ kind: "register", op: "set", namespace: "n", key: "k", value: 1 }] }),
 			storageA.getEntries([id]),
+			storageA.getUsageRows([id]),
 			storageA.getRegister("n", "k"),
 			storageA.listRegisters("n"),
 			storageA.scanBranch({ start: id }),

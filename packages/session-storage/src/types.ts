@@ -84,6 +84,7 @@ export interface SessionStats {
 export interface Storage {
 	commit(tx: Transaction): Promise<CommitResult>;
 	getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>>;
+	getUsageRows(ids: string[]): Promise<ReadonlyMap<string, UsageRow>>;
 	getRegister(namespace: string, key: string): Promise<Register | undefined>;
 	listRegisters(namespace: string): Promise<Register[]>;
 	scanBranch(query: BranchScan): Promise<Entry[]>;

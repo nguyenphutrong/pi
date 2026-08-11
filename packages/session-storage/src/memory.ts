@@ -79,12 +79,23 @@ class MemoryStorageCore {
 	}
 
 	async getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
-		assertIdList(ids);
+		assertIdList(ids, "entry");
 		const result = new Map<string, Entry>();
 		for (const id of ids) {
 			if (!isUuidV7(id)) fail("invalid_query", `Invalid entry id: ${id}`);
 			const entry = this.entries.get(id);
 			if (entry) result.set(id, structuredClone(entry));
+		}
+		return result;
+	}
+
+	async getUsageRows(ids: string[]): Promise<ReadonlyMap<string, UsageRow>> {
+		assertIdList(ids, "usage");
+		const result = new Map<string, UsageRow>();
+		for (const id of ids) {
+			if (!isUuidV7(id)) fail("invalid_query", `Invalid usage id: ${id}`);
+			const row = this.usage.get(id);
+			if (row) result.set(id, structuredClone(row));
 		}
 		return result;
 	}
@@ -291,6 +302,10 @@ export class MemoryStorage implements Storage {
 
 	getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
 		return this.call(() => this.#core.getEntries(ids));
+	}
+
+	getUsageRows(ids: string[]): Promise<ReadonlyMap<string, UsageRow>> {
+		return this.call(() => this.#core.getUsageRows(ids));
 	}
 
 	getRegister(namespace: string, key: string): Promise<Register | undefined> {
