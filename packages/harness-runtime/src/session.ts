@@ -1,14 +1,28 @@
 import type { Message } from "@earendil-works/pi-ai";
 import {
 	assertRegister,
+	assertUsageRow,
 	createIdGenerator,
 	type EntryScan,
 	type IdGenerator,
 	isUuidV7,
 	type Storage,
 	StorageError,
+	type UsageRow,
 } from "@earendil-works/pi-session-storage";
 import { decodeMessageEntry, encodeMessage } from "./codec.ts";
+import {
+	type CurrentRegister,
+	decodeConfigurationRegister,
+	decodeLaneStateRegister,
+	decodeRunOperationRegister,
+	decodeRunStateRegister,
+	encodeLaneConfiguration,
+	type LaneConfiguration,
+	type LaneState,
+	type RunOperation,
+	type RunState,
+} from "./durable.ts";
 import {
 	type BranchBounds,
 	type EntryQuery,
@@ -19,6 +33,7 @@ import {
 } from "./types.ts";
 
 const LEAF_NAMESPACE = "lane.leaf";
+const CONFIG_NAMESPACE = "lane.config";
 const STATE_NAMESPACE = "lane.state";
 const MAIN = "main";
 
@@ -78,38 +93,145 @@ function validateQuery(query: unknown, branch: boolean): asserts query is EntryQ
 		throw new SessionError("invalid_query", "stopAtId must be a UUIDv7");
 }
 
-function decodeMainLeafRegister(candidate: unknown): string | null {
-	assertRegister(candidate);
+function decodeMainLeafRegister(candidate: unknown): CurrentRegister<string | null> {
+	try {
+		assertRegister(candidate);
+	} catch (error) {
+		throw new SessionError("corruption", "Malformed main leaf register", error);
+	}
 	if (candidate.namespace !== LEAF_NAMESPACE || candidate.key !== MAIN)
 		throw new SessionError("corruption", "Main leaf register has the wrong identity");
 	if (candidate.value !== null && (typeof candidate.value !== "string" || !isUuidV7(candidate.value)))
 		throw new SessionError("corruption", "Main leaf must be null or a UUIDv7 entry id");
-	return candidate.value;
+	return Object.freeze({ seq: candidate.seq, value: candidate.value });
 }
 
 function decodeIdleMainStateRegister(candidate: unknown): void {
-	assertRegister(candidate);
-	if (candidate.namespace !== STATE_NAMESPACE || candidate.key !== MAIN)
-		throw new SessionError("corruption", "Main lane state register has the wrong identity");
-	const value = candidate.value;
-	if (
-		value === null ||
-		typeof value !== "object" ||
-		Array.isArray(value) ||
-		Object.keys(value).length !== 2 ||
-		!Object.hasOwn(value, "currentOperationId") ||
-		!Object.hasOwn(value, "pendingNextRun") ||
-		value.currentOperationId !== null ||
-		!Array.isArray(value.pendingNextRun) ||
-		value.pendingNextRun.length !== 0
-	)
-		throw new SessionError("corruption", "Main lane must be idle and empty");
+	if (decodeLaneStateRegister(candidate).value.currentOperationId !== null)
+		throw new SessionError("corruption", "Main lane must be idle");
+}
+
+interface CurrentStateHydration {
+	readonly entries: ReadonlyMap<string, MessageEntry>;
+	readonly usageRows: ReadonlyMap<string, UsageRow>;
+}
+
+async function hydrateCurrentState(
+	storage: Storage,
+	mainLeaf: CurrentRegister<string | null>,
+	runOperation?: CurrentRegister<RunOperation>,
+	runState?: CurrentRegister<RunState>,
+): Promise<CurrentStateHydration> {
+	const entryIds = new Set<string>();
+	const usageIds = new Set<string>();
+	if (mainLeaf.value !== null) entryIds.add(mainLeaf.value);
+
+	let triggerEntryId: string | undefined;
+	let responseEntryId: string | undefined;
+	let usageId: string | undefined;
+	if (runOperation && runState) {
+		if (runOperation.value.sourceLeafId !== null) entryIds.add(runOperation.value.sourceLeafId);
+		for (const id of runOperation.value.intent.promptEntryIds) entryIds.add(id);
+		if (runState.value.phase.kind === "checkpoint") triggerEntryId = runState.value.phase.triggerEntryId;
+		else {
+			triggerEntryId = runState.value.phase.generation.context.triggerEntryId;
+			if (runState.value.phase.generation.status === "effect_pending") {
+				responseEntryId = runState.value.phase.generation.responseEntryId;
+				usageId = runState.value.phase.generation.usageId;
+				entryIds.add(responseEntryId);
+				entryIds.add(usageId);
+				usageIds.add(responseEntryId);
+				usageIds.add(usageId);
+			}
+		}
+		entryIds.add(triggerEntryId);
+		if (runState.value.latestAssistantEntryId !== null) entryIds.add(runState.value.latestAssistantEntryId);
+	}
+
+	const [storedEntries, storedUsageRows] = await Promise.all([
+		storage.getEntries([...entryIds]),
+		storage.getUsageRows([...usageIds]),
+	]);
+	const entries = new Map<string, MessageEntry>();
+	for (const [id, candidate] of storedEntries) {
+		const entry = decodeMessageEntry(candidate);
+		if (entry.id !== id || !entryIds.has(id))
+			throw new SessionError("corruption", "Current-state entry lookup returned the wrong identity");
+		entries.set(id, entry);
+	}
+	const usageRows = new Map<string, UsageRow>();
+	for (const [id, candidate] of storedUsageRows) {
+		try {
+			assertUsageRow(candidate);
+		} catch (error) {
+			throw new SessionError("corruption", "Malformed current-state usage row", error);
+		}
+		if (candidate.id !== id || !usageIds.has(id))
+			throw new SessionError("corruption", "Current-state usage lookup returned the wrong identity");
+		usageRows.set(id, Object.freeze(structuredClone(candidate)));
+	}
+
+	const requireEntry = (id: string, name: string): MessageEntry => {
+		const entry = entries.get(id);
+		if (!entry) throw new SessionError("corruption", `${name} references a missing message entry`);
+		return entry;
+	};
+	if (mainLeaf.value !== null) requireEntry(mainLeaf.value, "Main leaf");
+	if (runOperation && runState && triggerEntryId) {
+		const operation = runOperation.value;
+		const state = runState.value;
+		if (operation.intent.promptEntryIds.length === 0)
+			throw new SessionError("corruption", "A Phase 1 run must contain a prompt entry");
+		let expectedParent = operation.sourceLeafId;
+		if (expectedParent !== null) requireEntry(expectedParent, "Operation source leaf");
+		for (const id of operation.intent.promptEntryIds) {
+			const prompt = requireEntry(id, "Run prompt");
+			if (prompt.parentId !== expectedParent)
+				throw new SessionError("corruption", "Run prompt entries do not extend the operation source in order");
+			expectedParent = id;
+		}
+		const trigger = requireEntry(triggerEntryId, "Current trigger");
+		if (state.latestAssistantEntryId !== null) {
+			const latest = requireEntry(state.latestAssistantEntryId, "Latest assistant");
+			if (latest.message.role !== "assistant")
+				throw new SessionError("corruption", "Latest assistant entry must contain an assistant message");
+		}
+		if (state.phase.kind === "checkpoint" && state.phase.continuation.kind === "may_finish") {
+			if (
+				mainLeaf.value !== triggerEntryId ||
+				trigger.message.role !== "assistant" ||
+				trigger.parentId !== expectedParent
+			)
+				throw new SessionError("corruption", "Finished Phase 1 generation has an invalid assistant closure");
+		} else if (mainLeaf.value !== triggerEntryId || triggerEntryId !== expectedParent) {
+			throw new SessionError(
+				"corruption",
+				"Open Phase 1 generation trigger must be the newest prompt and lane leaf",
+			);
+		}
+	}
+	if (responseEntryId && usageId) {
+		if (entries.has(usageId))
+			throw new SessionError("corruption", "Generation usage reservation id is occupied by an entry");
+		if (usageRows.has(responseEntryId))
+			throw new SessionError("corruption", "Generation response reservation id is occupied by a usage row");
+		const response = entries.get(responseEntryId);
+		const usage = usageRows.get(usageId);
+		if ((response === undefined) !== (usage === undefined))
+			throw new SessionError("corruption", "Generation response and usage reservations must materialize together");
+		if (response && (response.message.role !== "assistant" || response.parentId !== triggerEntryId))
+			throw new SessionError("corruption", "Materialized response reservation has an invalid assistant closure");
+		if (usage && (usage.id !== usageId || usage.adjustment || usage.entryId !== responseEntryId))
+			throw new SessionError("corruption", "Materialized usage reservation does not match its response");
+	}
+	return Object.freeze({ entries, usageRows });
 }
 
 export async function validateMainLane(storage: Storage): Promise<void> {
 	try {
-		const [leafRegisters, stateRegisters] = await Promise.all([
+		const [leafRegisters, configRegisters, stateRegisters] = await Promise.all([
 			storage.listRegisters(LEAF_NAMESPACE),
+			storage.listRegisters(CONFIG_NAMESPACE),
 			storage.listRegisters(STATE_NAMESPACE),
 		]);
 		if (leafRegisters.length !== 1)
@@ -117,15 +239,36 @@ export async function validateMainLane(storage: Storage): Promise<void> {
 		if (stateRegisters.length !== 1)
 			throw new SessionError("corruption", "Exactly one main lane state register is required");
 		const leaf = decodeMainLeafRegister(leafRegisters[0]);
-		if (typeof leaf === "string") {
-			const entry = (await storage.getEntries([leaf])).get(leaf);
-			if (!entry) throw new SessionError("corruption", "Main leaf references a missing entry");
-			decodeMessageEntry(entry);
+		if (configRegisters.length > 1) throw new SessionError("corruption", "At most one main configuration is allowed");
+		if (configRegisters[0]) decodeConfigurationRegister(configRegisters[0]);
+		const laneState = decodeLaneStateRegister(stateRegisters[0]);
+		let runOperation: CurrentRegister<RunOperation> | undefined;
+		let runState: CurrentRegister<RunState> | undefined;
+		if (laneState.value.currentOperationId !== null) {
+			if (!configRegisters[0]) throw new SessionError("corruption", "An open operation requires lane configuration");
+			const operationId = laneState.value.currentOperationId;
+			const [metadata, state] = await Promise.all([
+				storage.getRegister("op.meta", operationId),
+				storage.getRegister("op.state", operationId),
+			]);
+			if (!metadata || !state) throw new SessionError("corruption", "Open operation registers are missing");
+			runOperation = decodeRunOperationRegister(metadata, operationId);
+			runState = decodeRunStateRegister(state, operationId);
 		}
-		decodeIdleMainStateRegister(stateRegisters[0]);
+		await hydrateCurrentState(storage, leaf, runOperation, runState);
 	} catch (error) {
 		throw storageFailure(error);
 	}
+}
+
+export interface RuntimeAttachment {
+	readonly laneConfiguration: CurrentRegister<LaneConfiguration>;
+	readonly laneState: CurrentRegister<LaneState>;
+	readonly mainLeaf: CurrentRegister<string | null>;
+	readonly runOperation?: CurrentRegister<RunOperation>;
+	readonly runState?: CurrentRegister<RunState>;
+	readonly entries: ReadonlyMap<string, MessageEntry>;
+	readonly usageRows: ReadonlyMap<string, UsageRow>;
 }
 
 export class MemorySession implements Session {
@@ -136,6 +279,7 @@ export class MemorySession implements Session {
 	#sealed = false;
 	#mutationLine: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
+	#runtimeAttached = false;
 
 	constructor(metadata: SessionMetadata, storage: Storage, release: () => void) {
 		this.metadata = metadata;
@@ -148,10 +292,72 @@ export class MemorySession implements Session {
 		if (this.#sealed) throw new SessionError("closed", "Session is closed");
 	}
 
+	attachRuntime(seed: LaneConfiguration): Promise<RuntimeAttachment> {
+		this.#assertOpen();
+		let encodedSeed: ReturnType<typeof encodeLaneConfiguration>;
+		try {
+			encodedSeed = encodeLaneConfiguration(seed);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		if (this.#runtimeAttached) return Promise.reject(new SessionError("active", "A runtime is already attached"));
+		this.#runtimeAttached = true;
+		const operation = this.#mutationLine.then(async () => {
+			const [configuration, state, leaf] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!state) throw new SessionError("corruption", "Main lane state is missing");
+			const mainLeaf = decodeMainLeafRegister(leaf);
+			const laneState = decodeLaneStateRegister(state);
+			let laneConfiguration: CurrentRegister<LaneConfiguration>;
+			if (configuration) laneConfiguration = decodeConfigurationRegister(configuration);
+			else {
+				if (laneState.value.currentOperationId !== null)
+					throw new SessionError("corruption", "An open operation requires lane configuration");
+				const committed = await this.#storage.commit({
+					writes: [{ kind: "register", op: "set", namespace: CONFIG_NAMESPACE, key: MAIN, value: encodedSeed }],
+				});
+				laneConfiguration = Object.freeze({
+					seq: committed.seqs[0],
+					value: decodeConfigurationRegister({
+						namespace: CONFIG_NAMESPACE,
+						key: MAIN,
+						seq: committed.seqs[0],
+						value: encodedSeed,
+					}).value,
+				});
+			}
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (laneState.value.currentOperationId !== null) {
+				const operationId = laneState.value.currentOperationId;
+				const [metadata, currentState] = await Promise.all([
+					this.#storage.getRegister("op.meta", operationId),
+					this.#storage.getRegister("op.state", operationId),
+				]);
+				if (!metadata || !currentState)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadata, operationId);
+				runState = decodeRunStateRegister(currentState, operationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
 	async getLeafId(): Promise<string | null> {
 		this.#assertOpen();
 		try {
-			return decodeMainLeafRegister(await this.#storage.getRegister(LEAF_NAMESPACE, MAIN));
+			return decodeMainLeafRegister(await this.#storage.getRegister(LEAF_NAMESPACE, MAIN)).value;
 		} catch (error) {
 			throw storageFailure(error);
 		}
@@ -251,7 +457,7 @@ export class MemorySession implements Session {
 				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
 				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
 			]);
-			const leafId = decodeMainLeafRegister(leaf);
+			const leafId = decodeMainLeafRegister(leaf).value;
 			decodeIdleMainStateRegister(state);
 			await this.#storage.commit({
 				writes: [
