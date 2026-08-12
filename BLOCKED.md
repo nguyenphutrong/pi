@@ -2,7 +2,33 @@
 
 ## Current status
 
-No active blockers. Item 1.12 and D-018 were implemented by `69eb76d7f` after an independent PASS; work continues with Phase 1 kill-at-every-boundary recovery coverage.
+Active blocker B-006 requires a human choice on the D-019 writer-audit completeness bar. The test-only implementation is uncommitted; focused tests pass 114/114, Harness runtime passes 230/230, Storage passes 31/31, and `npm run check` passes, but two independent reviews rejected the same evidence gap.
+
+## B-006 — Choose the Phase 1 end-to-end writer-audit completeness bar
+
+- Date: 2026-08-12
+- Phase: 1
+- Work item: 1.13 — kill-at-every-boundary recovery coverage
+- Trigger: §6 repeated review-agent rejection. Two review passes rejected the writer audit for not proving complete state values and exact intent-to-settlement reservation identity.
+- Status: awaiting human selection; no flagged test code has been committed
+
+### Context
+
+D-019 correctly defines a Phase 1 kill as losing the RuntimeShell, Session, Memory handle, and provider-local state, then reopening a fresh handle over repository-owned in-process Memory state. True OS process-crash durability remains Phase 3 SQLite work.
+
+The uncommitted tests now prove the real `MemorySessionRepo.create → attach → prompt → transition → close → open` lifecycle at every normal cut and restore the correct action. A complementary instrumented writer audit proves exact transaction counts, write order, and write identities. The second review still requires the audit to duplicate every complete `RunOperation` and `RunState` value, and to derive R/U from intent before proving settlement uses exactly those same ids. It also requires the isolated cleanup namespaces to be entirely empty rather than merely free of operation-prefixed keys.
+
+### Decision needed
+
+1. **Complete the fully exact end-to-end writer audit (recommended for the literal D-019 bar).** Rework the test to build exact expected operation/state values for acceptance, ready, intent, settlement, and finish; carry R/U from intent into settlement assertions; assert cleanup namespaces are globally empty. This is test-only and adds duplication, but should satisfy the current review bar.
+2. **Keep a shape-complete end-to-end audit and rely on existing exact transition/codec tests for values.** Revise D-019 to require exact transaction count/order/identities plus durable-state action recovery, not one duplicated assertion of every total state field. Carry R/U linkage and empty namespace assertions into the current test, then review against the narrower decision.
+3. **Drop the new writer audit.** Treat D-018 plus existing writer-conformance, close-race, failed-commit, and fresh-handle tests as the Phase 1 boundary evidence; defer a consolidated end-to-end exact matrix until SQLite process-crash testing in Phase 3.
+
+Reply with `1`, `2`, or `3`.
+
+### Resume point
+
+Do not commit `packages/harness-runtime/test/repo.test.ts` or `packages/harness-runtime/test/runtime-shell.test.ts` while the review remains failing. After the selection, update D-019, make the selected test-only rework, rerun focused tests, Harness runtime, Storage, `npm run check`, and `git diff --check`, then request a fresh independent review. Repeated rejection after the human decision remains blocking rather than permission to bypass review.
 
 ## Resolved B-005 — Close versus synchronous provider fault winner ordering
 

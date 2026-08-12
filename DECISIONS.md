@@ -462,7 +462,7 @@ Commit `69eb76d7f` adds the two missing close/fresh-handle/reopen integration ca
 
 - Date: 2026-08-12
 - Phase: 1
-- Status: accepted
+- Status: accepted design; implementation blocked by B-006 after repeated review rejection
 - References: D-003, D-006, D-010–D-018; `packages/agent/docs/harness-v3.md` §§1.3–1.7, 2.8, 3.2–3.7, 3.13, 4.1–4.8, 8, 9.1–9.3
 
 ### Options
