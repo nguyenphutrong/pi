@@ -2,7 +2,7 @@
 
 ## Current status
 
-Active blocker B-009 requires a human choice on whether the legacy public agent package must share the private agent-loop implementation. No agent-loop code has been written.
+No active blocker. B-009 option 1 was selected and is recorded in D-022; Phase 2 design review may continue.
 
 ## B-009 — Choose the legacy public agent compatibility strategy
 
@@ -10,7 +10,8 @@ Active blocker B-009 requires a human choice on whether the legacy public agent 
 - Phase: 2
 - Work item: 2.1 — private agent-loop boundary
 - Trigger: §6 ambiguous, hard-to-reverse public-package and release architecture decision after independent design disagreement
-- Status: awaiting human selection; the fork-scope migration is complete, but `packages/agent-loop` has not been created
+- Resolved: 2026-08-12 — human selected option 1
+- Status: resolved; recorded in D-022, and `packages/agent-loop` has not yet been created
 
 ### Context
 
@@ -22,11 +23,11 @@ An npm prototype also established that `bundleDependencies` does not bundle a wo
 
 ### Decision needed
 
-1. **Recommended:** keep the current public `pi-agent-core` loop unchanged and independent. Make private `@nguyenphutrong/pi-agent-loop` canonical only for the new Harness architecture, and use shared conformance vectors to limit behavioral drift. This is the smallest and most upstream-mergeable option.
+1. **Selected:** keep the current public `pi-agent-core` loop unchanged and independent. Make private `@nguyenphutrong/pi-agent-loop` canonical only for the new Harness architecture, and use shared conformance vectors to limit behavioral drift. This is the smallest and most upstream-mergeable option.
 2. Vendor the private package's compiled JS and declarations into `pi-agent-core/dist` during build. Both consumers share one source implementation, but the public package gains custom build, clean, pack, source-map, and release verification machinery.
 3. Bundle the private package as a nested dependency inside the public tarball. This requires physical staging because npm does not bundle workspace symlinks, exposes the private package identity in a public artifact, and complicates npm/Bun release and lock generation.
 
-Reply with `1`, `2`, or `3`.
+The legacy implementation remains compatibility evidence outside the target architecture, not a second recovery or Harness authority. It gains no dependency on the private package and no custom packaging machinery.
 
 ### Resume point
 

@@ -534,3 +534,26 @@ The private package establishes the required internal boundary without premature
 Public upstream packages retain their existing `@earendil-works` scope, including `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`. The coding-agent installer identity also remains under its existing upstream scope. This decision changes npm identity only and does not change package directories or production behavior.
 
 Commit `b8d312e62` applies the two existing package renames, source and tooling resolution updates, internal-workspace recognition for both scopes, and the regenerated root lockfile. Session storage passes 31/31, Harness runtime passes 230/230, script tests pass 5/5, `npm run check` passes, `git diff --check` passes, fresh local workspace links resolve under `@nguyenphutrong`, and the independent review reports PASS.
+
+## D-022 — Keep the legacy public loop independent from the private Harness loop package
+
+- Date: 2026-08-12
+- Phase: 2
+- Status: confirmed by human after B-009 escalation
+- References: D-021; B-009; target three-layer architecture; `packages/agent/docs/harness-v3.md` §§5.7, 8
+
+### Options
+
+1. Keep the current public `pi-agent-core` loop unchanged and make private `@nguyenphutrong/pi-agent-loop` canonical only for the new Harness architecture.
+2. Vendor compiled private-package artifacts into `pi-agent-core/dist` during every public build.
+3. Physically stage and bundle the private package as a nested dependency in the public tarball.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The target architecture requires `harness-runtime` to use a narrow session-agnostic agent-loop boundary and forbids a dependency on the broad legacy agent package. It does not require the retained public compatibility package to consume that boundary. Keeping the legacy loop independent avoids an unpublished runtime dependency, custom build-time copying, nested-package staging, shrinkwrap exceptions, and fork-specific release coupling in an upstream package.
+
+The private package is the single behavior authority for the new Harness architecture. The legacy loop remains upstream-compatible reference and compatibility behavior outside that architecture; it is not a recovery, durability, or product-runtime authority. Shared conformance vectors cover overlapping contracts without creating package coupling. `pi-agent-core` receives no dependency on the private package and no build, pack, or release changes.

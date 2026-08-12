@@ -4,16 +4,16 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
-- Status: blocked on B-009; decide whether the legacy public agent package remains independent from the private agent-loop or consumes it through public-artifact packaging machinery
+- Status: B-009 option 1 selected; correct the durable tool-state design and obtain an independent design PASS before creating the private package
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 
 ## Queue
 
-1. Resolve B-009 private agent-loop versus legacy public agent consumption.
-2. Correct the 2.1 design tool state so `ToolCall` does not duplicate durable assistant-entry identity, then obtain an independent design PASS.
-3. Create the private agent-loop boundary using the selected compatibility strategy.
-4. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
-5. Implement and test the first durable tool-plan increment before tool effects.
+1. Correct the 2.1 design tool state so `ToolCall` does not duplicate durable assistant-entry identity, then obtain an independent design PASS.
+2. Create the private agent-loop boundary for the new Harness architecture while leaving legacy `pi-agent-core` unchanged.
+3. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
+4. Implement and test the first durable tool-plan increment before tool effects.
+5. Add shared conformance vectors between the new phases and unchanged legacy behavior where contracts overlap.
 
 ## Phase order
 
