@@ -1133,6 +1133,118 @@ describe("Phase 1 runtime shell", () => {
 		await reopened.close();
 	});
 
+	it("closes and reopens a durable ready assistant without preparation or provider activity", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("ready", state.createStorage());
+		const firstStorage = instrumentStorage(fixture.storage);
+		const firstModels = createModels();
+		const firstLease = vi.spyOn(firstModels, "lease");
+		const firstShell = await createRuntimeShell(session(firstStorage), config(), { models: firstModels });
+		expect(await firstShell.peekAction()).toMatchObject({
+			kind: "prepare_assistant_effect",
+			operationId: fixture.operationId,
+		});
+		expect(firstLease).not.toHaveBeenCalled();
+		const writesBeforeClose = firstStorage.committedTransactions.length;
+		await firstShell.close();
+		expect(firstStorage.committedTransactions).toHaveLength(writesBeforeClose);
+
+		const reopenedStorage = instrumentStorage(state.createStorage());
+		const reopenedModels = createModels();
+		const reopenedLease = vi.spyOn(reopenedModels, "lease");
+		const reopened = await createRuntimeShell(session(reopenedStorage), config(), { models: reopenedModels });
+		expect(await reopened.peekAction()).toMatchObject({
+			kind: "prepare_assistant_effect",
+			operationId: fixture.operationId,
+		});
+		expect(reopenedLease).not.toHaveBeenCalled();
+		expect(reopenedStorage.committedTransactions).toHaveLength(0);
+		await reopened.close();
+		expect(reopenedStorage.committedTransactions).toHaveLength(0);
+	});
+
+	it("closes and reopens matching materialized assistant reservations using bounded exact hydration", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("pending", state.createStorage());
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const generation = ((operationState.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+			.generation as Record<string, JsonValue>;
+		const responseEntryId = generation.responseEntryId as string;
+		const usageId = generation.usageId as string;
+		const message = terminal();
+		await fixture.storage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: {
+						id: responseEntryId,
+						parentId: fixture.prompt,
+						type: "message",
+						payload: json(message),
+					},
+				},
+				{
+					kind: "usage",
+					row: { id: usageId, entryId: responseEntryId, adjustment: false, usage: message.usage },
+				},
+			],
+		});
+		const firstStorage = instrumentStorage(fixture.storage);
+		const firstModels = createModels();
+		const firstLease = vi.spyOn(firstModels, "lease");
+		const firstShell = await createRuntimeShell(session(firstStorage), config(), { models: firstModels });
+		const expectedAction = {
+			kind: "repair_materialized_assistant",
+			operationId: fixture.operationId,
+			responseEntryId,
+			usageId,
+		};
+		expect(await firstShell.peekAction()).toEqual(expectedAction);
+		expect(firstLease).not.toHaveBeenCalled();
+		const writesBeforeClose = firstStorage.committedTransactions.length;
+		await firstShell.close();
+		expect(firstStorage.committedTransactions).toHaveLength(writesBeforeClose);
+
+		const reopenedStorage = state.createStorage();
+		const entryLookups: string[][] = [];
+		const usageLookups: string[][] = [];
+		const getEntries = reopenedStorage.getEntries.bind(reopenedStorage);
+		const getUsageRows = reopenedStorage.getUsageRows.bind(reopenedStorage);
+		reopenedStorage.getEntries = async (ids) => {
+			entryLookups.push([...ids]);
+			return getEntries(ids);
+		};
+		reopenedStorage.getUsageRows = async (ids) => {
+			usageLookups.push([...ids]);
+			return getUsageRows(ids);
+		};
+		reopenedStorage.listRegisters = async () => {
+			throw new Error("register scan forbidden");
+		};
+		reopenedStorage.scanEntries = async () => {
+			throw new Error("entry scan forbidden");
+		};
+		reopenedStorage.scanBranch = async () => {
+			throw new Error("branch scan forbidden");
+		};
+		reopenedStorage.scanBranchStructure = async () => {
+			throw new Error("branch structure scan forbidden");
+		};
+		reopenedStorage.getStats = async () => {
+			throw new Error("usage scan forbidden");
+		};
+		const reopenedModels = createModels();
+		const reopenedLease = vi.spyOn(reopenedModels, "lease");
+		const reopened = await createRuntimeShell(session(reopenedStorage), config(), { models: reopenedModels });
+		expect(entryLookups).toHaveLength(1);
+		expect(entryLookups[0]).toHaveLength(4);
+		expect(entryLookups[0]).toContain(responseEntryId);
+		expect(usageLookups).toEqual([[responseEntryId, usageId]]);
+		expect(await reopened.peekAction()).toEqual(expectedAction);
+		expect(reopenedLease).not.toHaveBeenCalled();
+		await reopened.close();
+	});
+
 	it("reopens a pending assistant without a live plan or model lookup using exact hydration only", async () => {
 		const state = new MemoryStorageState();
 		const firstStorage = state.createStorage();
