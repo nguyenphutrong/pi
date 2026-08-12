@@ -2,7 +2,7 @@
 
 ## Current status
 
-Active blocker B-010 requires a human choice on the visibility of `@nguyenphutrong/pi-harness-runtime` before it can depend on private `agent-loop`. No agent-loop code has been written.
+No active blocker. B-010 option 1 was selected and is recorded in D-023; implementation and corrected tool-design review may continue.
 
 ## B-010 — Choose how Harness distributes its private agent-loop dependency
 
@@ -10,7 +10,8 @@ Active blocker B-010 requires a human choice on the visibility of `@nguyenphutro
 - Phase: 2
 - Work item: 2.1 — private agent-loop boundary
 - Trigger: §6 hard-to-reverse package and release-contract decision found during corrected design review
-- Status: awaiting human selection; D-023 remains unrecorded
+- Resolved: 2026-08-12 — human selected option 1
+- Status: resolved; recorded in D-023
 
 ### Context
 
@@ -20,11 +21,11 @@ Active blocker B-010 requires a human choice on the visibility of `@nguyenphutro
 
 ### Decision needed
 
-1. **Recommended:** make `@nguyenphutrong/pi-harness-runtime` private workspace-only too. Keep `session-storage` public, remove Harness from public/local-release tarball inventories, and build private `agent-loop` before private Harness. This preserves D-021/D-022 without custom packaging.
+1. **Selected:** make `@nguyenphutrong/pi-harness-runtime` private workspace-only too. Keep `session-storage` public, remove Harness from public/local-release tarball inventories, and build private `agent-loop` before private Harness. This preserves D-021/D-022 without custom packaging.
 2. Keep Harness public and change `@nguyenphutrong/pi-agent-loop` to public. Both install normally, but this reverses the selected private-package decision and creates a supported public API now.
 3. Keep Harness public and vendor compiled private-loop implementation into `harness-runtime/dist`. The tarball remains installable without a private dependency, but Harness gains custom build, declaration, source-map, clean, pack, and release verification machinery.
 
-Reply with `1`, `2`, or `3`.
+The user also directed the orchestrator to apply future evidence-backed recommendations automatically and ask only when it genuinely cannot decide between materially different outcomes.
 
 ### Resume point
 

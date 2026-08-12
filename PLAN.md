@@ -4,12 +4,13 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
-- Status: blocked on B-010; decide whether `harness-runtime` also becomes private before it takes a runtime dependency on private `agent-loop`
+- Status: B-010 option 1 selected; make Harness private and finish the corrected durable-tool design review
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
+- Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Resolve B-010 Harness visibility and private dependency distribution.
+1. Make `@nguyenphutrong/pi-harness-runtime` private and remove it from public/local-release artifacts.
 2. Finish the corrected 2.1 design and obtain an independent design PASS.
 3. Create the private agent-loop boundary for the new Harness architecture while leaving legacy `pi-agent-core` unchanged.
 4. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.

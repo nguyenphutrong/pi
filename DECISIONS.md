@@ -557,3 +557,26 @@ Option 1.
 The target architecture requires `harness-runtime` to use a narrow session-agnostic agent-loop boundary and forbids a dependency on the broad legacy agent package. It does not require the retained public compatibility package to consume that boundary. Keeping the legacy loop independent avoids an unpublished runtime dependency, custom build-time copying, nested-package staging, shrinkwrap exceptions, and fork-specific release coupling in an upstream package.
 
 The private package is the single behavior authority for the new Harness architecture. The legacy loop remains upstream-compatible reference and compatibility behavior outside that architecture; it is not a recovery, durability, or product-runtime authority. Shared conformance vectors cover overlapping contracts without creating package coupling. `pi-agent-core` receives no dependency on the private package and no build, pack, or release changes.
+
+## D-023 — Keep Harness private with its private agent-loop dependency
+
+- Date: 2026-08-12
+- Phase: 2
+- Status: confirmed by human after B-010 escalation
+- References: D-021–D-022; B-010; package and local-release contracts
+
+### Options
+
+1. Make `@nguyenphutrong/pi-harness-runtime` private workspace-only, while keeping `session-storage` public.
+2. Keep Harness public and publish `@nguyenphutrong/pi-agent-loop` as a supported public package.
+3. Keep Harness public and vendor compiled private-loop artifacts into its public distribution.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Harness needs a real runtime dependency on the narrow loop package. A public Harness depending on an unpublished package would produce a publishable but uninstallable tarball; development, optional, or peer dependency forms do not satisfy that runtime import. Making Harness private preserves the selected private agent-loop boundary without adding vendoring, nested-package staging, or release exceptions.
+
+`session-storage` remains public because it has an independently installable contract and no private runtime dependency. Public release discovery already excludes packages marked private; local release must remove Harness from its explicit tarball list. Once agent-loop exists, the internal root build orders it before Harness. Coding-agent shrinkwrap and install-lock remain unchanged while neither private package enters that dependency closure.
