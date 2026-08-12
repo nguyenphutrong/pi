@@ -2,7 +2,35 @@
 
 ## Current status
 
-No active blocker. B-008 is resolved and the identity migration passed independent review in `b8d312e62`; Phase 2 package-boundary design may continue.
+Active blocker B-009 requires a human choice on whether the legacy public agent package must share the private agent-loop implementation. No agent-loop code has been written.
+
+## B-009 — Choose the legacy public agent compatibility strategy
+
+- Date: 2026-08-12
+- Phase: 2
+- Work item: 2.1 — private agent-loop boundary
+- Trigger: §6 ambiguous, hard-to-reverse public-package and release architecture decision after independent design disagreement
+- Status: awaiting human selection; the fork-scope migration is complete, but `packages/agent-loop` has not been created
+
+### Context
+
+The target architecture requires the new Harness kernel to consume a narrow private `@nguyenphutrong/pi-agent-loop` package rather than the broad legacy `packages/agent`. It does not unambiguously require the existing public `@earendil-works/pi-agent-core` tarball to consume the same private package. The target monorepo layout omits the legacy agent package, while the upstream-mergeability guardrail asks that retained Pi foundations remain close to upstream.
+
+The first Design pass recommended build-time vendoring so both consumers share one implementation. Independent review rejected that recommendation: vendoring adds custom JS/declaration copying and release verification to an upstream public package even though the new Harness does not need it. Keeping the legacy loop independent avoids release coupling but retains a bounded legacy implementation beside the new canonical Harness implementation.
+
+An npm prototype also established that `bundleDependencies` does not bundle a workspace symlink directly. Making nested bundling work requires a physical staging install before every pack and changes shrinkwrap/install-lock handling.
+
+### Decision needed
+
+1. **Recommended:** keep the current public `pi-agent-core` loop unchanged and independent. Make private `@nguyenphutrong/pi-agent-loop` canonical only for the new Harness architecture, and use shared conformance vectors to limit behavioral drift. This is the smallest and most upstream-mergeable option.
+2. Vendor the private package's compiled JS and declarations into `pi-agent-core/dist` during build. Both consumers share one source implementation, but the public package gains custom build, clean, pack, source-map, and release verification machinery.
+3. Bundle the private package as a nested dependency inside the public tarball. This requires physical staging because npm does not bundle workspace symlinks, exposes the private package identity in a public artifact, and complicates npm/Bun release and lock generation.
+
+Reply with `1`, `2`, or `3`.
+
+### Resume point
+
+After selection, record D-022, correct the tool-state design so durable `ToolCall` state stores only source index/result id plus status-specific replay or terminate, then obtain an independent design PASS before creating or extracting code.
 
 ## B-008 — Choose the `agent-loop` package visibility
 

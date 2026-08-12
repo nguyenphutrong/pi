@@ -4,14 +4,14 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
-- Status: package migration `b8d312e62` passed independent review; design how the public agent package can consume the private agent-loop boundary without an unpublished runtime dependency
+- Status: blocked on B-009; decide whether the legacy public agent package remains independent from the private agent-loop or consumes it through public-artifact packaging machinery
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 
 ## Queue
 
-1. Design and independently review how public `@earendil-works/pi-agent-core` consumes private `@nguyenphutrong/pi-agent-loop` without an unpublished runtime dependency.
+1. Resolve B-009 private agent-loop versus legacy public agent consumption.
 2. Correct the 2.1 design tool state so `ToolCall` does not duplicate durable assistant-entry identity, then obtain an independent design PASS.
-3. Extract the three behavior-preserving agent-loop tool phases at the selected package boundary.
+3. Create the private agent-loop boundary using the selected compatibility strategy.
 4. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
 5. Implement and test the first durable tool-plan increment before tool effects.
 
