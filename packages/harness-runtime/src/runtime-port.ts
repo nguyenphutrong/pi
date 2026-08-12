@@ -7,6 +7,8 @@ import {
 	type PrepareAssistantEffectTransition,
 	type RuntimeAttachment,
 	type RuntimeTransitionResult,
+	type SettleAssistantEffectResult,
+	type SettleAssistantEffectTransition,
 	type StartAssistantStepTransition,
 } from "./session.ts";
 import type { Session } from "./types.ts";
@@ -40,4 +42,13 @@ export function prepareAssistantEffect(
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.prepareAssistantEffect(transition);
+}
+
+export function settleAssistantEffect(
+	session: Session,
+	transition: SettleAssistantEffectTransition,
+): Promise<SettleAssistantEffectResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.settleAssistantEffect(transition);
 }

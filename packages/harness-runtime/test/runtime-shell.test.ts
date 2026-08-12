@@ -198,6 +198,13 @@ function terminal(stopReason: AssistantMessage["stopReason"] = "stop"): Assistan
 	};
 }
 
+async function settlePrepared(prepared: Awaited<ReturnType<typeof preparedShell>>) {
+	await prepared.shell.executeAction();
+	await prepared.shell.executeAction();
+	expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
+	return prepared.shell.executeAction();
+}
+
 async function preparedShell(result: () => Promise<AssistantMessage> | AssistantMessage) {
 	const state = new MemoryStorageState();
 	const durableOptions = { headers: { retained: "yes" }, metadata: { nested: [1] } };
@@ -1260,8 +1267,8 @@ describe("Phase 1 runtime shell", () => {
 		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "await_assistant_effect" });
 		expect(projection).toHaveBeenCalledTimes(1);
 		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
-		await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
-		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeDispatch);
+		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_assistant_effect" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeDispatch + 1);
 		expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
 		await prepared.shell.close();
 	});
@@ -1457,6 +1464,335 @@ describe("Phase 1 runtime shell", () => {
 		await prepared.shell.close();
 		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeClose);
 		await expectUncertainReopen(prepared.state);
+	});
+
+	it("atomically settles a successful detached response and plans finish without registry or provider access", async () => {
+		const message = terminal();
+		const prepared = await preparedShell(() => message);
+		const before = prepared.instrumented.committedTransactions.length;
+		const stateBefore = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const generation = ((stateBefore.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+			.generation as Record<string, JsonValue>;
+		const responseEntryId = generation.responseEntryId as string;
+		const usageId = generation.usageId as string;
+		const expectedState = {
+			...(stateBefore.value as Record<string, JsonValue>),
+			latestAssistantEntryId: responseEntryId,
+			phase: {
+				kind: "checkpoint",
+				continuation: { kind: "may_finish", includeFinalAssistant: true },
+				triggerEntryId: responseEntryId,
+			},
+		};
+
+		await expect(settlePrepared(prepared)).resolves.toMatchObject({ kind: "settle_assistant_effect" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+		const writes = prepared.instrumented.committedTransactions.at(-1)!.writes;
+		expect(writes).toEqual([
+			{
+				kind: "entry",
+				entry: {
+					id: responseEntryId,
+					parentId: prepared.fixture.prompt,
+					type: "message",
+					payload: message,
+				},
+			},
+			{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
+			{
+				kind: "usage",
+				row: { id: usageId, entryId: responseEntryId, usage: message.usage, adjustment: false },
+			},
+			{
+				kind: "register",
+				op: "set",
+				namespace: "op.state",
+				key: prepared.fixture.operationId,
+				value: expectedState,
+			},
+		]);
+		expect((await prepared.fixture.storage.getEntries([responseEntryId])).get(responseEntryId)?.payload).toEqual(
+			message,
+		);
+		expect(await prepared.shell.peekAction()).toEqual({
+			kind: "finish_run",
+			operationId: prepared.fixture.operationId,
+			triggerEntryId: responseEntryId,
+		});
+		expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
+		expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
+		expect(prepared.lease.stream).not.toHaveBeenCalled();
+		expect(prepared.lease.fetchDeferred).not.toHaveBeenCalled();
+		expect(prepared.lease.cancelDeferred).not.toHaveBeenCalled();
+		await prepared.shell.close();
+	});
+
+	it("settles against semantically current authoritative registers after their sequences advance", async () => {
+		const message = terminal();
+		const prepared = await preparedShell(() => message);
+		await prepared.shell.executeAction();
+		await prepared.shell.executeAction();
+		const operationState = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const laneState = (await prepared.fixture.storage.getRegister("lane.state", "main"))!;
+		const configuration = (await prepared.fixture.storage.getRegister("lane.config", "main"))!;
+		const leaf = (await prepared.fixture.storage.getRegister("lane.leaf", "main"))!;
+		const generation = ((operationState.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+			.generation as Record<string, JsonValue>;
+		const responseEntryId = generation.responseEntryId as string;
+		const expectedState = {
+			...(operationState.value as Record<string, JsonValue>),
+			latestAssistantEntryId: responseEntryId,
+			phase: {
+				kind: "checkpoint",
+				continuation: { kind: "may_finish", includeFinalAssistant: true },
+				triggerEntryId: responseEntryId,
+			},
+		};
+		await prepared.fixture.storage.commit({
+			writes: [
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: prepared.fixture.operationId,
+					value: operationState.value,
+				},
+				{ kind: "register", op: "set", namespace: "lane.state", key: "main", value: laneState.value },
+				{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: configuration.value },
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: leaf.value },
+			],
+		});
+		const before = prepared.instrumented.committedTransactions.length;
+
+		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_assistant_effect" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+		expect(prepared.instrumented.committedTransactions.at(-1)!.writes[3]).toEqual({
+			kind: "register",
+			op: "set",
+			namespace: "op.state",
+			key: prepared.fixture.operationId,
+			value: expectedState,
+		});
+		expect((await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!.value).toEqual(
+			expectedState,
+		);
+		await prepared.shell.close();
+	});
+
+	it("accepts matching pre-materialized reservations without writing and prefers repair planning", async () => {
+		const message = terminal();
+		const prepared = await preparedShell(() => message);
+		await prepared.shell.executeAction();
+		await prepared.shell.executeAction();
+		const operationState = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const generation = ((operationState.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+			.generation as Record<string, JsonValue>;
+		const responseEntryId = generation.responseEntryId as string;
+		const usageId = generation.usageId as string;
+		await prepared.fixture.storage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: {
+						payload: json({ ...message, usage: { ...message.usage } }),
+						type: "message",
+						parentId: prepared.fixture.prompt,
+						id: responseEntryId,
+					},
+				},
+				{
+					kind: "usage",
+					row: { usage: { ...message.usage }, adjustment: false, entryId: responseEntryId, id: usageId },
+				},
+			],
+		});
+		const before = prepared.instrumented.committedTransactions.length;
+
+		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_assistant_effect" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		expect(await prepared.shell.peekAction()).toEqual({
+			kind: "repair_materialized_assistant",
+			operationId: prepared.fixture.operationId,
+			responseEntryId,
+			usageId,
+		});
+		await prepared.shell.close();
+	});
+
+	it.each(["partial", "mismatched"] as const)(
+		"faults and seals on %s reservation materialization without a settlement write",
+		async (kind) => {
+			const message = terminal();
+			const prepared = await preparedShell(() => message);
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			const operationState = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			const generation = ((operationState.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+				.generation as Record<string, JsonValue>;
+			const responseEntryId = generation.responseEntryId as string;
+			const usageId = generation.usageId as string;
+			const writes: Write[] = [
+				{
+					kind: "entry",
+					entry: {
+						id: responseEntryId,
+						parentId: prepared.fixture.prompt,
+						type: "message",
+						payload: json(kind === "mismatched" ? terminal("length") : message),
+					},
+				},
+			];
+			if (kind === "mismatched")
+				writes.push({
+					kind: "usage",
+					row: { id: usageId, entryId: responseEntryId, adjustment: false, usage: message.usage },
+				});
+			await prepared.fixture.storage.commit({
+				writes,
+			});
+			const before = prepared.instrumented.committedTransactions.length;
+			const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+			expect(fault).toMatchObject({ code: "fault", cause: { code: "corruption" } });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+			await expect(prepared.shell.executeAction()).rejects.toBe(fault);
+			await prepared.shell.close();
+		},
+	);
+
+	it("discards an obsolete local settlement and replans from authoritative durable state", async () => {
+		const prepared = await preparedShell(() => terminal());
+		await prepared.shell.executeAction();
+		await prepared.shell.executeAction();
+		const operationState = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const authoritativeResponse = id();
+		const authoritativeState = {
+			...(operationState.value as Record<string, JsonValue>),
+			latestAssistantEntryId: authoritativeResponse,
+			phase: {
+				kind: "checkpoint",
+				continuation: { kind: "may_finish", includeFinalAssistant: true },
+				triggerEntryId: authoritativeResponse,
+			},
+		};
+		await prepared.fixture.storage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: {
+						id: authoritativeResponse,
+						parentId: prepared.fixture.prompt,
+						type: "message",
+						payload: json(terminal()),
+					},
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: authoritativeResponse },
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: prepared.fixture.operationId,
+					value: authoritativeState,
+				},
+			],
+		});
+		const before = prepared.instrumented.committedTransactions.length;
+
+		await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		expect(await prepared.shell.peekAction()).toEqual({
+			kind: "finish_run",
+			operationId: prepared.fixture.operationId,
+			triggerEntryId: authoritativeResponse,
+		});
+		await prepared.shell.close();
+	});
+
+	it("lets settlement admitted before close complete its four-write commit", async () => {
+		const prepared = await preparedShell(() => terminal());
+		await prepared.shell.executeAction();
+		await prepared.shell.executeAction();
+		const commit = prepared.instrumented.commit.bind(prepared.instrumented);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const admitted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let gate = true;
+		prepared.instrumented.commit = async (transaction) => {
+			if (gate && transaction.writes.length === 4) {
+				gate = false;
+				entered();
+				await blocked;
+			}
+			return commit(transaction);
+		};
+		const before = prepared.instrumented.committedTransactions.length;
+		const settlement = prepared.shell.executeAction();
+		await admitted;
+		const close = prepared.shell.close();
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		release();
+		await expect(settlement).resolves.toMatchObject({ kind: "settle_assistant_effect" });
+		await close;
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+		expect(prepared.instrumented.committedTransactions.at(-1)!.writes).toHaveLength(4);
+	});
+
+	it.each(["error", "toolUse", "deferred"] as const)(
+		"keeps settled proof and remains write-free when %s classification is unsupported",
+		async (stopReason) => {
+			const message = terminal(stopReason);
+			const prepared = await preparedShell(() => message);
+			const before = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			for (let attempt = 0; attempt < 2; attempt++) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
+				await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+				expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			}
+			await prepared.shell.close();
+		},
+	);
+
+	it("faults aborted-under-running with the session cause, writes nothing, and reopens uncertain", async () => {
+		const prepared = await preparedShell(() => terminal("aborted"));
+		const before = prepared.instrumented.committedTransactions.length;
+		const fault = await settlePrepared(prepared).catch((error: unknown) => error);
+		expect(fault).toMatchObject({
+			code: "fault",
+			cause: { code: "corruption", message: "Assistant aborted while durable control is running" },
+		});
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		await prepared.shell.close();
+		await expectUncertainReopen(prepared.state);
+	});
+
+	it("reopens an atomic successful settlement with complete rows and a finish action", async () => {
+		const prepared = await preparedShell(() => terminal());
+		await settlePrepared(prepared);
+		const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const responseEntryId = (state.value as { latestAssistantEntryId: string }).latestAssistantEntryId;
+		const settlement = prepared.instrumented.committedTransactions.at(-1)!;
+		const usageWrite = settlement.writes.find((write) => write.kind === "usage");
+		if (usageWrite?.kind !== "usage") throw new Error("settlement usage write missing");
+		await prepared.shell.close();
+
+		const storage = prepared.state.createStorage();
+		const models = createModels();
+		const leaseSpy = vi.spyOn(models, "lease");
+		const reopened = await createRuntimeShell(session(storage), config(), { models });
+		const response = (await storage.getEntries([responseEntryId])).get(responseEntryId);
+		const usage = (await storage.getUsageRows([usageWrite.row.id])).get(usageWrite.row.id);
+		expect(response?.payload).toMatchObject({ responseId: "upstream-response", stopReason: "stop" });
+		expect(usage).toMatchObject({ entryId: responseEntryId, adjustment: false, usage: terminal().usage });
+		expect(await reopened.peekAction()).toMatchObject({ kind: "finish_run", triggerEntryId: responseEntryId });
+		expect(leaseSpy).not.toHaveBeenCalled();
+		await reopened.close();
 	});
 
 	it("close is idempotent, write-free, and rejects later admission", async () => {

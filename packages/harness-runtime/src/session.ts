@@ -1,4 +1,5 @@
-import type { Message } from "@earendil-works/pi-ai";
+import { isDeepStrictEqual } from "node:util";
+import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import {
 	assertRegister,
 	assertUsageRow,
@@ -10,6 +11,7 @@ import {
 	StorageError,
 	type UsageRow,
 } from "@earendil-works/pi-session-storage";
+import { classifyAssistantSettlement } from "./assistant-settlement.ts";
 import { decodeMessageEntry, encodeMessage } from "./codec.ts";
 import {
 	type CurrentRegister,
@@ -318,6 +320,28 @@ export interface PrepareAssistantEffectTransition {
 	readonly intendedOutputLimit: number;
 	readonly contextWindow: number;
 }
+
+export interface SettleAssistantEffectTransition {
+	readonly operationId: string;
+	readonly stepId: string;
+	readonly attempt: number;
+	readonly responseEntryId: string;
+	readonly usageId: string;
+	readonly provider: string;
+	readonly modelId: string;
+	readonly triggerEntryId: string;
+	readonly intendedOutputLimit: number;
+	readonly contextWindow: number;
+	readonly message: AssistantMessage;
+}
+
+export type SettleAssistantEffectResult =
+	| { readonly status: "committed" | "materialized" | "obsolete"; readonly attachment: RuntimeAttachment }
+	| {
+			readonly status: "unsupported";
+			readonly classification: "unsupported";
+			readonly attachment: RuntimeAttachment;
+	  };
 
 export type PrepareAssistantEffectResult =
 	| {
@@ -638,6 +662,173 @@ export class MemorySession implements Session {
 				attachment: Object.freeze({
 					...attachment,
 					runState: Object.freeze({ seq: committed.seqs[0], value: structuredClone(nextState) }),
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	settleAssistantEffect(transition: SettleAssistantEffectTransition): Promise<SettleAssistantEffectResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
+				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			const phase = runState?.value.phase;
+			const generation = phase?.kind === "assistant" ? phase.generation : undefined;
+			if (
+				currentOperationId !== transition.operationId ||
+				!runOperation ||
+				!runState ||
+				generation?.status !== "effect_pending" ||
+				generation.context.stepId !== transition.stepId ||
+				generation.attempt !== transition.attempt ||
+				generation.responseEntryId !== transition.responseEntryId ||
+				generation.usageId !== transition.usageId ||
+				generation.context.triggerEntryId !== transition.triggerEntryId ||
+				generation.context.configuration.model.provider !== transition.provider ||
+				generation.context.configuration.model.modelId !== transition.modelId ||
+				generation.intendedOutputLimit !== transition.intendedOutputLimit ||
+				generation.contextWindow !== transition.contextWindow
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+			if (mainLeaf.value !== transition.triggerEntryId)
+				throw new SessionError("corruption", "Pending assistant effect no longer closes the current leaf");
+
+			const response = hydrated.entries.get(transition.responseEntryId);
+			const usage = hydrated.usageRows.get(transition.usageId);
+			if (response || usage) {
+				if (!response || !usage)
+					throw new SessionError("corruption", "Assistant settlement reservations materialized partially");
+				if (
+					response.parentId !== transition.triggerEntryId ||
+					!isDeepStrictEqual(response.message, transition.message) ||
+					usage.entryId !== transition.responseEntryId ||
+					usage.adjustment ||
+					!isDeepStrictEqual(usage.usage, transition.message.usage)
+				)
+					throw new SessionError(
+						"corruption",
+						"Materialized assistant settlement does not match the observed effect",
+					);
+				return Object.freeze({ status: "materialized" as const, attachment });
+			}
+
+			const classification = classifyAssistantSettlement(
+				transition.message,
+				generation.intendedOutputLimit,
+				runState.value.control.status,
+			);
+			if (classification === "corruption")
+				throw new SessionError("corruption", "Assistant aborted while durable control is running");
+			if (classification === "unsupported")
+				return Object.freeze({ status: "unsupported" as const, classification, attachment });
+
+			const nextState: RunState = {
+				...runState.value,
+				latestAssistantEntryId: transition.responseEntryId,
+				phase: {
+					kind: "checkpoint",
+					continuation: { kind: "may_finish", includeFinalAssistant: true },
+					triggerEntryId: transition.responseEntryId,
+				},
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: {
+							id: transition.responseEntryId,
+							parentId: transition.triggerEntryId,
+							type: "message",
+							payload: encodeMessage(transition.message),
+						},
+					},
+					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: transition.responseEntryId },
+					{
+						kind: "usage",
+						row: {
+							id: transition.usageId,
+							entryId: transition.responseEntryId,
+							usage: structuredClone(transition.message.usage),
+							adjustment: false,
+						},
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: transition.operationId,
+						value: encodeRunState(nextState, transition.operationId),
+					},
+				],
+			});
+			const entries = new Map(hydrated.entries);
+			entries.set(
+				transition.responseEntryId,
+				Object.freeze({
+					id: transition.responseEntryId,
+					parentId: transition.triggerEntryId,
+					seq: committed.seqs[0],
+					timestamp: committed.timestamp,
+					type: "message" as const,
+					message: structuredClone(transition.message),
+				}),
+			);
+			const usageRows = new Map(hydrated.usageRows);
+			usageRows.set(
+				transition.usageId,
+				Object.freeze({
+					id: transition.usageId,
+					seq: committed.seqs[2],
+					entryId: transition.responseEntryId,
+					usage: structuredClone(transition.message.usage),
+					adjustment: false,
+				}),
+			);
+			return Object.freeze({
+				status: "committed" as const,
+				attachment: Object.freeze({
+					...attachment,
+					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.responseEntryId }),
+					runState: Object.freeze({ seq: committed.seqs[3], value: structuredClone(nextState) }),
+					entries,
+					usageRows,
 				}),
 			});
 		});

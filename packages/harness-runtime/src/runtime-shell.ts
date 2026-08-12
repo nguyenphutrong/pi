@@ -10,7 +10,13 @@ import type {
 import { encodeMessage } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction } from "./planner.ts";
-import { acceptPrompt, attachRuntime, prepareAssistantEffect, startAssistantStep } from "./runtime-port.ts";
+import {
+	acceptPrompt,
+	attachRuntime,
+	prepareAssistantEffect,
+	settleAssistantEffect,
+	startAssistantStep,
+} from "./runtime-port.ts";
 import { RuntimeSettingsOwner } from "./runtime-settings.ts";
 import type { RuntimeAttachment } from "./session.ts";
 import type { Session } from "./types.ts";
@@ -45,6 +51,7 @@ interface AssistantEffectPlan {
 	readonly attempt: number;
 	readonly responseEntryId: string;
 	readonly usageId: string;
+	readonly triggerEntryId: string;
 	readonly intendedOutputLimit: number;
 	readonly contextWindow: number;
 }
@@ -204,6 +211,37 @@ export class RuntimeShell {
 				});
 				return action.info;
 			}
+			if (action.info.kind === "settle_assistant_effect") {
+				const effectKey = action.info.effectKey;
+				const effect = this.#assistantEffects.get(effectKey);
+				if (effect?.status !== "settled")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer settled");
+				const result = await settleAssistantEffect(this.#session, {
+					operationId: effect.plan.operationId,
+					stepId: effect.plan.stepId,
+					attempt: effect.plan.attempt,
+					responseEntryId: effect.plan.responseEntryId,
+					usageId: effect.plan.usageId,
+					provider: effect.plan.provider,
+					modelId: effect.plan.modelId,
+					triggerEntryId: effect.plan.triggerEntryId,
+					intendedOutputLimit: effect.plan.intendedOutputLimit,
+					contextWindow: effect.plan.contextWindow,
+					message: effect.message,
+				}).catch((cause: unknown) => {
+					throw this.#assistantFailure(effectKey, cause);
+				});
+				this.#current = result.attachment;
+				if (result.status === "unsupported")
+					throw new RuntimeShellError(
+						"unavailable",
+						"Assistant settlement classification is unavailable in Phase 1",
+					);
+				this.#assistantEffects.delete(effectKey);
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
+				return action.info;
+			}
 			if (action.info.kind !== "start_assistant_step" && action.info.kind !== "prepare_assistant_effect")
 				throw new RuntimeShellError("unavailable", `Action ${action.info.kind} is not executable in Phase 1`);
 			const info = action.info;
@@ -285,6 +323,7 @@ export class RuntimeShell {
 							attempt: info.nextAttempt,
 							responseEntryId: result.responseEntryId,
 							usageId: result.usageId,
+							triggerEntryId: generation.context.triggerEntryId,
 							intendedOutputLimit,
 							contextWindow,
 						},
