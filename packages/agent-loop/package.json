@@ -1,8 +1,8 @@
 {
-	"name": "@nguyenphutrong/pi-harness-runtime",
+	"name": "@nguyenphutrong/pi-agent-loop",
 	"version": "0.84.1",
 	"private": true,
-	"description": "Typed Harness session runtime and memory repository",
+	"description": "Stateless tool execution phases for the Harness runtime",
 	"type": "module",
 	"main": "./dist/index.js",
 	"types": "./dist/index.d.ts",
@@ -20,9 +20,7 @@
 		"prepublishOnly": "npm run build"
 	},
 	"dependencies": {
-		"@earendil-works/pi-ai": "^0.84.1",
-		"@nguyenphutrong/pi-agent-loop": "^0.84.1",
-		"@nguyenphutrong/pi-session-storage": "^0.84.1"
+		"@earendil-works/pi-ai": "^0.84.1"
 	},
 	"devDependencies": {
 		"shx": "0.4.0",
