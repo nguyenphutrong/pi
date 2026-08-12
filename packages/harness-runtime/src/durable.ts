@@ -20,6 +20,15 @@ export interface LaneState {
 	pendingNextRun: string[];
 }
 
+export interface LaneLastResult {
+	operationId: string;
+	kind: "run";
+	outcome: "completed";
+	leafId: string;
+	finalAssistantEntryId: string;
+	runCompletion: "assistant";
+}
+
 export interface RunOperation {
 	operationId: string;
 	lane: "main";
@@ -223,6 +232,31 @@ export function decodeLaneState(value: unknown): LaneState {
 	strings(state.pendingNextRun, "pendingNextRun", true);
 	if (state.pendingNextRun.length !== 0) fail("Phase 1 pendingNextRun must be empty");
 	return state as unknown as LaneState;
+}
+
+export function decodeLaneLastResult(value: unknown): LaneLastResult {
+	const result = object(
+		value,
+		["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
+		"lane last result",
+	);
+	uuid(result.operationId, "lane last result operationId");
+	uuid(result.leafId, "lane last result leafId");
+	uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
+	if (result.kind !== "run" || result.outcome !== "completed" || result.runCompletion !== "assistant")
+		fail("Unsupported Phase 1 lane last result");
+	if (result.leafId !== result.finalAssistantEntryId)
+		fail("Completed Phase 1 lane last result leaf must equal its final assistant");
+	return result as unknown as LaneLastResult;
+}
+
+export function encodeLaneLastResult(value: LaneLastResult): JsonValue {
+	try {
+		assertJsonValue(value);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Lane last result must be detached JSON-safe data", error);
+	}
+	return structuredClone(decodeLaneLastResult(value)) as unknown as JsonValue;
 }
 
 function decodeConfigurationRegister(candidate: unknown): CurrentRegister<LaneConfiguration> {

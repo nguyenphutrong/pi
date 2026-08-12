@@ -2,6 +2,8 @@ import type { LaneConfiguration } from "./durable.ts";
 import {
 	type AcceptPromptResult,
 	type AcceptPromptTransition,
+	type FinishRunResult,
+	type FinishRunTransition,
 	MemorySession,
 	type PrepareAssistantEffectResult,
 	type PrepareAssistantEffectTransition,
@@ -51,4 +53,10 @@ export function settleAssistantEffect(
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.settleAssistantEffect(transition);
+}
+
+export function finishRun(session: Session, transition: FinishRunTransition): Promise<FinishRunResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.finishRun(transition);
 }

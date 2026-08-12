@@ -13,6 +13,7 @@ import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction } f
 import {
 	acceptPrompt,
 	attachRuntime,
+	finishRun,
 	prepareAssistantEffect,
 	settleAssistantEffect,
 	startAssistantStep,
@@ -106,13 +107,12 @@ export class RuntimeShell {
 		for (const effect of this.#assistantEffects.values()) if (effect.status === "running") effect.controller.abort();
 	}
 
-	#faultShell(effectKey: string, cause: unknown): RuntimeShellError {
-		if (!this.#fault)
-			this.#fault = new RuntimeShellError("fault", "Assistant stream violated its runtime contract", cause);
+	#faultShell(effectKey: string | undefined, cause: unknown, message: string): RuntimeShellError {
+		if (!this.#fault) this.#fault = new RuntimeShellError("fault", message, cause);
 		this.#sealed = true;
 		this.#notifyShutdown();
 		this.#abortRunningEffects();
-		this.#assistantEffects.delete(effectKey);
+		if (effectKey !== undefined) this.#assistantEffects.delete(effectKey);
 		return this.#fault;
 	}
 
@@ -121,7 +121,13 @@ export class RuntimeShell {
 			? this.#fault
 			: this.#sealed
 				? new RuntimeShellError("closed", "Runtime shell is closed")
-				: this.#faultShell(effectKey, cause);
+				: this.#faultShell(effectKey, cause, "Assistant stream violated its runtime contract");
+	}
+
+	#transitionFailure(cause: unknown): RuntimeShellError {
+		if (this.#fault) return this.#fault;
+		if (this.#sealed) return new RuntimeShellError("closed", "Runtime shell is closed");
+		return this.#faultShell(undefined, cause, "Runtime transition failed");
 	}
 
 	#admit<T>(operation: () => Promise<T> | T): Promise<T> {
@@ -202,7 +208,7 @@ export class RuntimeShell {
 					)
 						throw new Error("Assistant stream returned a mismatched or non-terminal message");
 				} catch (cause) {
-					throw this.#faultShell(action.info.effectKey, cause);
+					throw this.#faultShell(action.info.effectKey, cause, "Assistant stream violated its runtime contract");
 				}
 				this.#assistantEffects.set(action.info.effectKey, {
 					status: "settled",
@@ -240,6 +246,19 @@ export class RuntimeShell {
 				this.#assistantEffects.delete(effectKey);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
+				return action.info;
+			}
+			if (action.info.kind === "finish_run") {
+				const result = await finishRun(this.#session, {
+					operationId: action.info.operationId,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLaneStateSeq: action.expected.laneStateSeq,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#current = result.attachment;
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Run finish is no longer authoritative");
 				return action.info;
 			}
 			if (action.info.kind !== "start_assistant_step" && action.info.kind !== "prepare_assistant_effect")

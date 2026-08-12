@@ -7,9 +7,11 @@ import {
 	type EntryScan,
 	type IdGenerator,
 	isUuidV7,
+	type JsonValue,
 	type Storage,
 	StorageError,
 	type UsageRow,
+	type Write,
 } from "@earendil-works/pi-session-storage";
 import { classifyAssistantSettlement } from "./assistant-settlement.ts";
 import { decodeMessageEntry, encodeMessage } from "./codec.ts";
@@ -20,6 +22,7 @@ import {
 	decodeRunOperationRegister,
 	decodeRunStateRegister,
 	encodeLaneConfiguration,
+	encodeLaneLastResult,
 	encodeRunOperation,
 	encodeRunState,
 	type LaneConfiguration,
@@ -41,6 +44,7 @@ import {
 const LEAF_NAMESPACE = "lane.leaf";
 const CONFIG_NAMESPACE = "lane.config";
 const STATE_NAMESPACE = "lane.state";
+const LAST_RESULT_NAMESPACE = "lane.lastResult";
 const MAIN = "main";
 
 function storageFailure(error: unknown): SessionError {
@@ -305,6 +309,24 @@ export interface RuntimeTransitionResult {
 	readonly committed: boolean;
 	readonly attachment: RuntimeAttachment;
 }
+
+export interface FinishRunTransition {
+	readonly operationId: string;
+	readonly expectedOperationStateSeq: number;
+	readonly expectedLaneStateSeq: number;
+}
+
+export interface FinishedRunResult {
+	readonly operationId: string;
+	readonly kind: "completed";
+	readonly leafId: string;
+	readonly finalEntryId: string;
+	readonly finalMessage: AssistantMessage;
+}
+
+export type FinishRunResult =
+	| { readonly status: "committed"; readonly attachment: RuntimeAttachment; readonly result: FinishedRunResult }
+	| { readonly status: "obsolete"; readonly attachment: RuntimeAttachment; readonly result?: undefined };
 
 export interface PrepareAssistantEffectTransition {
 	readonly operationId: string;
@@ -829,6 +851,149 @@ export class MemorySession implements Session {
 					runState: Object.freeze({ seq: committed.seqs[3], value: structuredClone(nextState) }),
 					entries,
 					usageRows,
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	finishRun(transition: FinishRunTransition): Promise<FinishRunResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
+				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			if (
+				laneState.seq !== transition.expectedLaneStateSeq ||
+				currentOperationId !== transition.operationId ||
+				runState?.seq !== transition.expectedOperationStateSeq
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+			if (!runOperation || !runState)
+				throw new SessionError("corruption", "Validated finish authority changed inside the mutation line");
+			const phase = runState.value.phase;
+			if (
+				runOperation.value.operationId !== transition.operationId ||
+				runOperation.value.lane !== MAIN ||
+				runState.value.control.status !== "running" ||
+				phase.kind !== "checkpoint" ||
+				phase.continuation.kind !== "may_finish" ||
+				phase.continuation.includeFinalAssistant !== true ||
+				runState.value.inbox.steer.length !== 0 ||
+				runState.value.inbox.followUp.length !== 0 ||
+				runState.value.inbox.writes.length !== 0 ||
+				mainLeaf.value === null ||
+				mainLeaf.value !== phase.triggerEntryId ||
+				mainLeaf.value !== runState.value.latestAssistantEntryId
+			)
+				throw new SessionError("corruption", "Run is not at a valid Phase 1 finish boundary");
+			const finalEntry = hydrated.entries.get(mainLeaf.value);
+			if (!finalEntry || finalEntry.message.role !== "assistant")
+				throw new SessionError("corruption", "Final assistant entry is missing or invalid");
+
+			const [toolArgs, preparations] = await Promise.all([
+				this.#storage.listRegisters("op.tool_args"),
+				this.#storage.listRegisters("op.preparation"),
+			]);
+			const prefix = `${transition.operationId}:`;
+			const validateDefensiveRegisters = (registers: typeof toolArgs, namespace: string) =>
+				registers.map((register) => {
+					try {
+						assertRegister(register);
+					} catch (error) {
+						throw new SessionError("corruption", "Malformed defensive operation register", error);
+					}
+					if (register.namespace !== namespace)
+						throw new SessionError("corruption", "Defensive operation register has the wrong namespace");
+					return register;
+				});
+			const defensive = [
+				...validateDefensiveRegisters(toolArgs, "op.tool_args")
+					.filter(({ key }) => key.startsWith(prefix))
+					.sort((left, right) => left.key.localeCompare(right.key)),
+				...validateDefensiveRegisters(preparations, "op.preparation")
+					.filter(({ key }) => key.startsWith(prefix))
+					.sort((left, right) => left.key.localeCompare(right.key)),
+			];
+			const durableResult = encodeLaneLastResult({
+				operationId: transition.operationId,
+				kind: "run",
+				outcome: "completed",
+				leafId: mainLeaf.value,
+				finalAssistantEntryId: mainLeaf.value,
+				runCompletion: "assistant",
+			});
+			const result: FinishedRunResult = Object.freeze({
+				operationId: transition.operationId,
+				kind: "completed",
+				leafId: mainLeaf.value,
+				finalEntryId: mainLeaf.value,
+				finalMessage: structuredClone(finalEntry.message),
+			});
+			const nextLaneState: LaneState = { ...laneState.value, currentOperationId: null };
+			const writes: Write[] = [
+				{ kind: "register", op: "delete", namespace: "op.meta", key: transition.operationId },
+				{ kind: "register", op: "delete", namespace: "op.state", key: transition.operationId },
+				...defensive.map(({ namespace, key }) => ({
+					kind: "register" as const,
+					op: "delete" as const,
+					namespace,
+					key,
+				})),
+				{ kind: "register", op: "set", namespace: LAST_RESULT_NAMESPACE, key: MAIN, value: durableResult },
+				{
+					kind: "register",
+					op: "set",
+					namespace: STATE_NAMESPACE,
+					key: MAIN,
+					value: structuredClone(nextLaneState) as unknown as JsonValue,
+				},
+			];
+			const committed = await this.#storage.commit({ writes });
+			return Object.freeze({
+				status: "committed" as const,
+				result,
+				attachment: Object.freeze({
+					laneConfiguration: configuration,
+					laneState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextLaneState) }),
+					mainLeaf,
+					entries: hydrated.entries,
+					usageRows: hydrated.usageRows,
 				}),
 			});
 		});

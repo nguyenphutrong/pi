@@ -25,6 +25,7 @@ async function rooted(
 	position: "idle" | "need" | "ready" | "pending" | "finish" = "need",
 	storage: Storage = new MemoryStorage(),
 	streamOptions: JsonValue = {},
+	finalPayload?: JsonValue,
 ) {
 	const operationId = id();
 	const source = id();
@@ -92,23 +93,25 @@ async function rooted(
 								id: response,
 								parentId: prompt,
 								type: "message" as const,
-								payload: json({
-									role: "assistant",
-									content: [{ type: "text", text: "done" }],
-									api: "anthropic-messages",
-									provider: "test",
-									model: "current",
-									usage: {
-										input: 0,
-										output: 0,
-										cacheRead: 0,
-										cacheWrite: 0,
-										totalTokens: 0,
-										cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-									},
-									stopReason: "stop",
-									timestamp: 1,
-								}),
+								payload:
+									finalPayload ??
+									json({
+										role: "assistant",
+										content: [{ type: "text", text: "done" }],
+										api: "anthropic-messages",
+										provider: "test",
+										model: "current",
+										usage: {
+											input: 0,
+											output: 0,
+											cacheRead: 0,
+											cacheWrite: 0,
+											totalTokens: 0,
+											cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+										},
+										stopReason: "stop",
+										timestamp: 1,
+									}),
 							},
 						},
 					]
@@ -155,7 +158,7 @@ async function rooted(
 		);
 	}
 	await storage.commit({ writes });
-	return { storage, operationId, prompt, source, stepId };
+	return { storage, operationId, prompt, response, source, stepId };
 }
 
 function session(storage: Storage) {
@@ -795,20 +798,17 @@ describe("Phase 1 runtime shell", () => {
 		await shell.close();
 	});
 
-	it.each(["ready", "pending", "finish"] as const)(
-		"keeps parked %s actions visible and write-free",
-		async (position) => {
-			const fixture = await rooted(position);
-			const instrumented = instrumentStorage(fixture.storage);
-			const shell = await createRuntimeShell(session(instrumented), config());
-			const action = await shell.peekAction();
-			expect(action).toBeDefined();
-			await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
-			expect(await shell.peekAction()).toEqual(action);
-			expect(instrumented.committedTransactions).toHaveLength(0);
-			await shell.close();
-		},
-	);
+	it.each(["ready", "pending"] as const)("keeps parked %s actions visible and write-free", async (position) => {
+		const fixture = await rooted(position);
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		const action = await shell.peekAction();
+		expect(action).toBeDefined();
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		expect(await shell.peekAction()).toEqual(action);
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		await shell.close();
+	});
 
 	it("returns undefined for idle peek and execute without writing", async () => {
 		const fixture = await rooted("idle");
@@ -1793,6 +1793,276 @@ describe("Phase 1 runtime shell", () => {
 		expect(await reopened.peekAction()).toMatchObject({ kind: "finish_run", triggerEntryId: responseEntryId });
 		expect(leaseSpy).not.toHaveBeenCalled();
 		await reopened.close();
+	});
+
+	it("finishes a durable may_finish checkpoint in the exact terminal transaction and reopens idle", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("finish", state.createStorage());
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		const action = await shell.peekAction();
+		expect(action).toEqual({
+			kind: "finish_run",
+			operationId: fixture.operationId,
+			triggerEntryId: fixture.response,
+		});
+
+		expect(await shell.executeAction()).toEqual(action);
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(instrumented.committedTransactions[0].writes).toEqual([
+			{ kind: "register", op: "delete", namespace: "op.meta", key: fixture.operationId },
+			{ kind: "register", op: "delete", namespace: "op.state", key: fixture.operationId },
+			{
+				kind: "register",
+				op: "set",
+				namespace: "lane.lastResult",
+				key: "main",
+				value: {
+					operationId: fixture.operationId,
+					kind: "run",
+					outcome: "completed",
+					leafId: fixture.response,
+					finalAssistantEntryId: fixture.response,
+					runCompletion: "assistant",
+				},
+			},
+			{
+				kind: "register",
+				op: "set",
+				namespace: "lane.state",
+				key: "main",
+				value: { currentOperationId: null, pendingNextRun: [] },
+			},
+		]);
+		expect(await fixture.storage.getRegister("op.meta", fixture.operationId)).toBeUndefined();
+		expect(await fixture.storage.getRegister("op.state", fixture.operationId)).toBeUndefined();
+		expect(await fixture.storage.getRegister("lane.leaf", "main")).toMatchObject({ value: fixture.response });
+		expect(await shell.peekAction()).toBeUndefined();
+		await shell.close();
+
+		const reopenedStorage = state.createStorage();
+		const reads: string[] = [];
+		const getRegister = reopenedStorage.getRegister.bind(reopenedStorage);
+		reopenedStorage.getRegister = async (namespace, key) => {
+			reads.push(`${namespace}/${key}`);
+			return getRegister(namespace, key);
+		};
+		const reopened = await createRuntimeShell(session(reopenedStorage), config());
+		expect(await reopened.peekAction()).toBeUndefined();
+		expect(reads).not.toContain("lane.lastResult/main");
+		await reopened.close();
+	});
+
+	it("deletes defensive operation prefixes in deterministic namespace/key order only", async () => {
+		const fixture = await rooted("finish");
+		const other = id();
+		await fixture.storage.commit({
+			writes: [
+				{ kind: "register", op: "set", namespace: "op.tool_args", key: `${fixture.operationId}:z`, value: {} },
+				{ kind: "register", op: "set", namespace: "op.tool_args", key: `${fixture.operationId}:a`, value: {} },
+				{ kind: "register", op: "set", namespace: "op.preparation", key: `${fixture.operationId}:b`, value: {} },
+				{ kind: "register", op: "set", namespace: "op.preparation", key: `${fixture.operationId}:a`, value: {} },
+				{ kind: "register", op: "set", namespace: "op.tool_args", key: `${other}:keep`, value: {} },
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.tool_args.other",
+					key: `${fixture.operationId}:keep`,
+					value: {},
+				},
+			],
+		});
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		await shell.executeAction();
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(instrumented.committedTransactions[0].writes.slice(2, 6)).toEqual([
+			{ kind: "register", op: "delete", namespace: "op.tool_args", key: `${fixture.operationId}:a` },
+			{ kind: "register", op: "delete", namespace: "op.tool_args", key: `${fixture.operationId}:z` },
+			{ kind: "register", op: "delete", namespace: "op.preparation", key: `${fixture.operationId}:a` },
+			{ kind: "register", op: "delete", namespace: "op.preparation", key: `${fixture.operationId}:b` },
+		]);
+		expect(await fixture.storage.getRegister("op.tool_args", `${other}:keep`)).toBeDefined();
+		expect(await fixture.storage.getRegister("op.tool_args.other", `${fixture.operationId}:keep`)).toBeDefined();
+		await shell.close();
+	});
+
+	it("returns only a committed detached internal MemorySession finish result with exact final identities", async () => {
+		const fixture = await rooted("finish");
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
+		const persisted = (await fixture.storage.getEntries([fixture.response])).get(fixture.response)!;
+		const result = await runtimeSession.finishRun({
+			operationId: fixture.operationId,
+			expectedOperationStateSeq: operationState.seq,
+			expectedLaneStateSeq: laneState.seq,
+		});
+		expect(result).toEqual({
+			status: "committed",
+			attachment: expect.objectContaining({
+				laneState: expect.objectContaining({ value: { currentOperationId: null, pendingNextRun: [] } }),
+			}),
+			result: {
+				operationId: fixture.operationId,
+				kind: "completed",
+				leafId: fixture.response,
+				finalEntryId: fixture.response,
+				finalMessage: persisted.payload,
+			},
+		});
+		expect(result.status).toBe("committed");
+		if (result.status === "committed") {
+			expect(result.result.finalMessage).not.toBe(persisted.payload);
+			result.result.finalMessage.content[0] = { type: "text", text: "result mutation" };
+			expect((await fixture.storage.getEntries([fixture.response])).get(fixture.response)?.payload).toEqual(
+				persisted.payload,
+			);
+		}
+		await runtimeSession.close();
+	});
+
+	it.each(["lane.state", "op.state"] as const)(
+		"reloads a sequence-stale finish without writing (%s)",
+		async (namespace) => {
+			const fixture = await rooted("finish");
+			const instrumented = instrumentStorage(fixture.storage);
+			const shell = await createRuntimeShell(session(instrumented), config());
+			const key = namespace === "lane.state" ? "main" : fixture.operationId;
+			const current = (await fixture.storage.getRegister(namespace, key))!;
+			await fixture.storage.commit({
+				writes: [{ kind: "register", op: "set", namespace, key, value: current.value }],
+			});
+			await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+			expect(instrumented.committedTransactions).toHaveLength(0);
+			expect(await shell.peekAction()).toMatchObject({ kind: "finish_run" });
+			await shell.close();
+		},
+	);
+
+	it("keeps wrong operation ownership and an invalid finish boundary write-free in direct transitions", async () => {
+		const wrongOwner = await rooted("finish");
+		const wrongOwnerInstrumented = instrumentStorage(wrongOwner.storage);
+		const wrongOwnerSession = session(wrongOwnerInstrumented);
+		const operationState = (await wrongOwner.storage.getRegister("op.state", wrongOwner.operationId))!;
+		await wrongOwner.storage.commit({
+			writes: [
+				{
+					kind: "register",
+					op: "set",
+					namespace: "lane.state",
+					key: "main",
+					value: { currentOperationId: null, pendingNextRun: [] },
+				},
+			],
+		});
+		const laneState = (await wrongOwner.storage.getRegister("lane.state", "main"))!;
+		const obsolete = await wrongOwnerSession.finishRun({
+			operationId: wrongOwner.operationId,
+			expectedOperationStateSeq: operationState.seq,
+			expectedLaneStateSeq: laneState.seq,
+		});
+		expect(obsolete).toMatchObject({ status: "obsolete" });
+		expect(obsolete).not.toHaveProperty("result");
+		expect(wrongOwnerInstrumented.committedTransactions).toHaveLength(0);
+		await wrongOwnerSession.close();
+
+		const invalid = await rooted("finish");
+		const currentState = (await invalid.storage.getRegister("op.state", invalid.operationId))!;
+		const invalidValue = structuredClone(currentState.value) as Record<string, JsonValue>;
+		const phase = invalidValue.phase as Record<string, JsonValue>;
+		phase.continuation = { kind: "may_finish", includeFinalAssistant: false };
+		await invalid.storage.commit({
+			writes: [
+				{ kind: "register", op: "set", namespace: "op.state", key: invalid.operationId, value: invalidValue },
+			],
+		});
+		const invalidInstrumented = instrumentStorage(invalid.storage);
+		const invalidSession = session(invalidInstrumented);
+		const latestState = (await invalid.storage.getRegister("op.state", invalid.operationId))!;
+		const invalidLane = (await invalid.storage.getRegister("lane.state", "main"))!;
+		await expect(
+			invalidSession.finishRun({
+				operationId: invalid.operationId,
+				expectedOperationStateSeq: latestState.seq,
+				expectedLaneStateSeq: invalidLane.seq,
+			}),
+		).rejects.toMatchObject({ code: "corruption" });
+		expect(invalidInstrumented.committedTransactions).toHaveLength(0);
+		await invalidSession.close();
+	});
+
+	it("rejects a non-assistant final entry without a terminal write", async () => {
+		const fixture = await rooted("finish", new MemoryStorage(), {}, json(user("not final assistant")));
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
+		await expect(
+			runtimeSession.finishRun({
+				operationId: fixture.operationId,
+				expectedOperationStateSeq: operationState.seq,
+				expectedLaneStateSeq: laneState.seq,
+			}),
+		).rejects.toMatchObject({ code: "corruption" });
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		await runtimeSession.close();
+	});
+
+	it("faults on terminal commit failure without publishing idle and reopens at the pre-finish checkpoint", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("finish", state.createStorage());
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		instrumented.commit = vi.fn().mockRejectedValueOnce(new Error("commit failed"));
+		const fault = await shell.executeAction().catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault" });
+		await expect(shell.peekAction()).rejects.toBe(fault);
+		expect((await fixture.storage.getRegister("lane.state", "main"))!.value).toMatchObject({
+			currentOperationId: fixture.operationId,
+		});
+		await shell.close();
+		const reopened = await createRuntimeShell(session(state.createStorage()), config());
+		expect(await reopened.peekAction()).toMatchObject({ kind: "finish_run" });
+		await reopened.close();
+	});
+
+	it("close before finish admission is write-free", async () => {
+		const fixture = await rooted("finish");
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		await shell.close();
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+		expect(instrumented.committedTransactions).toHaveLength(0);
+	});
+
+	it("lets an admitted finish commit before queued close drains", async () => {
+		const fixture = await rooted("finish");
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		const commit = instrumented.commit.bind(instrumented);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const admitted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		instrumented.commit = async (transaction) => {
+			entered();
+			await blocked;
+			return commit(transaction);
+		};
+		const finish = shell.executeAction();
+		await admitted;
+		const close = shell.close();
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		release();
+		await expect(finish).resolves.toMatchObject({ kind: "finish_run" });
+		await close;
+		expect(instrumented.committedTransactions).toHaveLength(1);
 	});
 
 	it("close is idempotent, write-free, and rejects later admission", async () => {
