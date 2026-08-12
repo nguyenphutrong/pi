@@ -431,7 +431,7 @@ Commit `1576b20bb` implements the conditional terminal transition, exact narrow 
 
 - Date: 2026-08-12
 - Phase: 1
-- Status: accepted
+- Status: implemented by `69eb76d7f` after independent conformance review
 - References: D-010–D-017; `packages/agent/docs/harness-v3.md` §§1.3–1.7, 3.2–3.7, 3.13, 4.1–4.8, 5.1–5.2, 8, 9.1–9.3
 
 ### Options
@@ -455,3 +455,5 @@ Existing tests already provide complete close/reopen coverage for accepted `need
 Recovery authority remains `lane.state/main` to `op.meta/O` and `op.state/O`, with bounded exact entry and usage hydration. Restore performs no history, branch, configuration, register, or usage-ledger scan. Close performs no durable write. A committed terminal state restores idle without reading `lane.lastResult/main`.
 
 Matching materialization is a supported recovery prefix, not a normal assistant settlement boundary: ordinary settlement still inserts the reserved response and usage and advances the total operation state in one atomic transaction. No production behavior, Storage contract, LaneRecord API, provider adapter, public completion API, or new test-support abstraction is introduced.
+
+Commit `69eb76d7f` adds the two missing close/fresh-handle/reopen integration cases. Harness runtime tests pass 220/220, session-storage tests pass 31/31, `npm run check` passes, `git diff --check` passes, and the independent conformance review reports PASS with no blocking findings.

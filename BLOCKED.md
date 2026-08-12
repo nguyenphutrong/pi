@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Item 1.11 and D-017 were implemented by `1576b20bb` after an independent PASS; work continues with Phase 1 Tier A close/reopen boundary coverage.
+No active blockers. Item 1.12 and D-018 were implemented by `69eb76d7f` after an independent PASS; work continues with Phase 1 kill-at-every-boundary recovery coverage.
 
 ## Resolved B-005 — Close versus synchronous provider fault winner ordering
 
