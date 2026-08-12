@@ -4,12 +4,12 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.13 — Kill-at-every-boundary recovery coverage
-- Status: blocked by B-006 after two independent review rejections of the writer-audit completeness bar; implementation remains uncommitted
+- Status: B-006 option 1 selected by the human; complete the fully exact end-to-end writer audit and re-run the independent gate
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Resolve B-006, rework or rescope the D-019 writer audit, and obtain an independent PASS.
+1. Complete the exact D-019 writer audit selected in B-006 and obtain an independent PASS.
 2. Run independent Phase 1 done-bar review.
 3. Run the Phase 1 recovery/QA pass.
 4. Begin Phase 2 only after Phase 1 is accepted.
