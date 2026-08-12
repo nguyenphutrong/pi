@@ -636,3 +636,36 @@ Tool updates are transient, accepted only while the tool promise is active, drai
 The conformance bar covers every normal, error, invalid-output, abort, update, and replay-default path in the stateless phases. Harness Tier A must cover every source position and durable call status, replay declaration combination, exact-argument hydration/corruption, synthetic outcome, abort position, prefix cleanup, and resumed-versus-uninterrupted result. Tier B proves exact `plan → clearance → args+intent → effect → updates → finalize → atomic settlement → prefix cleanup/checkpoint` order. Tier C drives both abort/close orders around every boundary and compares manual with automatic durable state.
 
 The independent final design gate reports PASS. Commit `bd7cefe5b` creates the private package, its 95-case conformance suite, root build and type paths, lockfile entry, and the private Harness dependency without changing legacy agent behavior. Focused tests pass 95/95, `npm run check` passes, `git diff --check` passes, and the independent implementation review reports PASS. Parallel tools, queues, full hook/event facilities, compaction, SQLite, serving, and legacy-loop refactoring remain deferred.
+
+## D-025 — Recover an unknown generation through durable retry wait or synthetic failure
+
+- Date: 2026-08-12
+- Phase: 2
+- Status: approved by independent design review; pending implementation
+- References: D-010–D-020; `packages/agent/docs/harness-v3.md` §§3.2, 3.7, 3.12–3.13, 4.1, 4.4–4.8, 9.1–9.3; `packages/agent/docs/harness-v2.md` retry and recovery behavior
+
+### Options
+
+1. Atomically replace the restored uncertain intent with durable `retry_wait`, cross a separately visible timer effect, release to `ready`, and let the ordinary preparation transition allocate a later attempt's fresh response and usage ids. At the captured cap, atomically settle the uncertain attempt under its reserved ids and enter `failure_drain`.
+2. Replace the uncertain intent directly with `ready` and keep the backoff deadline only in process memory.
+3. Leave the uncertain intent current during backoff, then combine later-attempt preparation, id allocation, and the replacement intent in a recovery-only transition.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The captured retry policy is operation state, so process loss must not erase its deadline or reset an attempt count. Recovery applies only under running control with `1 <= k <= maxAttempts`. Below the cap means exactly `k < maxAttempts`: one commit writes only total `op.state`, `effect_pending(k) → retry_wait(nextAttempt:k+1, notBefore, errorMessage)`. Delay is `min(Number.MAX_SAFE_INTEGER, baseDelayMs * 2^(k-1))`, and `notBefore` is `min(Number.MAX_SAFE_INTEGER, capturedNow + delay)`, where `capturedNow` is read inside the current recovery transition after authority validation. The stable retry diagnostic is `"Provider outcome unknown after interruption"`.
+
+The timer is an independently released process-local action. Completion installs only an exact local elapsed proof keyed by operation id, step id, `nextAttempt`, and `notBefore`; a proof for another wait can never release this one. A second action conditionally commits `retry_wait → ready` while preserving the same `nextAttempt` without another increment. This preserves stable peeking and the one-effect-or-one-transaction manual boundary. Close during the timer releases no proof and writes nothing. Close before the ready commit leaves the same durable deadline; reopen waits only its non-negative remainder.
+
+The ordinary `prepare_assistant_effect` path remains the only authority that resolves the captured model lease, projects context, calculates request limits, allocates response/usage ids, and commits an intent. It accepts the persisted later attempt number and allocates fresh ids only after the `ready` state is current. The uncertain attempt's reserved ids are never reused by another provider effect and may remain unmaterialized below the cap.
+
+At the cap means exactly `k === maxAttempts`. Recovery needs no provider identity and performs one atomic transaction: insert a synthetic assistant error under the uncertain attempt's `responseEntryId`, move `lane.leaf/main`, insert zero usage under its `usageId`, and replace total state with `latestAssistantEntryId` plus response-provenance `failure_drain`. The exact `OperationError` is `{ code: "provider_interrupted", message: "Provider outcome unknown after interruption" }`. The synthetic message uses captured provider/model identity, `api: "harness"`, empty content, zero usage, `stopReason: "error"`, and the same string as `errorMessage`. Its message timestamp is `Date.now()` captured inside the current recovery transition after authority validation. Zero usage has zero `input`, `output`, `cacheRead`, `cacheWrite`, and `totalTokens`, with zero `input`, `output`, `cacheRead`, `cacheWrite`, and `total` cost; optional usage fields are absent. The ledger row copies that exact usage and sets `adjustment:false`. `api: "harness"` identifies Harness as the producer rather than fabricating an adapter API that is absent from `GenerationContext`; `pi-ai` already permits application-defined API strings. This changes neither `pi-ai` nor Storage.
+
+With the Phase 2 inbox still empty, `failure_drain` has no input to restart work. Its next ordinary action is a failed terminal transaction: delete operation-owned registers, write `lane.lastResult` with `outcome:"failed"`, the exact `OperationError`, and `leafId`/`finalAssistantEntryId` both equal to the synthetic response entry id, omit `runCompletion`, then clear only `lane.state.currentOperationId`. The result references the durable response by id and never embeds it. It runs no provider request and no normal finish hook. Queue draining and cancellation variants remain deferred to their ordered Phase 2 work items.
+
+Option 2 loses the deadline on reopen and violates the specified durable `retry_wait` state. Option 3 restarts a full delay after close, duplicates request preparation in recovery, and couples identity resolution to scheduling. Neither is acceptable.
+
+Replacing a below-cap intent with `retry_wait` intentionally leaves its old response/usage strings unmaterialized and no longer reserved: current-state invariant 15 gives reservation authority only to ids named by the latest `op.state`. Tier A covers uncertain attempts below and at the cap, invalid attempt/policy relationships, exact timer-proof matching, every new durable prefix, fresh later ids, exact synthetic response/usage/provenance, bounded write-free restore, and failed terminal cleanup. Writer/close-reopen coverage proves recovery intent, timer, ready release, later request intent, cap synthesis, and failed finish remain distinct boundaries. No public Harness API, provider adapter, private agent-loop behavior, Storage contract, history reducer, or forbidden legacy record surface changes.
