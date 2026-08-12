@@ -383,3 +383,44 @@ The successful transaction has exactly four ordered writes: insert reserved resp
 Session returns a structured observation: committed, matching materialized reservations, obsolete effect, or unsupported classification. RuntimeShell updates its attachment before changing local proof. It deletes the exact settled value only after commit, validated materialization, or confirmed obsolescence; unsupported classification retains it. Matching materialization never inserts again and lets planner repair keep precedence. Partial or mismatched reservation materialization is corruption. Storage/corruption failures fault the shell through D-015 first-terminal-condition arbitration. Close-first writes nothing; settlement admitted first may commit and close waits.
 
 Commit `c0dae84c2` implements this boundary. Harness runtime tests pass 202/202, session-storage tests pass 31/31, `npm run check` passes, `git diff --check` passes, and the independent conformance review reports PASS with no blocking findings.
+
+## D-017 — Reconcile terminal Phase 1 no-tool completion conditionally
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: accepted after design and independent architecture review
+- References: D-010–D-016; `packages/agent/docs/harness-v3.md` §§1.3, 3.2–3.5, 3.12–3.13, 4.1–4.4, 4.7–4.8, 5.1–5.2, 8–9
+
+### Options
+
+1. Keep `finish_run` as a distinct action and add one narrow completed-run terminal transition.
+2. Fold terminal cleanup into assistant settlement, removing the durable `may_finish` boundary.
+3. Build the future generic terminal kernel and public completion surface together now.
+
+### Choice
+
+Option 1, with the full terminal-cleanup ownership contract but only the completed no-tool result variant currently reachable.
+
+### Rationale
+
+The separate finish boundary preserves deterministic close/reopen behavior and leaves room for later checkpoint work such as `before_run_end`. Unlike assistant settlement, finish is an ordinary conditional transition: it requires the planner's expected `op.state` and `lane.state` sequences as well as semantic validation of the latest total state. A changed token reloads and replans without writing; no configuration or settings token is needed because finish snapshots neither.
+
+Inside the lane mutation line, finish rereads and validates lane state, leaf, `op.meta/O`, `op.state/O`, and the exact final assistant entry. The lane must still own O; the state must be running at checkpoint `may_finish` with an empty Phase 1 inbox and `includeFinalAssistant:true`; leaf, checkpoint trigger, and `latestAssistantEntryId` must name the same assistant entry.
+
+The completed terminal transaction owns this ordered shape:
+
+```text
+delete op.meta/O
+delete op.state/O
+delete every op.tool_args key prefixed O:
+delete every op.preparation key prefixed O:
+delete every operation-owned pending.entry key
+set lane.lastResult/main
+set lane.state/main with only currentOperationId cleared
+```
+
+Valid Phase 1 no-tool state has empty prefix and pending-entry deletion sets, so its transaction has exactly four writes: the two operation-register deletes, `lane.lastResult`, then latest total `lane.state`. The executor nevertheless discovers and deletes defensive `op.tool_args/O:*` and `op.preparation/O:*` leaks now, preserving §3.13 ownership before those namespaces become reachable. Operation-owned `pending.entry` is provably empty under the current codecs; its explicit ids and deletion tests land before queues or abort can make it non-empty. Lane-owned `pendingNextRun` is never deleted, and the final lane-state write spreads the latest value before clearing only operation ownership.
+
+The Harness-owned narrow durable result is `{ operationId, kind:"run", outcome:"completed", leafId, finalAssistantEntryId, runCompletion:"assistant" }`, with exact fields, UUIDv7 ids, and equal leaf/final-assistant ids. Restore never reads `lane.lastResult`. The transition also returns a detached internal result `{ operationId, kind:"completed", leafId, finalEntryId, finalMessage }` computed from the authoritative persisted entry. RuntimeShell installs the idle attachment only after commit and keeps returning the released `finish_run` action; it does not add a singleton completion slot, change prompt semantics, or expose `runToCompletion()`/`getLastResult()` yet.
+
+Close-first prevents terminal admission and reopen plans `finish_run`; finish-first commits completely and close waits. A commit or codec failure faults without publishing idle state or a result, subject to D-015 first-terminal-condition ordering. Public results, prompt completion promises, generic outcomes, queues, abort, hooks/events, and structural operations remain deferred.

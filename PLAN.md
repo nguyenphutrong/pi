@@ -4,16 +4,15 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.11 — Reconcile terminal no-tool completion
-- Status: work item 1.10 committed as `c0dae84c2`; design the terminal transaction and internal completion result
+- Status: D-017 approved after independent design review; implement the conditional terminal transaction and internal completion result
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Design terminal cleanup/reconciliation and the internal no-tool completion result.
-2. Implement the approved terminal transaction and completion result.
-3. Add close/reopen Tier A coverage for every resulting action and transition boundary.
-4. Add kill-at-every-boundary recovery coverage.
-5. Run independent Phase 1 done-bar review and recovery QA.
+1. Implement the D-017 terminal transaction and completion result.
+2. Add close/reopen Tier A coverage for every resulting action and transition boundary.
+3. Add kill-at-every-boundary recovery coverage.
+4. Run independent Phase 1 done-bar review and recovery QA.
 
 ## Phase order
 
