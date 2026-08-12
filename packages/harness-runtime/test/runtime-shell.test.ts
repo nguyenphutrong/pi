@@ -1,14 +1,16 @@
 import { type AssistantMessage, type Context, createModels, type ModelRequestLease } from "@earendil-works/pi-ai";
 import {
+	isUuidV7,
 	type JsonValue,
 	MemoryStorage,
 	MemoryStorageState,
 	type Storage,
 	type Write,
 } from "@earendil-works/pi-session-storage";
-import { instrumentStorage } from "@earendil-works/pi-session-storage/testing";
+import { type InstrumentedStorage, instrumentStorage } from "@earendil-works/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
-import type { LaneConfiguration } from "../src/durable.ts";
+import type { LaneConfiguration, RunOperation, RunState } from "../src/durable.ts";
+import { MemorySessionRepo } from "../src/repo.ts";
 import { createRuntimeShell } from "../src/runtime-shell.ts";
 import { MemorySession } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
@@ -251,6 +253,319 @@ async function expectUncertainReopen(state: MemoryStorageState): Promise<void> {
 	await shell.close();
 	expect(instrumented.committedTransactions).toHaveLength(0);
 }
+
+const commitCuts = [
+	["prompt acceptance", 0, "start_assistant_step"],
+	["assistant step ready", 1, "prepare_assistant_effect"],
+	["assistant effect intent", 2, "recover_assistant_effect"],
+	["assistant settlement", 5, "finish_run"],
+	["terminal finish", 6, undefined],
+] as const;
+
+describe("D-019 no-tool fresh-handle lifecycle", () => {
+	it.each(commitCuts)("restores %s through MemorySessionRepo", async (_cut, actions, nextKind) => {
+		const now = 1_800_000_000_000 + actions;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+		const handles: InstrumentedStorage[] = [];
+		const createStorage = MemoryStorageState.prototype.createStorage;
+		const storageSpy = vi.spyOn(MemoryStorageState.prototype, "createStorage").mockImplementation(function (
+			this: MemoryStorageState,
+		): MemoryStorage {
+			const instrumented = instrumentStorage(createStorage.call(this));
+			handles.push(instrumented);
+			return instrumented as unknown as MemoryStorage;
+		});
+		try {
+			const repo = new MemorySessionRepo();
+			const created = await repo.create();
+			expect(created).toBeInstanceOf(MemorySession);
+			expect(created.metadata.createdAt).toBe(now);
+			const operationId = id();
+			const promptEntryId = id();
+			const stepId = id();
+			const responseEntryId = id();
+			const usageId = id();
+			const activeSession = created as MemorySession;
+			vi.spyOn(activeSession.idGenerator, "next")
+				.mockReturnValueOnce(operationId)
+				.mockReturnValueOnce(promptEntryId)
+				.mockReturnValueOnce(stepId)
+				.mockReturnValueOnce(responseEntryId)
+				.mockReturnValueOnce(usageId);
+			const { models, lease } = availableModels();
+			vi.mocked(lease.streamSimple).mockReturnValue({
+				result: () => Promise.resolve(terminal()),
+			} as ReturnType<ModelRequestLease["streamSimple"]>);
+			const shell = await createRuntimeShell(activeSession, config(), { models });
+			await shell.prompt(user("audit prompt"));
+			for (let index = 0; index < actions; index++) await shell.executeAction();
+			await shell.close();
+
+			const reopened = await repo.open(created.metadata);
+			const freshHandle = handles.at(-1);
+			if (!freshHandle || handles.length !== 2) throw new Error("fresh repository storage handle missing");
+			const restoredModels = createModels();
+			const restoredLease = vi.spyOn(restoredModels, "lease");
+			const restored = await createRuntimeShell(reopened, config(), { models: restoredModels });
+			const expectedAction =
+				nextKind === "start_assistant_step"
+					? { kind: nextKind, operationId, triggerEntryId: promptEntryId }
+					: nextKind === "prepare_assistant_effect"
+						? { kind: nextKind, operationId, stepId, nextAttempt: 1 }
+						: nextKind === "recover_assistant_effect"
+							? { kind: nextKind, operationId, stepId, attempt: 1 }
+							: nextKind === "finish_run"
+								? { kind: nextKind, operationId, triggerEntryId: responseEntryId }
+								: undefined;
+			expect(await restored.peekAction()).toEqual(expectedAction);
+			expect(freshHandle.committedTransactions).toEqual([]);
+			expect(restoredLease).not.toHaveBeenCalled();
+			await restored.close();
+			expect(freshHandle.committedTransactions).toEqual([]);
+		} finally {
+			storageSpy.mockRestore();
+			clock.mockRestore();
+		}
+	});
+});
+
+describe("D-019 no-tool ordered writer audit", () => {
+	it.each([...commitCuts] as const)("records the complete transaction prefix at %s", async (_cut, actions) => {
+		const now = 1_900_000_000_000 + actions;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+		const handles: InstrumentedStorage[] = [];
+		const createStorage = MemoryStorageState.prototype.createStorage;
+		const storageSpy = vi.spyOn(MemoryStorageState.prototype, "createStorage").mockImplementation(function (
+			this: MemoryStorageState,
+		): MemoryStorage {
+			const instrumented = instrumentStorage(createStorage.call(this));
+			handles.push(instrumented);
+			return instrumented as unknown as MemoryStorage;
+		});
+		try {
+			const repo = new MemorySessionRepo();
+			const activeSession = await repo.create();
+			expect(activeSession).toBeInstanceOf(MemorySession);
+			expect(activeSession.metadata.createdAt).toBe(now);
+			const activeStorage = handles[0];
+			if (!activeStorage) throw new Error("repository creation storage handle missing");
+			const operationId = id();
+			const promptEntryId = id();
+			const stepId = id();
+			const responseEntryId = id();
+			const usageId = id();
+			const memorySession = activeSession as MemorySession;
+			vi.spyOn(memorySession.idGenerator, "next")
+				.mockReturnValueOnce(operationId)
+				.mockReturnValueOnce(promptEntryId)
+				.mockReturnValueOnce(stepId)
+				.mockReturnValueOnce(responseEntryId)
+				.mockReturnValueOnce(usageId);
+			const { models, lease } = availableModels();
+			vi.mocked(lease.streamSimple).mockReturnValue({
+				result: () => Promise.resolve(terminal()),
+			} as ReturnType<ModelRequestLease["streamSimple"]>);
+			const shell = await createRuntimeShell(memorySession, config(), { models });
+			await shell.prompt(user("audit prompt"));
+			const operation: RunOperation = {
+				operationId,
+				lane: "main",
+				sourceLeafId: null,
+				startedAt: now,
+				intent: { kind: "run", promptEntryIds: [promptEntryId] },
+			};
+			const commonState = {
+				kind: "run" as const,
+				control: { status: "running" as const },
+				settings: {
+					compaction: { enabled: false, reserveTokens: 0, keepRecentTokens: 0 },
+					steeringMode: "all" as const,
+					followUpMode: "all" as const,
+					toolExecution: "sequential" as const,
+				},
+				inbox: { steer: [] as [], followUp: [] as [], writes: [] as [] },
+			};
+			const acceptedState: RunState = {
+				...commonState,
+				phase: {
+					kind: "checkpoint",
+					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+					triggerEntryId: promptEntryId,
+				},
+				latestAssistantEntryId: null,
+			};
+			const generationContext = {
+				stepId,
+				triggerEntryId: promptEntryId,
+				configuration: config(),
+				streamOptions: {},
+				retryPolicy: { maxAttempts: 1, baseDelayMs: 1000 },
+				overflowRecoveryUsed: false,
+			};
+			const readyState: RunState = {
+				...commonState,
+				phase: { kind: "assistant", generation: { status: "ready", context: generationContext, nextAttempt: 1 } },
+				latestAssistantEntryId: null,
+			};
+			const pendingState: RunState = {
+				...commonState,
+				phase: {
+					kind: "assistant",
+					generation: {
+						status: "effect_pending",
+						context: generationContext,
+						attempt: 1,
+						responseEntryId,
+						usageId,
+						intendedOutputLimit: 4096,
+						contextWindow: 8192,
+					},
+				},
+				latestAssistantEntryId: null,
+			};
+			const settledState: RunState = {
+				...commonState,
+				phase: {
+					kind: "checkpoint",
+					continuation: { kind: "may_finish", includeFinalAssistant: true },
+					triggerEntryId: responseEntryId,
+				},
+				latestAssistantEntryId: responseEntryId,
+			};
+			const lastResult = {
+				operationId,
+				kind: "run" as const,
+				outcome: "completed" as const,
+				leafId: responseEntryId,
+				finalAssistantEntryId: responseEntryId,
+				runCompletion: "assistant" as const,
+			};
+			const expectedTransactions = [
+				[
+					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: null },
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.state",
+						key: "main",
+						value: { currentOperationId: null, pendingNextRun: [] },
+					},
+				],
+				[{ kind: "register", op: "set", namespace: "lane.config", key: "main", value: json(config()) }],
+				[
+					{
+						kind: "entry",
+						entry: { id: promptEntryId, parentId: null, type: "message", payload: json(user("audit prompt")) },
+					},
+					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: promptEntryId },
+					{ kind: "register", op: "set", namespace: "op.meta", key: operationId, value: json(operation) },
+					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: json(acceptedState) },
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.state",
+						key: "main",
+						value: { currentOperationId: operationId, pendingNextRun: [] },
+					},
+				],
+				[{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: json(readyState) }],
+				[{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: json(pendingState) }],
+				[
+					{
+						kind: "entry",
+						entry: { id: responseEntryId, parentId: promptEntryId, type: "message", payload: json(terminal()) },
+					},
+					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
+					{
+						kind: "usage",
+						row: { id: usageId, entryId: responseEntryId, usage: terminal().usage, adjustment: false },
+					},
+					{ kind: "register", op: "set", namespace: "op.state", key: operationId, value: json(settledState) },
+				],
+				[
+					{ kind: "register", op: "delete", namespace: "op.meta", key: operationId },
+					{ kind: "register", op: "delete", namespace: "op.state", key: operationId },
+					{ kind: "register", op: "set", namespace: "lane.lastResult", key: "main", value: lastResult },
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.state",
+						key: "main",
+						value: { currentOperationId: null, pendingNextRun: [] },
+					},
+				],
+			] satisfies Write[][];
+			for (let index = 0; index < actions; index++) await shell.executeAction();
+
+			const expectedCount = actions === 0 ? 3 : actions === 1 ? 4 : actions === 2 ? 5 : actions === 5 ? 6 : 7;
+			expect(activeStorage.committedTransactions.map(({ writes }) => writes)).toEqual(
+				expectedTransactions.slice(0, expectedCount),
+			);
+			expect((await activeStorage.getRegister("lane.config", "main"))?.value).toEqual(config());
+			expect((await activeStorage.getEntries([promptEntryId])).get(promptEntryId)).toEqual({
+				id: promptEntryId,
+				parentId: null,
+				seq: 4,
+				timestamp: now,
+				type: "message",
+				payload: user("audit prompt"),
+			});
+			const expectedCurrentState =
+				actions === 0 ? acceptedState : actions === 1 ? readyState : actions === 2 ? pendingState : settledState;
+			if (actions < 6) {
+				expect((await activeStorage.getRegister("lane.state", "main"))?.value).toEqual({
+					currentOperationId: operationId,
+					pendingNextRun: [],
+				});
+				expect((await activeStorage.getRegister("op.meta", operationId))?.value).toEqual(operation);
+				expect((await activeStorage.getRegister("op.state", operationId))?.value).toEqual(expectedCurrentState);
+				expect(await activeStorage.getRegister("lane.lastResult", "main")).toBeUndefined();
+			}
+			if (actions === 2) {
+				expect(isUuidV7(responseEntryId)).toBe(true);
+				expect(isUuidV7(usageId)).toBe(true);
+				expect(responseEntryId).not.toBe(usageId);
+				expect((await activeStorage.getEntries([responseEntryId, usageId])).size).toBe(0);
+				expect((await activeStorage.getUsageRows([responseEntryId, usageId])).size).toBe(0);
+				expect((await activeStorage.getRegister("lane.leaf", "main"))?.value).toBe(promptEntryId);
+			}
+			if (actions >= 5) {
+				expect((await activeStorage.getEntries([responseEntryId])).get(responseEntryId)).toEqual({
+					id: responseEntryId,
+					parentId: promptEntryId,
+					seq: 11,
+					timestamp: now,
+					type: "message",
+					payload: terminal(),
+				});
+				expect((await activeStorage.getUsageRows([usageId])).get(usageId)).toEqual({
+					id: usageId,
+					seq: 13,
+					entryId: responseEntryId,
+					adjustment: false,
+					usage: terminal().usage,
+				});
+				expect((await activeStorage.getRegister("lane.leaf", "main"))?.value).toBe(responseEntryId);
+			}
+			if (actions === 6) {
+				expect((await activeStorage.getRegister("lane.lastResult", "main"))?.value).toEqual(lastResult);
+				expect((await activeStorage.getRegister("lane.leaf", "main"))?.value).toBe(responseEntryId);
+				expect((await activeStorage.getRegister("lane.state", "main"))?.value).toEqual({
+					currentOperationId: null,
+					pendingNextRun: [],
+				});
+				expect(await activeStorage.getRegister("op.meta", operationId)).toBeUndefined();
+				expect(await activeStorage.getRegister("op.state", operationId)).toBeUndefined();
+				for (const namespace of ["op.tool_args", "op.preparation", "pending.entry"])
+					expect(await activeStorage.listRegisters(namespace)).toEqual([]);
+			}
+			await shell.close();
+		} finally {
+			storageSpy.mockRestore();
+			clock.mockRestore();
+		}
+	});
+});
 
 describe("Phase 1 runtime shell", () => {
 	it("prepares one detached durable assistant intent and parks the retained live plan", async () => {

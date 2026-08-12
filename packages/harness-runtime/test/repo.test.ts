@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { LaneConfiguration } from "../src/durable.ts";
 import {
 	CURRENT_STORAGE_VERSION,
 	MemorySessionRepo,
@@ -6,7 +7,14 @@ import {
 	SessionError,
 	type SessionMetadata,
 } from "../src/index.ts";
+import { attachRuntime } from "../src/runtime-port.ts";
 import { id, user, ZERO_USAGE } from "./fixtures.ts";
+
+const configuration = (): LaneConfiguration => ({
+	model: { provider: "test", modelId: "current" },
+	thinkingLevel: "medium",
+	activeToolNames: [],
+});
 
 async function errorCode(operation: Promise<unknown>): Promise<string | undefined> {
 	try {
@@ -26,7 +34,7 @@ function asMetadata(value: unknown): SessionMetadata {
 }
 
 describe("MemorySessionRepo", () => {
-	it("creates detached current metadata and an empty idle main lane", async () => {
+	it("commits the complete idle main lane at creation and preserves it across a fresh handle", async () => {
 		const repo = new MemorySessionRepo();
 		const parentSessionId = id();
 		const session = await repo.create({ parentSessionId });
@@ -45,9 +53,36 @@ describe("MemorySessionRepo", () => {
 		expect(await session.getLeafId()).toBeNull();
 		expect(await session.findEntries()).toEqual([]);
 		expect(await session.getStats()).toEqual({ messageCount: 0, usage: ZERO_USAGE });
-		await session.appendMessage(user("first"));
-		expect((await session.findEntry())?.seq).toBe(3);
 		await session.close();
+
+		const reopened = await repo.open(session.metadata);
+		const firstAttachment = await attachRuntime(reopened, configuration());
+		expect(firstAttachment.mainLeaf.value).toBeNull();
+		expect(firstAttachment.laneState.value).toEqual({ currentOperationId: null, pendingNextRun: [] });
+		expect(firstAttachment.laneState.seq).toBe(firstAttachment.mainLeaf.seq + 1);
+		expect(firstAttachment.laneConfiguration.value).toEqual(configuration());
+		expect(firstAttachment.laneConfiguration.seq).toBe(firstAttachment.laneState.seq + 1);
+		expect(firstAttachment.runOperation).toBeUndefined();
+		expect(firstAttachment.runState).toBeUndefined();
+		await reopened.close();
+
+		const reopenedAgain = await repo.open(session.metadata);
+		const secondAttachment = await attachRuntime(reopenedAgain, {
+			...configuration(),
+			model: { provider: "other", modelId: "ignored-seed" },
+		});
+		expect(secondAttachment.mainLeaf).toEqual(firstAttachment.mainLeaf);
+		expect(secondAttachment.laneState).toEqual(firstAttachment.laneState);
+		expect(secondAttachment.laneConfiguration).toEqual(firstAttachment.laneConfiguration);
+		expect(secondAttachment.runOperation).toBeUndefined();
+		expect(secondAttachment.runState).toBeUndefined();
+		await reopenedAgain.close();
+
+		const mutable = await repo.open(session.metadata);
+		await mutable.appendMessage(user("first"));
+		const entry = await mutable.findEntry();
+		expect(entry?.seq).toBe(firstAttachment.laneConfiguration.seq + 1);
+		await mutable.close();
 	});
 
 	it("enforces exclusive ownership and returns a fresh handle after close", async () => {
