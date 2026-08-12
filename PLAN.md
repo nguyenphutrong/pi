@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.2 — Private stateless agent-loop package and conformance tests
-- Status: D-024 durable sequential-tool design passed the independent design gate; implement the package without changing legacy `pi-agent-core`
+- Work item: 2.3 — Generation unknown-effect recovery
+- Status: private stateless agent-loop commit `bd7cefe5b` passed independent review; implement retry-or-synthetic recovery for restored provider intents
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Create private `@nguyenphutrong/pi-agent-loop` with prepare, execute, finalize, and conformance tests.
-2. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
-3. Implement and test the first complete durable tool-plan commit before clearance or effects.
-4. Add durable clearance, persisted effective arguments, replay policy, and sequential tool settlement.
-5. Add durable abort/reconciliation after sequential tool states are abort-ready.
+1. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
+2. Implement and test the first complete durable tool-plan commit before clearance or effects.
+3. Add durable clearance, persisted effective arguments, replay policy, and sequential tool settlement.
+4. Add durable abort/reconciliation after sequential tool states are abort-ready.
+5. Add close/reopen crash matrices at every Phase 2 commit boundary and run the done-bar gate.
 
 ## Phase order
 

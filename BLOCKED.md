@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-024 passed the independent design gate; private agent-loop implementation may continue.
+No active blocker. Private agent-loop implementation passed review; generation unknown-effect recovery may continue.
 
 ## B-010 — Choose how Harness distributes its private agent-loop dependency
 

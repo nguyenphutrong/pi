@@ -587,7 +587,7 @@ Commit `ccf86e630` marks Harness private and removes only its explicit local-rel
 
 - Date: 2026-08-12
 - Phase: 2
-- Status: accepted after independent design review
+- Status: implemented by `bd7cefe5b` after independent review
 - References: D-021–D-023; `packages/agent/docs/harness-v3.md` §§0.4–0.5, 3.8, 3.13, 4.1–4.8, 5.6–5.7, 9; `packages/agent/docs/harness-v2.md` tool behavior and crash catalog
 
 ### Options
@@ -635,4 +635,4 @@ Tool updates are transient, accepted only while the tool promise is active, drai
 
 The conformance bar covers every normal, error, invalid-output, abort, update, and replay-default path in the stateless phases. Harness Tier A must cover every source position and durable call status, replay declaration combination, exact-argument hydration/corruption, synthetic outcome, abort position, prefix cleanup, and resumed-versus-uninterrupted result. Tier B proves exact `plan → clearance → args+intent → effect → updates → finalize → atomic settlement → prefix cleanup/checkpoint` order. Tier C drives both abort/close orders around every boundary and compares manual with automatic durable state.
 
-The independent final design gate reports PASS. Parallel tools, queues, full hook/event facilities, compaction, SQLite, serving, and legacy-loop refactoring remain deferred.
+The independent final design gate reports PASS. Commit `bd7cefe5b` creates the private package, its 95-case conformance suite, root build and type paths, lockfile entry, and the private Harness dependency without changing legacy agent behavior. Focused tests pass 95/95, `npm run check` passes, `git diff --check` passes, and the independent implementation review reports PASS. Parallel tools, queues, full hook/event facilities, compaction, SQLite, serving, and legacy-loop refactoring remain deferred.
