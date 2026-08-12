@@ -2,7 +2,31 @@
 
 ## Current status
 
-No active blockers as of Phase 1 work item 1.8b (`2eca9c11f`).
+No active blockers. B-005 was resolved by the human selection of option 1.
+
+## Resolved B-005 — Close versus synchronous provider fault winner ordering
+
+- Date: 2026-08-11
+- Resolved: 2026-08-12 — human selected option 1; recorded in D-015
+- Phase: 1
+- Work item: 1.9 — dispatch the retained assistant provider lease
+- Trigger: §6 repeated review-agent rejection. Two review passes rejected the same underlying close-versus-provider-fault winner-ordering gap.
+- Status: resolved; implement close-first synchronous arbitration and obtain a fresh independent review
+
+### Context
+
+The asynchronous half is resolved: a `stream.result()` rejection arriving after `close()` is observed without changing the shell from `closed` to `fault`, and reopen remains uncertain.
+
+One reentrant synchronous trace remains. Retained `streamSimple()` or `stream.result()` can synchronously call `shell.close()` and then throw. Close seals first, but the dispatch catch currently calls `#faultShell()` unconditionally, changing future calls from `closed` to `fault`.
+
+### Decision
+
+1. **Selected:** close-first wins. If a synchronous provider throw occurs after close sealed the shell, abort the owned controller, preserve `closed`, write nothing, and reopen from durable `effect_pending` as uncertain. A throw that wins before close keeps the existing fault-first behavior and original cause.
+2. Fault always wins for a synchronous provider throw, even when provider reentrancy already sealed close. This differs from the approved asynchronous ordering and requires updating D-014 plus close tests.
+
+### Resume point
+
+For option 1, apply the asynchronous callback's winner arbitration to the synchronous catch; add direct reentrant-close regressions for both `streamSimple()` and `result()` throws; rerun focused/full Harness tests and `npm run check`; obtain a fresh independent PASS before commit.
 
 ## Resolved B-004 — Restore cannot validate a reserved usage ID with the current Storage contract
 

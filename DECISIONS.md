@@ -334,3 +334,23 @@ Close seals new admission, notifies parked await work, and aborts running contro
 A synchronous stream throw, rejected result promise, malformed terminal message, or pending terminal message violates the `pi-ai` stream contract. It removes the local proof, faults and seals the current shell, aborts other effects, preserves the durable `effect_pending` prefix, and rejects pending/future local calls. The same handle must not execute recovery after an invariant fault; only close/reopen may observe the absent key and apply uncertain-effect policy.
 
 Work item 1.9 stops at the process-local settled state. `settle_assistant_effect` remains stable and write-free but unavailable until the response/usage/classification transaction lands. No public API, Storage schema, provider adapter, event/hook surface, or completion promise changes.
+
+## D-015 — Preserve the first terminal shell condition across provider reentrancy
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: confirmed by human after B-005 escalation
+- References: D-014; `packages/agent/docs/harness-v3.md` §§4.2, 4.7–4.8, 9.3
+
+### Options
+
+1. Close-first wins when provider code synchronously reenters `close()` and then throws; fault-first remains a fault.
+2. A synchronous provider throw always reclassifies the shell as faulted, even after close sealed it.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Close and fault are terminal process-local conditions, so the first one observed must remain authoritative. If provider code reenters `close()` from `streamSimple()` or `result()` and then throws, close has already sealed admission and pulled the owned signal. The throw is consumed, dispatch rejects as closed, no storage write occurs, and reopen applies uncertain recovery to the durable `effect_pending` prefix. A synchronous or asynchronous provider contract failure observed before close still faults the shell with its original cause. This makes synchronous and asynchronous outcome arbitration identical and prevents provider callback timing from changing a closed handle's classification.
