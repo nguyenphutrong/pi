@@ -1,4 +1,5 @@
 import type {
+	AssistantMessage,
 	Context,
 	Message,
 	ModelRequestLease,
@@ -14,13 +15,13 @@ import { RuntimeSettingsOwner } from "./runtime-settings.ts";
 import type { RuntimeAttachment } from "./session.ts";
 import type { Session } from "./types.ts";
 
-export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed";
+export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed" | "fault";
 
 export class RuntimeShellError extends Error {
 	readonly code: RuntimeShellErrorCode;
 
-	constructor(code: RuntimeShellErrorCode, message: string) {
-		super(message);
+	constructor(code: RuntimeShellErrorCode, message: string, cause?: unknown) {
+		super(message, cause === undefined ? undefined : { cause });
 		this.name = "RuntimeShellError";
 		this.code = code;
 	}
@@ -37,6 +38,8 @@ interface AssistantEffectPlan {
 	readonly lease: ModelRequestLease;
 	readonly context: Context;
 	readonly options: ModelsSimpleStreamOptions;
+	readonly provider: string;
+	readonly modelId: string;
 	readonly operationId: string;
 	readonly stepId: string;
 	readonly attempt: number;
@@ -46,33 +49,81 @@ interface AssistantEffectPlan {
 	readonly contextWindow: number;
 }
 
+type ObservedAssistantResult =
+	| { readonly status: "fulfilled"; readonly message: AssistantMessage }
+	| { readonly status: "rejected"; readonly error: RuntimeShellError };
+
+type AssistantEffectState =
+	| { readonly status: "planned"; readonly plan: AssistantEffectPlan }
+	| {
+			readonly status: "running";
+			readonly plan: AssistantEffectPlan;
+			readonly controller: AbortController;
+			readonly observed: Promise<ObservedAssistantResult>;
+	  }
+	| { readonly status: "settled"; readonly plan: AssistantEffectPlan; readonly message: AssistantMessage };
+
 export class RuntimeShell {
 	readonly #session: Session;
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
-	readonly #assistantEffects = new Map<string, AssistantEffectPlan>();
+	readonly #assistantEffects = new Map<string, AssistantEffectState>();
 	#current: RuntimeAttachment;
 	#sealed = false;
+	#fault: RuntimeShellError | undefined;
 	#admissionLine: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
+	readonly #shutdownNotice: Promise<void>;
+	readonly #notifyShutdown: () => void;
 
 	constructor(session: Session, settings: RuntimeSettingsOwner, attachment: RuntimeAttachment, models?: Models) {
 		this.#session = session;
 		this.#settings = settings;
 		this.#current = attachment;
 		this.#models = models;
+		let notifyShutdown!: () => void;
+		this.#shutdownNotice = new Promise((resolve) => {
+			notifyShutdown = resolve;
+		});
+		this.#notifyShutdown = notifyShutdown;
 	}
 
 	#plan(): PlannedAction | undefined {
 		return planAction(this.#current, {
 			settingsRevision: this.#settings.peek().revision,
-			assistantEffects: this.#assistantEffects,
+			assistantEffectStatus: (key) => this.#assistantEffects.get(key)?.status,
 		});
 	}
 
+	#abortRunningEffects(): void {
+		for (const effect of this.#assistantEffects.values()) if (effect.status === "running") effect.controller.abort();
+	}
+
+	#faultShell(effectKey: string, cause: unknown): RuntimeShellError {
+		if (!this.#fault)
+			this.#fault = new RuntimeShellError("fault", "Assistant stream violated its runtime contract", cause);
+		this.#sealed = true;
+		this.#notifyShutdown();
+		this.#abortRunningEffects();
+		this.#assistantEffects.delete(effectKey);
+		return this.#fault;
+	}
+
+	#assistantFailure(effectKey: string, cause: unknown): RuntimeShellError {
+		return this.#fault
+			? this.#fault
+			: this.#sealed
+				? new RuntimeShellError("closed", "Runtime shell is closed")
+				: this.#faultShell(effectKey, cause);
+	}
+
 	#admit<T>(operation: () => Promise<T> | T): Promise<T> {
+		if (this.#fault) return Promise.reject(this.#fault);
 		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
-		const admitted = this.#admissionLine.then(operation);
+		const admitted = this.#admissionLine.then(() => {
+			if (this.#fault) throw this.#fault;
+			return operation();
+		});
 		this.#admissionLine = admitted.then(
 			() => undefined,
 			() => undefined,
@@ -88,6 +139,71 @@ export class RuntimeShell {
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "dispatch_assistant_effect") {
+				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+				const effectKey = action.info.effectKey;
+				const effect = this.#assistantEffects.get(effectKey);
+				if (effect?.status !== "planned")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer planned");
+				const controller = new AbortController();
+				let observe!: (result: ObservedAssistantResult) => void;
+				const observed = new Promise<ObservedAssistantResult>((resolve) => {
+					observe = resolve;
+				});
+				this.#assistantEffects.set(effectKey, {
+					status: "running",
+					plan: effect.plan,
+					controller,
+					observed,
+				});
+				try {
+					const stream = effect.plan.lease.streamSimple(effect.plan.context, {
+						...effect.plan.options,
+						signal: controller.signal,
+					});
+					Promise.resolve(stream.result()).then(
+						(message) => observe({ status: "fulfilled", message }),
+						(cause) => {
+							observe({ status: "rejected", error: this.#assistantFailure(effectKey, cause) });
+						},
+					);
+				} catch (cause) {
+					controller.abort();
+					throw this.#assistantFailure(effectKey, cause);
+				}
+				return action.info;
+			}
+			if (action.info.kind === "await_assistant_effect") {
+				const effect = this.#assistantEffects.get(action.info.effectKey);
+				if (effect?.status !== "running")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer running");
+				const outcome = await Promise.race([effect.observed, this.#shutdownNotice.then(() => undefined)]);
+				if (this.#fault) throw this.#fault;
+				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+				if (outcome === undefined) {
+					throw new RuntimeShellError("closed", "Runtime shell is closed");
+				}
+				if (outcome.status === "rejected") throw outcome.error;
+				let message: AssistantMessage;
+				try {
+					message = encodeMessage(outcome.message) as unknown as AssistantMessage;
+					if (
+						message.role !== "assistant" ||
+						message.provider !== effect.plan.provider ||
+						message.model !== effect.plan.modelId ||
+						message.stopReason === "pending"
+					)
+						throw new Error("Assistant stream returned a mismatched or non-terminal message");
+				} catch (cause) {
+					throw this.#faultShell(action.info.effectKey, cause);
+				}
+				this.#assistantEffects.set(action.info.effectKey, {
+					status: "settled",
+					plan: effect.plan,
+					message: Object.freeze(message),
+				});
+				return action.info;
+			}
 			if (action.info.kind !== "start_assistant_step" && action.info.kind !== "prepare_assistant_effect")
 				throw new RuntimeShellError("unavailable", `Action ${action.info.kind} is not executable in Phase 1`);
 			const info = action.info;
@@ -156,17 +272,22 @@ export class RuntimeShell {
 					if (!result.committed) throw new RuntimeShellError("stale", "Action no longer matches durable state");
 					const key = assistantEffectKey(info.operationId, info.stepId, info.nextAttempt);
 					this.#assistantEffects.set(key, {
-						key,
-						lease,
-						context,
-						options,
-						operationId: info.operationId,
-						stepId: info.stepId,
-						attempt: info.nextAttempt,
-						responseEntryId: result.responseEntryId,
-						usageId: result.usageId,
-						intendedOutputLimit,
-						contextWindow,
+						status: "planned",
+						plan: {
+							key,
+							lease,
+							context,
+							options,
+							provider,
+							modelId,
+							operationId: info.operationId,
+							stepId: info.stepId,
+							attempt: info.nextAttempt,
+							responseEntryId: result.responseEntryId,
+							usageId: result.usageId,
+							intendedOutputLimit,
+							contextWindow,
+						},
 					});
 					return info;
 				}
@@ -187,6 +308,7 @@ export class RuntimeShell {
 	}
 
 	prompt(input: Message | readonly Message[]): Promise<RuntimeAttachment> {
+		if (this.#fault) return Promise.reject(this.#fault);
 		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
 		let messages: Message[];
 		try {
@@ -232,7 +354,10 @@ export class RuntimeShell {
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#sealed = true;
+		this.#notifyShutdown();
+		this.#abortRunningEffects();
 		this.#closePromise = this.#admissionLine.then(() => {
+			this.#abortRunningEffects();
 			this.#assistantEffects.clear();
 			return this.#session.close();
 		});

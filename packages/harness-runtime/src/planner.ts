@@ -3,7 +3,9 @@ import type { RuntimeAttachment } from "./session.ts";
 export type ActionInfo =
 	| { kind: "start_assistant_step"; operationId: string; triggerEntryId: string }
 	| { kind: "prepare_assistant_effect"; operationId: string; stepId: string; nextAttempt: number }
+	| { kind: "dispatch_assistant_effect"; operationId: string; effectKey: string }
 	| { kind: "await_assistant_effect"; operationId: string; effectKey: string }
+	| { kind: "settle_assistant_effect"; operationId: string; effectKey: string }
 	| { kind: "recover_assistant_effect"; operationId: string; stepId: string; attempt: number }
 	| { kind: "repair_materialized_assistant"; operationId: string; responseEntryId: string; usageId: string }
 	| { kind: "finish_run"; operationId: string; triggerEntryId: string };
@@ -24,7 +26,10 @@ export function assistantEffectKey(operationId: string, stepId: string, attempt:
 
 export function planAction(
 	attachment: RuntimeAttachment,
-	inputs: { readonly settingsRevision: number; readonly assistantEffects: Readonly<{ has(key: string): boolean }> },
+	inputs: {
+		readonly settingsRevision: number;
+		readonly assistantEffectStatus: (key: string) => "planned" | "running" | "settled" | undefined;
+	},
 ): PlannedAction | undefined {
 	const operation = attachment.runOperation;
 	const state = attachment.runState;
@@ -63,15 +68,21 @@ export function planAction(
 				responseEntryId: generation.responseEntryId,
 				usageId: generation.usageId,
 			};
-		} else if (inputs.assistantEffects.has(key)) {
-			info = { kind: "await_assistant_effect", operationId: operation.value.operationId, effectKey: key };
 		} else {
-			info = {
-				kind: "recover_assistant_effect",
-				operationId: operation.value.operationId,
-				stepId: generation.context.stepId,
-				attempt: generation.attempt,
-			};
+			const localStatus = inputs.assistantEffectStatus(key);
+			if (localStatus === "planned")
+				info = { kind: "dispatch_assistant_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (localStatus === "running")
+				info = { kind: "await_assistant_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (localStatus === "settled")
+				info = { kind: "settle_assistant_effect", operationId: operation.value.operationId, effectKey: key };
+			else
+				info = {
+					kind: "recover_assistant_effect",
+					operationId: operation.value.operationId,
+					stepId: generation.context.stepId,
+					attempt: generation.attempt,
+				};
 		}
 	}
 	return Object.freeze({ info: Object.freeze(info), expected });

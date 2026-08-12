@@ -98,7 +98,7 @@ function attachment(position: "idle" | "need" | "ready" | "pending" | "finish", 
 describe("pure Phase 1 action planner", () => {
 	it("covers every durable position and hides correctness tokens from ActionInfo", () => {
 		expect(
-			planAction(attachment("idle").value, { settingsRevision: 0, assistantEffects: new Map() }),
+			planAction(attachment("idle").value, { settingsRevision: 0, assistantEffectStatus: () => undefined }),
 		).toBeUndefined();
 		for (const [position, kind] of [
 			["need", "start_assistant_step"],
@@ -106,7 +106,7 @@ describe("pure Phase 1 action planner", () => {
 			["finish", "finish_run"],
 		] as const) {
 			const fixture = attachment(position);
-			const plan = planAction(fixture.value, { settingsRevision: 7, assistantEffects: new Map() })!;
+			const plan = planAction(fixture.value, { settingsRevision: 7, assistantEffectStatus: () => undefined })!;
 			expect(plan.info.kind).toBe(kind);
 			expect(Reflect.ownKeys(plan.info)).not.toContain("expectedOperationStateSeq");
 			expect(plan.expected).toEqual({
@@ -118,30 +118,49 @@ describe("pure Phase 1 action planner", () => {
 		}
 	});
 
-	it("prioritizes matching materialized reservations over a live key", () => {
-		const fixture = attachment("pending", true);
-		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
-		expect(
-			planAction(fixture.value, { settingsRevision: 0, assistantEffects: new Map([[key, true]]) })?.info,
-		).toEqual({
-			kind: "repair_materialized_assistant",
-			operationId: fixture.operationId,
-			responseEntryId: fixture.responseEntryId,
-			usageId: fixture.usageId,
-		});
-	});
+	it.each(["planned", "running", "settled", undefined] as const)(
+		"prioritizes matching materialized reservations over local status %s",
+		(status) => {
+			const fixture = attachment("pending", true);
+			const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
+			expect(
+				planAction(fixture.value, {
+					settingsRevision: 0,
+					assistantEffectStatus: (candidate) => (candidate === key ? status : undefined),
+				})?.info,
+			).toEqual({
+				kind: "repair_materialized_assistant",
+				operationId: fixture.operationId,
+				responseEntryId: fixture.responseEntryId,
+				usageId: fixture.usageId,
+			});
+		},
+	);
 
-	it("awaits only the exact deterministic live key and otherwise recovers", () => {
+	it.each([
+		["planned", "dispatch_assistant_effect"],
+		["running", "await_assistant_effect"],
+		["settled", "settle_assistant_effect"],
+		[undefined, "recover_assistant_effect"],
+	] as const)("maps exact local status %s to %s", (status, kind) => {
 		const fixture = attachment("pending");
 		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
 		expect(
-			planAction(fixture.value, { settingsRevision: 0, assistantEffects: new Map([[key, true]]) })?.info.kind,
-		).toBe("await_assistant_effect");
+			planAction(fixture.value, {
+				settingsRevision: 0,
+				assistantEffectStatus: (candidate) => (candidate === key ? status : undefined),
+			})?.info.kind,
+		).toBe(kind);
+	});
+
+	it("uses only the exact deterministic effect key", () => {
+		const fixture = attachment("pending");
+		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
 		for (const keys of [new Set<string>(), new Set([`${key}:bad`]), new Set(["malformed"])])
 			expect(
 				planAction(fixture.value, {
 					settingsRevision: 0,
-					assistantEffects: new Map([...keys].map((key) => [key, true])),
+					assistantEffectStatus: (candidate) => (keys.has(candidate) ? "running" : undefined),
 				})?.info.kind,
 			).toBe("recover_assistant_effect");
 	});
@@ -152,11 +171,11 @@ describe("pure Phase 1 action planner", () => {
 		const before = structuredClone({ attachment: fixture.value, keys: [...keys] });
 		const first = planAction(fixture.value, {
 			settingsRevision: 3,
-			assistantEffects: new Map([...keys].map((key) => [key, true])),
+			assistantEffectStatus: (candidate) => (keys.has(candidate) ? "running" : undefined),
 		});
 		const second = planAction(fixture.value, {
 			settingsRevision: 3,
-			assistantEffects: new Map([...keys].map((key) => [key, true])),
+			assistantEffectStatus: (candidate) => (keys.has(candidate) ? "running" : undefined),
 		});
 		expect(second).toEqual(first);
 		expect({ attachment: fixture.value, keys: [...keys] }).toEqual(before);

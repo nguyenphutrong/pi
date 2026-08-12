@@ -1,4 +1,4 @@
-import { createModels, type ModelRequestLease } from "@earendil-works/pi-ai";
+import { type AssistantMessage, type Context, createModels, type ModelRequestLease } from "@earendil-works/pi-ai";
 import {
 	type JsonValue,
 	MemoryStorage,
@@ -21,8 +21,11 @@ const config = (): LaneConfiguration => ({
 });
 const json = (value: unknown): JsonValue => value as JsonValue;
 
-async function rooted(position: "idle" | "need" | "ready" | "pending" | "finish" = "need") {
-	const storage = new MemoryStorage();
+async function rooted(
+	position: "idle" | "need" | "ready" | "pending" | "finish" = "need",
+	storage: Storage = new MemoryStorage(),
+	streamOptions: JsonValue = {},
+) {
 	const operationId = id();
 	const source = id();
 	const prompt = id();
@@ -50,7 +53,7 @@ async function rooted(position: "idle" | "need" | "ready" | "pending" | "finish"
 			stepId,
 			triggerEntryId: trigger,
 			configuration: config(),
-			streamOptions: {},
+			streamOptions,
 			retryPolicy: { maxAttempts: 1, baseDelayMs: 1 },
 			overflowRecoveryUsed: false,
 		};
@@ -167,10 +170,11 @@ function availableModels(
 	limits: { maxTokens: number; contextWindow: number } = { maxTokens: 4096, contextWindow: 8192 },
 ) {
 	const models = createModels();
+	const never = new Promise<AssistantMessage>(() => undefined);
 	const lease = {
 		model: { provider: "test", id: "current", ...limits },
 		stream: vi.fn(),
-		streamSimple: vi.fn(),
+		streamSimple: vi.fn(() => ({ result: () => never }) as ReturnType<ModelRequestLease["streamSimple"]>),
 		fetchDeferred: vi.fn(),
 		cancelDeferred: vi.fn(),
 	} as unknown as ModelRequestLease;
@@ -183,6 +187,59 @@ function expectLeaseUnused(lease: ModelRequestLease): void {
 	expect(lease.streamSimple).not.toHaveBeenCalled();
 	expect(lease.fetchDeferred).not.toHaveBeenCalled();
 	expect(lease.cancelDeferred).not.toHaveBeenCalled();
+}
+
+function terminal(stopReason: AssistantMessage["stopReason"] = "stop"): AssistantMessage {
+	return {
+		...assistant(stopReason),
+		provider: "test",
+		model: "current",
+		responseId: "upstream-response",
+	};
+}
+
+async function preparedShell(result: () => Promise<AssistantMessage> | AssistantMessage) {
+	const state = new MemoryStorageState();
+	const durableOptions = { headers: { retained: "yes" }, metadata: { nested: [1] } };
+	const fixture = await rooted("ready", state.createStorage(), durableOptions);
+	const instrumented = instrumentStorage(fixture.storage);
+	const runtimeSession = session(instrumented);
+	const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+	vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
+	const { models, lease, leaseSpy } = availableModels();
+	const streamSimple = vi.mocked(lease.streamSimple);
+	streamSimple.mockReturnValue({ result } as ReturnType<ModelRequestLease["streamSimple"]>);
+	const shell = await createRuntimeShell(runtimeSession, config(), {
+		models,
+	});
+	await shell.executeAction();
+	return {
+		state,
+		durableOptions,
+		fixture,
+		instrumented,
+		runtimeSession,
+		projection,
+		models,
+		lease,
+		leaseSpy,
+		streamSimple,
+		shell,
+	};
+}
+
+async function expectUncertainReopen(state: MemoryStorageState): Promise<void> {
+	const storage = state.createStorage();
+	const instrumented = instrumentStorage(storage);
+	const models = createModels();
+	const lease = vi.spyOn(models, "lease");
+	const shell = await createRuntimeShell(session(instrumented), config(), { models });
+	expect(await shell.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
+	await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+	expect(lease).not.toHaveBeenCalled();
+	expect(instrumented.committedTransactions).toHaveLength(0);
+	await shell.close();
+	expect(instrumented.committedTransactions).toHaveLength(0);
 }
 
 describe("Phase 1 runtime shell", () => {
@@ -228,12 +285,12 @@ describe("Phase 1 runtime shell", () => {
 		const serialized = JSON.stringify(durable);
 		for (const forbidden of ["lease", "messages", "streamSimple", "fetchDeferred", "cancelDeferred", "reasoning"])
 			expect(serialized).not.toContain(forbidden);
-		expect(await shell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
+		expect(await shell.peekAction()).toMatchObject({ kind: "dispatch_assistant_effect" });
 		const beforePark = instrumented.committedTransactions.length;
-		await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "dispatch_assistant_effect" });
 		expect(instrumented.committedTransactions).toHaveLength(beforePark);
 		expect(projection).toHaveBeenCalledTimes(1);
-		expectLeaseUnused(lease);
+		expect(lease.streamSimple).toHaveBeenCalledTimes(1);
 		await shell.close();
 	});
 
@@ -936,6 +993,48 @@ describe("Phase 1 runtime shell", () => {
 		]);
 	});
 
+	it("rejects a queued dispatch when close seals behind a blocked admitted preparation", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("ready", state.createStorage());
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
+		const { models, lease } = availableModels();
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const original = instrumented.getRegister.bind(instrumented);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const insideSession = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let gate = true;
+		instrumented.getRegister = async (namespace, key) => {
+			if (gate && namespace === "lane.config" && key === "main") {
+				gate = false;
+				entered();
+				await blocked;
+			}
+			return original(namespace, key);
+		};
+		const preparation = shell.executeAction();
+		await insideSession;
+		const dispatch = shell.executeAction();
+		const close = shell.close();
+		release();
+		await expect(preparation).resolves.toMatchObject({ kind: "prepare_assistant_effect" });
+		await expect(dispatch).rejects.toMatchObject({ code: "closed" });
+		await close;
+		expect(lease.streamSimple).not.toHaveBeenCalled();
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(instrumented.committedTransactions[0].writes).toEqual([
+			expect.objectContaining({ namespace: "op.state", key: fixture.operationId }),
+		]);
+		await expectUncertainReopen(state);
+	});
+
 	it("lets an admitted prompt finish while close drains it", async () => {
 		const fixture = await rooted("idle");
 		const instrumented = instrumentStorage(fixture.storage);
@@ -1070,7 +1169,7 @@ describe("Phase 1 runtime shell", () => {
 		const { models } = availableModels();
 		const firstShell = await createRuntimeShell(firstSession, config(), { models });
 		await firstShell.executeAction();
-		expect(await firstShell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
+		expect(await firstShell.peekAction()).toMatchObject({ kind: "dispatch_assistant_effect" });
 		await firstShell.close();
 
 		const reopenedStorage = state.createStorage();
@@ -1128,6 +1227,236 @@ describe("Phase 1 runtime shell", () => {
 		await expect(shell.peekAction()).resolves.toMatchObject({ kind: "start_assistant_step" });
 		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "start_assistant_step" });
 		await shell.close();
+	});
+
+	it("dispatches the retained lease once with retained context/options and a harness signal", async () => {
+		let resolve!: (message: AssistantMessage) => void;
+		const result = new Promise<AssistantMessage>((done) => {
+			resolve = done;
+		});
+		const prepared = await preparedShell(() => result);
+		const projection = prepared.projection;
+		const durableOptionsBefore = structuredClone(prepared.durableOptions);
+		const beforeDispatch = prepared.instrumented.committedTransactions.length;
+		const dispatch = prepared.shell.executeAction();
+		await expect(dispatch).resolves.toMatchObject({ kind: "dispatch_assistant_effect" });
+		expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
+		expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
+		const [context, options] = prepared.streamSimple.mock.calls[0] as [Context, Record<string, unknown>];
+		expect(projection).toHaveBeenCalledTimes(1);
+		expect(context).toEqual({ messages: [user("source"), user("prompt")] });
+		expect(context.messages).not.toBe(await projection.mock.results[0].value);
+		expect(options).toEqual({
+			headers: { retained: "yes" },
+			metadata: { nested: [1] },
+			reasoning: "medium",
+			signal: expect.any(AbortSignal),
+		});
+		expect(Reflect.ownKeys(options).sort()).toEqual(["headers", "metadata", "reasoning", "signal"].sort());
+		expect(prepared.durableOptions).toEqual(durableOptionsBefore);
+		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeDispatch);
+		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
+		resolve(terminal());
+		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "await_assistant_effect" });
+		expect(projection).toHaveBeenCalledTimes(1);
+		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
+		await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeDispatch);
+		expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
+		await prepared.shell.close();
+	});
+
+	it("installs running before synchronous provider entry and serializes concurrent dispatch", async () => {
+		const prepared = await preparedShell(() => new Promise<AssistantMessage>(() => undefined));
+		let reentrantPeek!: Promise<unknown>;
+		let reentrantExecute!: Promise<unknown>;
+		prepared.streamSimple.mockImplementationOnce(() => {
+			reentrantPeek = prepared.shell.peekAction();
+			reentrantExecute = prepared.shell.executeAction();
+			return { result: () => new Promise<AssistantMessage>(() => undefined) } as ReturnType<
+				typeof prepared.lease.streamSimple
+			>;
+		});
+		const first = prepared.shell.executeAction();
+		const second = prepared.shell.executeAction();
+		await expect(first).resolves.toMatchObject({ kind: "dispatch_assistant_effect" });
+		expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
+		await prepared.shell.close();
+		await expect(second).rejects.toMatchObject({ code: "closed" });
+		await expect(reentrantPeek).resolves.toMatchObject({ kind: "await_assistant_effect" });
+		await expect(reentrantExecute).rejects.toMatchObject({ code: "closed" });
+	});
+
+	it.each(["stop", "length", "toolUse", "deferred", "error", "aborted"] as const)(
+		"accepts and detaches terminal %s results",
+		async (stopReason) => {
+			const providerMessage = terminal(stopReason);
+			const prepared = await preparedShell(() => providerMessage);
+			await prepared.shell.executeAction();
+			const awaitResult = prepared.shell.executeAction();
+			providerMessage.content[0] = { type: "text", text: "provider mutation" };
+			await expect(awaitResult).resolves.toMatchObject({ kind: "await_assistant_effect" });
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
+			expect(providerMessage.responseId).toBe("upstream-response");
+			await prepared.shell.close();
+		},
+	);
+
+	it.each([
+		["pending", terminal("pending")],
+		["wrong provider", { ...terminal(), provider: "other" }],
+		["wrong model", { ...terminal(), model: "other" }],
+		["malformed", { ...terminal(), role: "user" }],
+	] as const)("faults and seals on %s results", async (_name, message) => {
+		const prepared = await preparedShell(() => message as AssistantMessage);
+		await prepared.shell.executeAction();
+		const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault" });
+		await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+		await expect(prepared.shell.executeAction()).rejects.toBe(fault);
+		await expect(prepared.shell.prompt(user("later"))).rejects.toBe(fault);
+		await prepared.shell.close();
+	});
+
+	it.each(["stream", "result"] as const)(
+		"aborts and preserves the original synchronous %s throw, then reopens uncertain",
+		async (kind) => {
+			const cause = new Error(`${kind} failed`);
+			const prepared = await preparedShell(() => {
+				throw cause;
+			});
+			if (kind === "stream")
+				prepared.streamSimple.mockImplementationOnce(() => {
+					throw cause;
+				});
+			const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+			expect(fault).toMatchObject({ code: "fault", cause });
+			const signal = prepared.streamSimple.mock.calls[0]?.[1]?.signal;
+			expect(signal?.aborted).toBe(true);
+			await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+			await expect(prepared.shell.executeAction()).rejects.toBe(fault);
+			const writes = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.close();
+			expect(prepared.instrumented.committedTransactions).toHaveLength(writes);
+			await expectUncertainReopen(prepared.state);
+		},
+	);
+
+	it.each(["stream", "result"] as const)(
+		"prefers reentrant close over a synchronous %s throw and reopens uncertain",
+		async (kind) => {
+			const cause = new Error(`${kind} failed after close`);
+			const prepared = await preparedShell(() => {
+				close = prepared.shell.close();
+				throw cause;
+			});
+			let close!: Promise<void>;
+			if (kind === "stream")
+				prepared.streamSimple.mockImplementationOnce(() => {
+					close = prepared.shell.close();
+					throw cause;
+				});
+			const writesAfterIntent = prepared.instrumented.committedTransactions.length;
+			expect(writesAfterIntent).toBe(1);
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
+			expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
+			expect(prepared.streamSimple.mock.calls[0]?.[1]?.signal?.aborted).toBe(true);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(writesAfterIntent);
+			await close;
+			await expect(prepared.shell.peekAction()).rejects.toMatchObject({ code: "closed" });
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			await expect(prepared.shell.prompt(user("later"))).rejects.toMatchObject({ code: "closed" });
+			expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(writesAfterIntent);
+			await expectUncertainReopen(prepared.state);
+		},
+	);
+
+	it("observes asynchronous rejection immediately and rejects a pending await with the same fault", async () => {
+		let reject!: (cause: unknown) => void;
+		const result = new Promise<AssistantMessage>((_resolve, fail) => {
+			reject = fail;
+		});
+		const cause = new Error("async result failed");
+		const prepared = await preparedShell(() => result);
+		await prepared.shell.executeAction();
+		const awaiting = prepared.shell.executeAction();
+		reject(cause);
+		await Promise.resolve();
+		const fault = await awaiting.catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault", cause });
+		expect(prepared.streamSimple.mock.calls[0][1]?.signal?.aborted).toBe(true);
+		await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+		const writes = prepared.instrumented.committedTransactions.length;
+		await prepared.shell.close();
+		expect(prepared.instrumented.committedTransactions).toHaveLength(writes);
+		await expectUncertainReopen(prepared.state);
+	});
+
+	it("faults immediately on an observed asynchronous rejection without a manual await", async () => {
+		let reject!: (cause: unknown) => void;
+		const result = new Promise<AssistantMessage>((_resolve, fail) => {
+			reject = fail;
+		});
+		const cause = new Error("unawaited async result failed");
+		const prepared = await preparedShell(() => result);
+		await prepared.shell.executeAction();
+		reject(cause);
+		await Promise.resolve();
+		await Promise.resolve();
+		await expect(prepared.shell.peekAction()).rejects.toMatchObject({ code: "fault", cause });
+		await prepared.shell.close();
+	});
+
+	it("keeps late provider rejection after close observed, closed, and durably uncertain", async () => {
+		let reject!: (cause: unknown) => void;
+		const result = new Promise<AssistantMessage>((_resolve, fail) => {
+			reject = fail;
+		});
+		const prepared = await preparedShell(() => result);
+		await prepared.shell.executeAction();
+		const signal = prepared.streamSimple.mock.calls[0][1]?.signal;
+		const beforeClose = prepared.instrumented.committedTransactions.length;
+
+		await prepared.shell.close();
+		expect(signal?.aborted).toBe(true);
+		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeClose);
+
+		const unhandled: unknown[] = [];
+		const observeUnhandled = (cause: unknown) => unhandled.push(cause);
+		process.on("unhandledRejection", observeUnhandled);
+		try {
+			reject(new Error("late provider rejection"));
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(unhandled).toEqual([]);
+			await expect(prepared.shell.peekAction()).rejects.toMatchObject({ code: "closed" });
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			await expect(prepared.shell.prompt(user("late"))).rejects.toMatchObject({ code: "closed" });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(beforeClose);
+		} finally {
+			process.off("unhandledRejection", observeUnhandled);
+		}
+
+		await expectUncertainReopen(prepared.state);
+	});
+
+	it("close after local provider settlement writes nothing and reopen treats the parked settlement as uncertain", async () => {
+		let resolve!: (message: AssistantMessage) => void;
+		const result = new Promise<AssistantMessage>((done) => {
+			resolve = done;
+		});
+		const prepared = await preparedShell(() => result);
+		await prepared.shell.executeAction();
+		const awaiting = prepared.shell.executeAction();
+		resolve(terminal());
+		await expect(awaiting).resolves.toMatchObject({ kind: "await_assistant_effect" });
+		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
+		const beforeClose = prepared.instrumented.committedTransactions.length;
+		await prepared.shell.close();
+		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeClose);
+		await expectUncertainReopen(prepared.state);
 	});
 
 	it("close is idempotent, write-free, and rejects later admission", async () => {
