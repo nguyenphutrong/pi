@@ -3,17 +3,16 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.9 — Dispatch the retained assistant provider lease without a registry reread
-- Status: D-015 approved; implement close-first arbitration for reentrant synchronous provider throws, then re-review
+- Work item: 1.10 — Settle the retained assistant response atomically
+- Status: 1.9 completed by `7eea8b445`; design response entry, usage row, leaf, and classification settlement
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Bind the retained `ModelRequestLease` to provider execution without persisting, exposing, or rereading it.
-2. Implement provider settlement with one atomic response/usage/classification commit.
-3. Implement terminal cleanup and the internal no-tool completion result.
-4. Add close/reopen Tier A coverage for every resulting action and transition boundary.
-5. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
+1. Implement provider settlement with one atomic response/usage/classification commit.
+2. Implement terminal cleanup and the internal no-tool completion result.
+3. Add close/reopen Tier A coverage for every resulting action and transition boundary.
+4. Add kill-at-every-boundary recovery coverage, then run independent Phase 1 review and recovery QA.
 
 ## Phase order
 

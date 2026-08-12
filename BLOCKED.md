@@ -11,7 +11,7 @@ No active blockers. B-005 was resolved by the human selection of option 1.
 - Phase: 1
 - Work item: 1.9 — dispatch the retained assistant provider lease
 - Trigger: §6 repeated review-agent rejection. Two review passes rejected the same underlying close-versus-provider-fault winner-ordering gap.
-- Status: resolved; implement close-first synchronous arbitration and obtain a fresh independent review
+- Status: resolved and implemented by `7eea8b445`; Harness runtime 181/181, session storage 31/31, `npm run check` PASS, independent conformance review PASS
 
 ### Context
 

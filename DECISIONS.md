@@ -308,7 +308,7 @@ Every newly minted id is checked pairwise and through exact entry, usage-row, an
 
 - Date: 2026-08-11
 - Phase: 1
-- Status: accepted after design and independent architecture review
+- Status: implemented by `7eea8b445` after independent conformance review
 - References: D-010–D-013; `packages/agent/docs/harness-v3.md` §§3.7, 4.1–4.8, 5.2, 9.3
 
 ### Options
@@ -339,7 +339,7 @@ Work item 1.9 stops at the process-local settled state. `settle_assistant_effect
 
 - Date: 2026-08-12
 - Phase: 1
-- Status: confirmed by human after B-005 escalation
+- Status: confirmed by human after B-005 escalation and implemented by `7eea8b445`
 - References: D-014; `packages/agent/docs/harness-v3.md` §§4.2, 4.7–4.8, 9.3
 
 ### Options
