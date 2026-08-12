@@ -3,16 +3,16 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.11 — Reconcile terminal no-tool completion
-- Status: D-017 approved after independent design review; implement the conditional terminal transaction and internal completion result
+- Work item: 1.12 — Close/reopen Tier A coverage for every Phase 1 action and transition boundary
+- Status: Item 1.11 implemented by `1576b20bb`; Harness runtime 218/218, Storage 31/31, root check PASS, and independent conformance review PASS
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Implement the D-017 terminal transaction and completion result.
-2. Add close/reopen Tier A coverage for every resulting action and transition boundary.
-3. Add kill-at-every-boundary recovery coverage.
-4. Run independent Phase 1 done-bar review and recovery QA.
+1. Build the authoritative Phase 1 boundary matrix and fill close/reopen Tier A coverage gaps.
+2. Add kill-at-every-boundary recovery coverage.
+3. Run independent Phase 1 done-bar review.
+4. Run the Phase 1 recovery/QA pass.
 
 ## Phase order
 

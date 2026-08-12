@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. D-017 was approved after independent design review; B-005 remains resolved by the human selection of option 1.
+No active blockers. Item 1.11 and D-017 were implemented by `1576b20bb` after an independent PASS; work continues with Phase 1 Tier A close/reopen boundary coverage.
 
 ## Resolved B-005 — Close versus synchronous provider fault winner ordering
 
