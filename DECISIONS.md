@@ -462,7 +462,7 @@ Commit `69eb76d7f` adds the two missing close/fresh-handle/reopen integration ca
 
 - Date: 2026-08-12
 - Phase: 1
-- Status: accepted design; B-006 option 1 selected for a fully exact writer audit
+- Status: implemented by `5afa0cc35` after B-006/B-007 resolution and independent conformance review
 - References: D-003, D-006, D-010–D-018; `packages/agent/docs/harness-v3.md` §§1.3–1.7, 2.8, 3.2–3.7, 3.13, 4.1–4.8, 8, 9.1–9.3
 
 ### Options
@@ -486,3 +486,7 @@ Item 1.13 adds only integration evidence that the actual `prompt → provider �
 Unknown-effect execution remains intentionally unavailable in the current Phase 1 runtime. Deterministically exposing `recover_assistant_effect` after runtime loss is the acceptance result; driving that action through retry or synthetic settlement is owned by later generation-recovery work.
 
 No production Storage API, serialization format, SQLite backend, child process, provider adapter, public completion surface, history reducer, or LaneRecord compatibility path is introduced.
+
+The final audit instruments the real repository-owned Memory handle from `MemorySessionRepo.create()` onward. A fixed clock and deterministic O/P/S/R/U generator make metadata, operation state, entry envelopes, reservation identity, and every transaction value independently exact. Its prefix includes repository initialization, configuration seed, acceptance, ready, intent, settlement, and terminal cleanup. Every fresh `repo.open()` handle is separately instrumented and proves that open, attach, action planning, and close commit nothing and never resolve a model.
+
+Commit `5afa0cc35` adds only test coverage. Focused repository/runtime-shell tests pass 114/114, Harness runtime passes 230/230, session-storage passes 31/31, `npm run check` passes, `git diff --check` passes, and the independent D-019 review reports PASS with all historical and B-007 findings resolved.

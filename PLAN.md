@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 1 — Minimal durable run
-- Work item: 1.13 — Kill-at-every-boundary recovery coverage
-- Status: blocked on B-007 after the post-selection independent review again rejected the exact writer-audit completeness evidence
+- Work item: Phase 1 done-bar review
+- Status: item 1.13 completed by `5afa0cc35`; run an independent whole-phase conformance review before Recovery/QA
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Resolve B-007's completeness bar, rework only the selected test evidence, and obtain an independent PASS.
-2. Run independent Phase 1 done-bar review.
-3. Run the Phase 1 recovery/QA pass.
+1. Run independent Phase 1 done-bar review.
+2. Run the Phase 1 recovery/QA pass.
+3. Checkpoint Phase 1 acceptance.
 4. Begin Phase 2 only after Phase 1 is accepted.
 
 ## Phase order

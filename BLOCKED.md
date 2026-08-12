@@ -2,15 +2,16 @@
 
 ## Current status
 
-Active blocker B-007 requires a human choice after the post-selection D-019 review again rejected the same writer-audit completeness bar. The test-only implementation remains uncommitted.
+No active human blocker. B-007 option 1 was implemented by `5afa0cc35` and the independent D-019 review passed.
 
 ## B-007 — Resolve the remaining literal D-019 audit evidence
 
 - Date: 2026-08-12
+- Resolved: 2026-08-12 — human selected option 1
 - Phase: 1
 - Work item: 1.13 — kill-at-every-boundary recovery coverage
 - Trigger: §6 repeated review-agent rejection after the human selected B-006 option 1
-- Status: awaiting human selection; no reviewer-failed test code may be committed
+- Status: resolved and implemented by `5afa0cc35`; focused 114/114, Harness runtime 230/230, Storage 31/31, `npm run check` PASS, independent conformance review PASS
 
 ### Verified state
 
@@ -22,17 +23,15 @@ The independent gate still reports three blocking evidence gaps:
 2. The writer audit instruments a synthetic idle fixture after initialization, so it does not include the repository's initial lane transaction in the claimed end-to-end prefix.
 3. The real `MemorySessionRepo.create → close → open` matrix proves the restored action and zero provider lease, but does not directly instrument each reopened handle to prove restore performs zero commits.
 
-### Decision needed
+### Decision
 
-1. **Recommended:** finish the literal audit with test-only instrumentation. Mock `Date.now`, wrap `MemoryStorageState.prototype.createStorage()` before `MemorySessionRepo.create()`, inventory the initial lane transaction plus every subsequent exact transaction, and assert every reopen/attach/peek handle records zero commits. No production or public API changes.
+1. **Selected:** finish the literal audit with test-only instrumentation. Mock `Date.now`, wrap `MemoryStorageState.prototype.createStorage()` before `MemorySessionRepo.create()`, inventory the initial lane transaction plus every subsequent exact transaction, and assert every reopen/attach/peek handle records zero commits. No production or public API changes.
 2. Narrow D-019 to treat storage-assigned timestamps, repository initialization, and restore write-freedom as composition of existing conformance/repository tests rather than requiring all three in this end-to-end matrix. Keep the current exact operation/state and R/U audit.
 3. Accept the current evidence despite the review failure. This overrides the guardrail and is not recommended.
 
-Reply with `1`, `2`, or `3`.
+### Outcome
 
-### Resume point
-
-Do not commit `packages/harness-runtime/test/repo.test.ts` or `packages/harness-runtime/test/runtime-shell.test.ts`. After the human selection, implement only that option, rerun focused tests, Harness runtime, Storage, `npm run check`, and `git diff --check`, then request a fresh independent review. A further rejection remains blocking.
+Commit `5afa0cc35` fixes all three evidence gaps without changing production code or public APIs. The independent review passed; orchestration advanced to the Phase 1 done-bar review.
 
 ## B-006 — Choose the Phase 1 end-to-end writer-audit completeness bar
 
