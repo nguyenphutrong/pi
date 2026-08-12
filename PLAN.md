@@ -4,17 +4,17 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
-- Status: B-010 option 1 selected; make Harness private and finish the corrected durable-tool design review
+- Status: private Harness commit `ccf86e630` passed independent review; finish the corrected sequential-tool design review
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Make `@nguyenphutrong/pi-harness-runtime` private and remove it from public/local-release artifacts.
-2. Finish the corrected 2.1 design and obtain an independent design PASS.
-3. Create the private agent-loop boundary for the new Harness architecture while leaving legacy `pi-agent-core` unchanged.
-4. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
-5. Implement and test the first durable tool-plan increment before tool effects.
+1. Finish the corrected 2.1 design and obtain an independent design PASS.
+2. Create the private agent-loop boundary for the new Harness architecture while leaving legacy `pi-agent-core` unchanged.
+3. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
+4. Implement and test the first durable tool-plan increment before tool effects.
+5. Add durable abort/reconciliation after sequential tool states are abort-ready.
 
 ## Phase order
 

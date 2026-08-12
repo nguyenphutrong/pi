@@ -562,7 +562,7 @@ The private package is the single behavior authority for the new Harness archite
 
 - Date: 2026-08-12
 - Phase: 2
-- Status: confirmed by human after B-010 escalation
+- Status: implemented by `ccf86e630` after independent review
 - References: D-021–D-022; B-010; package and local-release contracts
 
 ### Options
@@ -580,3 +580,5 @@ Option 1.
 Harness needs a real runtime dependency on the narrow loop package. A public Harness depending on an unpublished package would produce a publishable but uninstallable tarball; development, optional, or peer dependency forms do not satisfy that runtime import. Making Harness private preserves the selected private agent-loop boundary without adding vendoring, nested-package staging, or release exceptions.
 
 `session-storage` remains public because it has an independently installable contract and no private runtime dependency. Public release discovery already excludes packages marked private; local release must remove Harness from its explicit tarball list. Once agent-loop exists, the internal root build orders it before Harness. Coding-agent shrinkwrap and install-lock remain unchanged while neither private package enters that dependency closure.
+
+Commit `ccf86e630` marks Harness private and removes only its explicit local-release artifact. The public-package inventory excludes Harness and retains session storage; `npm run check` and `git diff --check` pass, no lockfile change is required, and the independent implementation review reports PASS.
