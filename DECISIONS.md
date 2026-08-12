@@ -582,3 +582,57 @@ Harness needs a real runtime dependency on the narrow loop package. A public Har
 `session-storage` remains public because it has an independently installable contract and no private runtime dependency. Public release discovery already excludes packages marked private; local release must remove Harness from its explicit tarball list. Once agent-loop exists, the internal root build orders it before Harness. Coding-agent shrinkwrap and install-lock remain unchanged while neither private package enters that dependency closure.
 
 Commit `ccf86e630` marks Harness private and removes only its explicit local-release artifact. The public-package inventory excludes Harness and retains session storage; `npm run check` and `git diff --check` pass, no lockfile change is required, and the independent implementation review reports PASS.
+
+## D-024 — Split stateless tool phases from durable sequential orchestration
+
+- Date: 2026-08-12
+- Phase: 2
+- Status: accepted after independent design review
+- References: D-021–D-023; `packages/agent/docs/harness-v3.md` §§0.4–0.5, 3.8, 3.13, 4.1–4.8, 5.6–5.7, 9; `packages/agent/docs/harness-v2.md` tool behavior and crash catalog
+
+### Options
+
+1. Put tool lookup, callbacks, effects, durable state, and recovery together in Harness.
+2. Move the complete tool-batch driver and durable callbacks into `agent-loop`.
+3. Put only the stateless `prepareToolCall → executeToolCall → finalizeToolCall` phases and narrow contracts in `agent-loop`, with all durable orchestration in Harness.
+
+For aggregate callback failure:
+
+1. Reject the phase promise and leave ordinary callback defects to Harness.
+2. Ignore callback failure and preserve the previous value.
+3. Normalize callback failure into a call-level synthetic error while keeping per-handler isolation inside the Harness hook registry.
+
+### Choice
+
+Boundary option 3 and callback option 3. Phase 2 executes tool calls sequentially; parallel execution remains deferred.
+
+### Rationale
+
+`@nguyenphutrong/pi-agent-loop` is a private, session-agnostic package. It owns tool lookup, `prepareArguments`, argument validation and replacement revalidation, one aggregate before callback, one tool invocation with transient updates, one aggregate after callback, replay declarations defaulting to `never`, and result/error normalization. It knows no Session, storage, durable id, register, operation state, transaction, recovery policy, running-effect map, hook registry, or batch state machine. Legacy public `pi-agent-core` remains unchanged and independent.
+
+Harness owns the complete batch plan, source-order interpreter, `EffectPlan`, process-local running map, hooks and events, recovery, abort, and commits. Durable call state is exactly:
+
+```ts
+type ToolCall =
+  | { status: "planned"; sourceIndex: number; resultEntryId: string }
+  | { status: "effect_pending"; sourceIndex: number; resultEntryId: string;
+      replay: "never" | "safe" }
+  | { status: "completed"; sourceIndex: number; resultEntryId: string;
+      terminate: boolean };
+```
+
+The source call is derived from `ToolBatch.assistantEntryId + sourceIndex`. Effective arguments use exactly `op.tool_args/{operationId}:{turnId}:{sourceIndex}`, where `turnId` is the producing generation `stepId`; call id, name, raw arguments, and an argument key are not duplicated in state.
+
+The complete batch and every reserved result id commit atomically before lookup, preparation, hooks, or effects. Successful clearance atomically writes effective arguments and `effect_pending(replay)` before dispatch. Settlement atomically writes the reserved result, lane leaf, optional finalized tool-usage row, and total state with `completed(terminate)`. Synthetic results report no usage. Unlike the older record design, this register design has no usage-without-result crash state. All effective-argument registers remain until the final source-position settlement, which also deletes the whole batch prefix and enters `may_finish(includeFinalAssistant:false)` only when every result terminates; otherwise it enters `need_assistant(false)`. Terminal cleanup defensively deletes any operation-owned argument prefix.
+
+Recovery uses only `lane.state → op.meta/op.state` plus bounded direct hydration. A planned call reruns clearance under its existing result id. A live `effect_pending` call awaits its exact process-local promise. After process loss, it never reruns clearance or infers a live effect: persisted arguments replay only when both persisted and current declarations are `safe` and current policy allows; otherwise the reserved id receives a synthetic `interrupted` result. Cancellation settles unstarted planned calls as `aborted`, never replays restored pending calls, and permits already-live effects to settle. The interpreter remains `dispatch → await_effect → finalizeTool → settlement`.
+
+The Harness hook registry and the loop's aggregate callbacks have different failure contracts. Registry handlers run in registration order. Ordinary hook failures emit `handler_error`, skip that handler, and continue according to that hook's aggregation. `before_tool` instead fails closed: a throw, rejection, invalid output, or valid first block is terminal and later `before_tool` handlers do not run. A valid `block` field is `{ reason: string; terminate?: boolean }`; `reason` is mandatory.
+
+An aggregate before callback throw, rejection, invalid output, or invalid replacement arguments becomes one immediate synthetic error with `isError:true`, `terminate:false`, no updates, no persisted arguments, and no tool effect. Only an intentional valid block may preserve its nested `terminate`. An aggregate after callback throw, rejection, or invalid patch replaces the raw result completely with a synthetic error carrying `isError:true`, `terminate:false`, and no usage; the real effect and already emitted transient updates remain observable. Valid after patches replace `content`, `details`, `isError`, `usage`, and `terminate` field by field without deep merge. Invalid external tool results are normalized before any durable write.
+
+Tool updates are transient, accepted only while the tool promise is active, drained before execution resolves, and ignored when late. Public listener failures are isolated by Harness before reaching the aggregate sink; aggregate sink rejection is an internal fault, not a replay-safe tool error. Genuine accepted `length` responses still receive a complete plan, then source-ordered explanatory errors with no lookup, hook, or effect. Missing tools, argument failures, blocks, and before failures settle from planned state without an intent. Tool throws become raw error results and still pass through after finalization unless abort won first. Sequential execution settles every source position; one terminating result never short-circuits the batch.
+
+The conformance bar covers every normal, error, invalid-output, abort, update, and replay-default path in the stateless phases. Harness Tier A must cover every source position and durable call status, replay declaration combination, exact-argument hydration/corruption, synthetic outcome, abort position, prefix cleanup, and resumed-versus-uninterrupted result. Tier B proves exact `plan → clearance → args+intent → effect → updates → finalize → atomic settlement → prefix cleanup/checkpoint` order. Tier C drives both abort/close orders around every boundary and compares manual with automatic durable state.
+
+The independent final design gate reports PASS. Parallel tools, queues, full hook/event facilities, compaction, SQLite, serving, and legacy-loop refactoring remain deferred.
