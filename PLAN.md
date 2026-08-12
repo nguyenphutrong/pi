@@ -4,7 +4,7 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.10 — Settle the retained assistant response atomically
-- Status: 1.9 completed by `7eea8b445`; design response entry, usage row, leaf, and classification settlement
+- Status: D-016 approved; implement the atomic no-tool success settlement and deterministic race coverage
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue

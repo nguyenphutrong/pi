@@ -354,3 +354,30 @@ Option 1.
 ### Rationale
 
 Close and fault are terminal process-local conditions, so the first one observed must remain authoritative. If provider code reenters `close()` from `streamSimple()` or `result()` and then throws, close has already sealed admission and pulled the owned signal. The throw is consumed, dispatch rejects as closed, no storage write occurs, and reopen applies uncertain recovery to the durable `effect_pending` prefix. A synchronous or asynchronous provider contract failure observed before close still faults the shell with its original cause. This makes synchronous and asynchronous outcome arbitration identical and prevents provider callback timing from changing a closed handle's classification.
+
+## D-016 — Settle only the Phase 1 no-tool success classification
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: accepted after design and independent architecture review
+- References: D-010, D-013–D-015; `packages/agent/docs/harness-v3.md` §§3.2–3.7, 4.1–4.8, 8, 9.3
+
+### Options
+
+1. Inline settlement checks and commit only the currently supported success path.
+2. Add one narrow package-private pure classifier, but expose only the currently supported success path to the durable transition.
+3. Widen the durable union now with tools, retry, deferred, failure-drain, cancellation, and overflow states so every provider result can settle.
+
+### Choice
+
+Option 2.
+
+### Rationale
+
+D-010 deliberately makes only checkpoint `need_assistant`/`may_finish` and assistant `ready`/`effect_pending` reachable in Phase 1. Settlement therefore commits only a call-free `stop`, or a call-free `length` whose `usage.output` is at least the persisted `intendedOutputLimit`. A lower-output `length` is suspected overflow. Responses containing tool calls, `toolUse`, `error`, `deferred`, and suspected overflow remain valid process-local outputs but are unavailable to this increment: settlement stays parked and writes nothing. An `aborted` response while durable control is still running is different: the owned signal was not pulled by durable cancellation, so the spec classifies it as corruption and the shell faults without writing.
+
+Classification is pure and occurs after Session reloads the latest durable state. The Session mutation line verifies semantic effect authority — current operation, assistant `effect_pending`, step, attempt, response/usage reservations, captured provider/model, and trigger leaf — instead of rejecting on old operation, lane, configuration, settings, or leaf sequence numbers. This preserves the §4.1 settlement rule: future unrelated state changes may advance register sequences while the same exact effect remains pending, and settlement merges into the latest total state. With one mutation line, a semantically current absent settlement always commits; old sequence changes do not create a separate pending outcome.
+
+The successful transaction has exactly four ordered writes: insert reserved response entry R under the current trigger, set `lane.leaf/main = R`, insert reserved usage row U linked to R, and replace `op.state/O` with the latest run state updated to `latestAssistantEntryId = R` plus checkpoint `may_finish` triggered by R. Provider `responseId` remains payload data and is never confused with durable entry id R. Message usage remains in the payload and is also copied completely into ledger row U. All four writes land or none do.
+
+Session returns a structured observation: committed, matching materialized reservations, obsolete effect, or unsupported classification. RuntimeShell updates its attachment before changing local proof. It deletes the exact settled value only after commit, validated materialization, or confirmed obsolescence; unsupported classification retains it. Matching materialization never inserts again and lets planner repair keep precedence. Partial or mismatched reservation materialization is corruption. Storage/corruption failures fault the shell through D-015 first-terminal-condition arbitration. Close-first writes nothing; settlement admitted first may commit and close waits.
