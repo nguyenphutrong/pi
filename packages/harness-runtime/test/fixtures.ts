@@ -1,5 +1,5 @@
 import type { AssistantMessage, Message, ToolResultMessage, Usage, UserMessage } from "@earendil-works/pi-ai";
-import { createIdGenerator } from "@earendil-works/pi-session-storage";
+import { createIdGenerator } from "@nguyenphutrong/pi-session-storage";
 
 export const ZERO_USAGE: Usage = {
 	input: 0,

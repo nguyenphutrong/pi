@@ -4,7 +4,7 @@ import {
 	isUuidV7,
 	type JsonValue,
 	type Register,
-} from "@earendil-works/pi-session-storage";
+} from "@nguyenphutrong/pi-session-storage";
 import { SessionError } from "./types.ts";
 
 export type ThinkingLevel = "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max";

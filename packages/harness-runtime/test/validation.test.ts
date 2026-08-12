@@ -1,4 +1,4 @@
-import { MemoryStorage, type Register, type Storage, type Write } from "@earendil-works/pi-session-storage";
+import { MemoryStorage, type Register, type Storage, type Write } from "@nguyenphutrong/pi-session-storage";
 import { describe, expect, it } from "vitest";
 import { validateMainLane } from "../src/session.ts";
 import { id } from "./fixtures.ts";

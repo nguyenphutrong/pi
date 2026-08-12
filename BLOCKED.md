@@ -2,7 +2,7 @@
 
 ## Current status
 
-Active blocker B-008 requires a human choice on the public visibility of the target `packages/agent-loop` boundary before Phase 2 implementation begins.
+No active blocker. B-008 is resolved; Phase 2 may continue after identity-migration verification and design correction.
 
 ## B-008 — Choose the `agent-loop` package visibility
 
@@ -10,7 +10,8 @@ Active blocker B-008 requires a human choice on the public visibility of the tar
 - Phase: 2
 - Work item: 2.1 — durable sequential tool design
 - Trigger: §6 hard-to-reverse package/public contract decision found by the Design agent
-- Status: awaiting human selection; no Phase 2 code has been written
+- Resolved: 2026-08-12 — human selected private workspace-only visibility and the fork-owned npm scope
+- Status: resolved; recorded in D-021
 
 ### Context
 
@@ -20,11 +21,11 @@ The unresolved choice is whether creating the package also commits the project t
 
 ### Decision needed
 
-1. **Recommended:** create `@earendil-works/pi-agent-loop` as a private workspace package. Export only the contracts and three phases required internally; keep current `pi-agent-core` exports/behavior intact. Publishing can be decided later without migrating the kernel.
-2. Create `@earendil-works/pi-agent-loop` as a public lockstep-versioned package now. Its exports become a supported external contract and must join release artifacts immediately.
+1. **Selected:** create `@nguyenphutrong/pi-agent-loop` as a private workspace package. Export only the contracts and three phases required internally; keep current `pi-agent-core` exports/behavior intact. Publishing can be decided later without migrating the kernel.
+2. Create `@nguyenphutrong/pi-agent-loop` as a public lockstep-versioned package now. Its exports become a supported external contract and must join release artifacts immediately.
 3. Do not create the package yet; export the phases from `pi-agent-core` and accept a temporary `harness-runtime → agent` dependency. This conflicts with the target boundary and is not recommended.
 
-Reply with `1`, `2`, or `3`.
+The same decision renames the existing fork-owned packages to `@nguyenphutrong/pi-harness-runtime` and `@nguyenphutrong/pi-session-storage`. Public upstream packages retain `@earendil-works`, including `pi-ai` and `pi-agent-core`.
 
 ### Resume point
 

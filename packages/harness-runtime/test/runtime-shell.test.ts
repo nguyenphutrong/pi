@@ -6,8 +6,8 @@ import {
 	MemoryStorageState,
 	type Storage,
 	type Write,
-} from "@earendil-works/pi-session-storage";
-import { type InstrumentedStorage, instrumentStorage } from "@earendil-works/pi-session-storage/testing";
+} from "@nguyenphutrong/pi-session-storage";
+import { type InstrumentedStorage, instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration, RunOperation, RunState } from "../src/durable.ts";
 import { MemorySessionRepo } from "../src/repo.ts";

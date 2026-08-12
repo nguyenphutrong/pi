@@ -503,3 +503,32 @@ Commit `5afa0cc35` adds only test coverage. Focused repository/runtime-shell tes
 Phase 1 is complete. The independent whole-phase reviewer traced the actual no-tool state machine, storage transactions, provider effect sandwich, terminal cleanup, package boundaries, forbidden-legacy absence, and D-018/D-019 recovery evidence and returned PASS. A separate Recovery/QA pass then reran Harness runtime 230/230, session-storage 31/31, pi-ai provider-lease 44/44, coding-agent lease integration 6/6, `npm run check`, and `git diff --check`; all passed from a clean worktree.
 
 Unknown-effect execution, retry, public completion promises, automatic drive, tools, abort, queues, hooks/events, SQLite, and OS-process durability remain explicit later-phase work rather than Phase 1 gaps. Phase 2 may now begin, but only after re-reading its authoritative tool, recovery, abort, terminal, API, and testing sections.
+
+## D-021 — Keep agent-loop private and use the fork scope for fork-owned packages
+
+- Date: 2026-08-12
+- Phase: 2
+- Status: confirmed by human after B-008 escalation; identity migration in implementation/review
+- References: B-008; target `packages/agent-loop` boundary
+
+### Options
+
+Visibility:
+
+1. Create `@nguyenphutrong/pi-agent-loop` as a private workspace-only package.
+2. Publish `pi-agent-loop` as a supported public package.
+
+Scope:
+
+1. Rename only the future `agent-loop` package to the fork scope.
+2. Rename every fork-owned package, including the existing Harness runtime and session storage packages, while retaining upstream-owned public package identities.
+
+### Choice
+
+Visibility option 1 and scope option 2.
+
+### Rationale
+
+The private package establishes the required internal boundary without prematurely creating a public API. A single fork-owned scope makes ownership explicit and avoids introducing a mixed identity convention for new fork-only modules. Therefore the existing packages become `@nguyenphutrong/pi-harness-runtime` and `@nguyenphutrong/pi-session-storage`, and the future package will be `@nguyenphutrong/pi-agent-loop`.
+
+Public upstream packages retain their existing `@earendil-works` scope, including `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`. The coding-agent installer identity also remains under its existing upstream scope. This decision changes npm identity only and does not change package directories or production behavior.

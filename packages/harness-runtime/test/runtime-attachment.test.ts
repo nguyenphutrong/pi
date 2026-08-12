@@ -5,8 +5,8 @@ import {
 	type Storage,
 	type UsageRow,
 	type Write,
-} from "@earendil-works/pi-session-storage";
-import { instrumentStorage } from "@earendil-works/pi-session-storage/testing";
+} from "@nguyenphutrong/pi-session-storage";
+import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { attachRuntime } from "../src/runtime-port.ts";

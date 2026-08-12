@@ -1,4 +1,4 @@
-import type { Register } from "@earendil-works/pi-session-storage";
+import type { Register } from "@nguyenphutrong/pi-session-storage";
 import { describe, expect, it } from "vitest";
 import {
 	decodeLaneConfiguration,

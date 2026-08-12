@@ -1,5 +1,5 @@
 {
-	"name": "@earendil-works/pi-session-storage",
+	"name": "@nguyenphutrong/pi-session-storage",
 	"version": "0.84.1",
 	"description": "Domain-neutral durable session storage contracts and memory backend",
 	"type": "module",

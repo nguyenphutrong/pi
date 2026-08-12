@@ -1,4 +1,4 @@
-import { createIdGenerator, isUuidV7, MemoryStorageState } from "@earendil-works/pi-session-storage";
+import { createIdGenerator, isUuidV7, MemoryStorageState } from "@nguyenphutrong/pi-session-storage";
 import { MemorySession, validateMainLane } from "./session.ts";
 import { CURRENT_STORAGE_VERSION, type Session, SessionError, type SessionMetadata } from "./types.ts";
 

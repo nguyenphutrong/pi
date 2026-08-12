@@ -24,9 +24,9 @@ export default defineConfig({
 			{ find: /^@earendil-works\/pi-ai$/, replacement: workspaceSourcePaths.aiIndex },
 			{ find: /^@earendil-works\/pi-ai\/compat$/, replacement: workspaceSourcePaths.aiCompat },
 			{ find: /^@earendil-works\/pi-ai\/oauth$/, replacement: workspaceSourcePaths.aiOAuth },
-			{ find: /^@earendil-works\/pi-session-storage$/, replacement: workspaceSourcePaths.sessionStorageIndex },
-			{ find: /^@earendil-works\/pi-session-storage\/testing$/, replacement: workspaceSourcePaths.sessionStorageTesting },
-			{ find: /^@earendil-works\/pi-harness-runtime$/, replacement: workspaceSourcePaths.harnessRuntimeIndex },
+			{ find: /^@nguyenphutrong\/pi-session-storage$/, replacement: workspaceSourcePaths.sessionStorageIndex },
+			{ find: /^@nguyenphutrong\/pi-session-storage\/testing$/, replacement: workspaceSourcePaths.sessionStorageTesting },
+			{ find: /^@nguyenphutrong\/pi-harness-runtime$/, replacement: workspaceSourcePaths.harnessRuntimeIndex },
 			{
 				find: /^@earendil-works\/pi-ai\/providers\/(.+)$/,
 				replacement: `${workspaceSourcePaths.aiProviders}/$1.ts`,

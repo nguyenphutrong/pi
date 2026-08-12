@@ -12,7 +12,7 @@ import {
 	StorageError,
 	type UsageRow,
 	type Write,
-} from "@earendil-works/pi-session-storage";
+} from "@nguyenphutrong/pi-session-storage";
 import { classifyAssistantSettlement } from "./assistant-settlement.ts";
 import { decodeMessageEntry, encodeMessage } from "./codec.ts";
 import {

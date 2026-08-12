@@ -4,16 +4,17 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
-- Status: blocked on B-008; choose whether the target `packages/agent-loop` boundary is private workspace-only or a published package before fixing its contract
+- Status: implementing/reviewing the fork-owned npm identity migration decided in D-021
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 
 ## Queue
 
-1. Resolve B-008 package visibility.
-2. Correct the 2.1 memo to the spec's non-duplicated `ToolCall` state and obtain an independent design PASS.
-3. Extract the three behavior-preserving agent-loop tool phases at the selected package boundary.
-4. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
-5. Implement and test the first durable tool-plan increment before tool effects.
+1. Verify the atomic npm identity migration.
+2. Resolve how public `@earendil-works/pi-agent-core` consumes private `@nguyenphutrong/pi-agent-loop` before extraction.
+3. Correct the 2.1 design tool state so `ToolCall` does not duplicate durable assistant-entry identity, then obtain an independent design PASS.
+4. Extract the three behavior-preserving agent-loop tool phases at the selected package boundary.
+5. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
+6. Implement and test the first durable tool-plan increment before tool effects.
 
 ## Phase order
 

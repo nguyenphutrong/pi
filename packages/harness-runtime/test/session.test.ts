@@ -1,6 +1,6 @@
 import type { Message } from "@earendil-works/pi-ai";
-import { MemoryStorage } from "@earendil-works/pi-session-storage";
-import { instrumentStorage } from "@earendil-works/pi-session-storage/testing";
+import { MemoryStorage } from "@nguyenphutrong/pi-session-storage";
+import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import { type BranchBounds, CURRENT_STORAGE_VERSION, type EntryQuery, MemorySessionRepo } from "../src/index.ts";
 import { MemorySession } from "../src/session.ts";

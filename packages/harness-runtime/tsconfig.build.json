@@ -5,7 +5,7 @@
 		"rootDir": "./src",
 		"paths": {
 			"@earendil-works/pi-ai": ["../ai/dist/index.d.ts"],
-			"@earendil-works/pi-session-storage": ["../session-storage/dist/index.d.ts"]
+			"@nguyenphutrong/pi-session-storage": ["../session-storage/dist/index.d.ts"]
 		}
 	},
 	"include": ["src/**/*.ts"],

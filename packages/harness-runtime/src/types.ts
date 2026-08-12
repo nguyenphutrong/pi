@@ -1,5 +1,5 @@
 import type { Message } from "@earendil-works/pi-ai";
-import type { EntryCursor, IdGenerator, SessionStats } from "@earendil-works/pi-session-storage";
+import type { EntryCursor, IdGenerator, SessionStats } from "@nguyenphutrong/pi-session-storage";
 
 export const CURRENT_STORAGE_VERSION = 1;
 

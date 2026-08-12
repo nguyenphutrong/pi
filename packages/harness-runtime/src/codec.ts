@@ -1,5 +1,5 @@
 import type { Message, Usage } from "@earendil-works/pi-ai";
-import { assertEntry, assertJsonValue, type Entry, type JsonValue } from "@earendil-works/pi-session-storage";
+import { assertEntry, assertJsonValue, type Entry, type JsonValue } from "@nguyenphutrong/pi-session-storage";
 import { type MessageEntry, SessionError } from "./types.ts";
 
 type Code = "invalid_message" | "corruption";
