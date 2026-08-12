@@ -4,7 +4,7 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.3 — Generation unknown-effect recovery
-- Status: private stateless agent-loop commit `bd7cefe5b` passed independent review; implement retry-or-synthetic recovery for restored provider intents
+- Status: D-025 durable retry-wait/synthetic-failure design passed independent review in `96fab5ce4`; production implementation is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
