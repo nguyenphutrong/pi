@@ -2,7 +2,33 @@
 
 ## Current status
 
-No active human blocker. Phase 1 passed its independent done-bar review and Recovery/QA gate; Phase 2 design may begin.
+Active blocker B-008 requires a human choice on the public visibility of the target `packages/agent-loop` boundary before Phase 2 implementation begins.
+
+## B-008 — Choose the `agent-loop` package visibility
+
+- Date: 2026-08-12
+- Phase: 2
+- Work item: 2.1 — durable sequential tool design
+- Trigger: §6 hard-to-reverse package/public contract decision found by the Design agent
+- Status: awaiting human selection; no Phase 2 code has been written
+
+### Context
+
+The reusable `prepareToolCall → executeToolCall → finalizeToolCall` behavior is currently private inside broad `packages/agent`, which also contains the forbidden legacy harness/reducer. Making `harness-runtime` depend on that package would violate the target boundary and create a later migration. The target layout already names `packages/agent-loop`, so the recommended design creates that narrow package now and lets both `agent` and `harness-runtime` consume it.
+
+The unresolved choice is whether creating the package also commits the project to a new published public API. Publishing is hard to reverse. A private workspace package still establishes the correct internal dependency boundary and can be made public later.
+
+### Decision needed
+
+1. **Recommended:** create `@earendil-works/pi-agent-loop` as a private workspace package. Export only the contracts and three phases required internally; keep current `pi-agent-core` exports/behavior intact. Publishing can be decided later without migrating the kernel.
+2. Create `@earendil-works/pi-agent-loop` as a public lockstep-versioned package now. Its exports become a supported external contract and must join release artifacts immediately.
+3. Do not create the package yet; export the phases from `pi-agent-core` and accept a temporary `harness-runtime → agent` dependency. This conflicts with the target boundary and is not recommended.
+
+Reply with `1`, `2`, or `3`.
+
+### Resume point
+
+After selection, correct the preliminary design before recording it: `ToolCall` state must follow `harness-v3.md` and store only source index/result id plus status-specific replay or terminate; tool call id/name come from the durable assistant entry, and the `op.tool_args` key is deterministic rather than duplicated in state. Then run an independent design review before implementation.
 
 ## B-007 — Resolve the remaining literal D-019 audit evidence
 
