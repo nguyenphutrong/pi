@@ -2,7 +2,33 @@
 
 ## Current status
 
-No active blocker. B-009 option 1 was selected and is recorded in D-022; Phase 2 design review may continue.
+Active blocker B-010 requires a human choice on the visibility of `@nguyenphutrong/pi-harness-runtime` before it can depend on private `agent-loop`. No agent-loop code has been written.
+
+## B-010 — Choose how Harness distributes its private agent-loop dependency
+
+- Date: 2026-08-12
+- Phase: 2
+- Work item: 2.1 — private agent-loop boundary
+- Trigger: §6 hard-to-reverse package and release-contract decision found during corrected design review
+- Status: awaiting human selection; D-023 remains unrecorded
+
+### Context
+
+`@nguyenphutrong/pi-harness-runtime` is currently public: its manifest has no `private` marker, release discovery includes it, and local release packs and isolated-installs its tarball. The planned private `@nguyenphutrong/pi-agent-loop` is a real runtime dependency of Harness. A public Harness tarball may publish with that dependency, but consumer installs and the isolated npm/Bun release smoke test will fail when they try to fetch the unpublished package.
+
+`devDependencies`, optional dependencies, and peer dependencies do not solve a required runtime import. Coding-agent shrinkwrap/install-lock are currently unaffected because Harness is outside that dependency closure. `session-storage` can remain public independently because its dependency graph contains no private package.
+
+### Decision needed
+
+1. **Recommended:** make `@nguyenphutrong/pi-harness-runtime` private workspace-only too. Keep `session-storage` public, remove Harness from public/local-release tarball inventories, and build private `agent-loop` before private Harness. This preserves D-021/D-022 without custom packaging.
+2. Keep Harness public and change `@nguyenphutrong/pi-agent-loop` to public. Both install normally, but this reverses the selected private-package decision and creates a supported public API now.
+3. Keep Harness public and vendor compiled private-loop implementation into `harness-runtime/dist`. The tarball remains installable without a private dependency, but Harness gains custom build, declaration, source-map, clean, pack, and release verification machinery.
+
+Reply with `1`, `2`, or `3`.
+
+### Resume point
+
+After selection, record D-023's package visibility together with the corrected durable-tool design, rerun independent design review, and only then create `packages/agent-loop`.
 
 ## B-009 — Choose the legacy public agent compatibility strategy
 
