@@ -4,12 +4,12 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.13 — Kill-at-every-boundary recovery coverage
-- Status: Item 1.12 implemented by `69eb76d7f`; Harness runtime 220/220, Storage 31/31, root check PASS, and independent conformance review PASS
+- Status: D-019 defines Phase 1 kill as fresh-handle runtime loss over one real no-tool commit-cut audit; OS process-crash durability remains Phase 3 SQLite work
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Design and add deterministic kill/reopen coverage for every Phase 1 commit boundary.
+1. Add the D-019 end-to-end commit-cut audit and run the independent review gate.
 2. Run independent Phase 1 done-bar review.
 3. Run the Phase 1 recovery/QA pass.
 4. Begin Phase 2 only after Phase 1 is accepted.

@@ -457,3 +457,32 @@ Recovery authority remains `lane.state/main` to `op.meta/O` and `op.state/O`, wi
 Matching materialization is a supported recovery prefix, not a normal assistant settlement boundary: ordinary settlement still inserts the reserved response and usage and advances the total operation state in one atomic transaction. No production behavior, Storage contract, LaneRecord API, provider adapter, public completion API, or new test-support abstraction is introduced.
 
 Commit `69eb76d7f` adds the two missing close/fresh-handle/reopen integration cases. Harness runtime tests pass 220/220, session-storage tests pass 31/31, `npm run check` passes, `git diff --check` passes, and the independent conformance review reports PASS with no blocking findings.
+
+## D-019 — Model Phase 1 kill coverage as fresh-handle loss over one end-to-end commit-cut matrix
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: accepted
+- References: D-003, D-006, D-010–D-018; `packages/agent/docs/harness-v3.md` §§1.3–1.7, 2.8, 3.2–3.7, 3.13, 4.1–4.8, 8, 9.1–9.3
+
+### Options
+
+1. Treat D-018's per-durable-state close/reopen tests as the complete item 1.13 evidence.
+2. Retain D-018 as Tier A state coverage and add one narrow end-to-end manual commit-cut matrix over the real Phase 1 no-tool path.
+3. Add a reusable commit fault-injection or Memory snapshot/process-kill harness.
+
+### Choice
+
+Option 2.
+
+### Rationale
+
+Memory durability is intentionally in-process. `MemoryStorageState` owns the durable maps while `MemoryStorage`, `MemorySession`, RuntimeShell, scheduler state, provider leases, controllers, promises, and settled outputs are disposable handles or process-local values. Phase 1 therefore defines a kill as discarding those local objects, closing or abandoning the active handle, creating a fresh handle from the same repository-owned state, and restoring from current registers. It makes no OS process-crash durability claim; SQLite process-crash testing belongs to Phase 3.
+
+D-018 already proves every distinct reachable durable recovery position: idle, checkpoint `need_assistant`, assistant `ready`, assistant `effect_pending` with absent reservations, assistant `effect_pending` with matching materialized reservations, and checkpoint `may_finish`. Provider-local `planned`, `running`, and `settled` intervals are not additional durable states: all reopen from the same `effect_pending` prefix without a live key and deterministically expose `recover_assistant_effect`. Matching materialization instead exposes `repair_materialized_assistant`.
+
+Item 1.13 adds only integration evidence that the actual `prompt → provider → final response` path reaches those commit cuts in order. The audit includes session creation, first configuration seed, prompt acceptance, assistant ready, assistant intent, provider planned/running/locally-settled aliases, assistant settlement, and terminal finish. At each cut it asserts the complete durable inventory, absence of partial transaction artifacts, fresh-handle next action or idle state, no provider resolution during restore, and no recovery write.
+
+Unknown-effect execution remains intentionally unavailable in the current Phase 1 runtime. Deterministically exposing `recover_assistant_effect` after runtime loss is the acceptance result; driving that action through retry or synthetic settlement is owned by later generation-recovery work.
+
+No production Storage API, serialization format, SQLite backend, child process, provider adapter, public completion surface, history reducer, or LaneRecord compatibility path is introduced.
