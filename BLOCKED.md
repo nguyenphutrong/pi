@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. B-005 was resolved by the human selection of option 1.
+No active blockers. Work item 1.10 passed independent review; B-005 remains resolved by the human selection of option 1.
 
 ## Resolved B-005 — Close versus synchronous provider fault winner ordering
 
