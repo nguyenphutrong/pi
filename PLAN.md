@@ -2,17 +2,18 @@
 
 ## Current checkpoint
 
-- Phase: 1 — Minimal durable run
-- Work item: Phase 1 done-bar review
-- Status: item 1.13 completed by `5afa0cc35`; run an independent whole-phase conformance review before Recovery/QA
-- Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
+- Phase: 2 — Durable tools and abort
+- Work item: 2.1 — Durable sequential tool plan, arguments, replay, and recovery design
+- Status: Phase 1 accepted after independent done-bar review and Recovery/QA PASS; re-read the Phase 2 spec sections before design delegation
+- Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 
 ## Queue
 
-1. Run independent Phase 1 done-bar review.
-2. Run the Phase 1 recovery/QA pass.
-3. Checkpoint Phase 1 acceptance.
-4. Begin Phase 2 only after Phase 1 is accepted.
+1. Re-read the records catalog, tool lifecycle, recovery, abort, terminal, public API, and testing-tier sections for Phase 2.
+2. Delegate 2.1 design options for exact durable sequential tool planning, persisted arguments, and `replay: safe|never` recovery.
+3. Select and independently review the 2.1 design before implementation.
+4. Implement the first commit-sized durable tool-state increment.
+5. Add Tier A/B/C crash-boundary coverage before widening to abort.
 
 ## Phase order
 

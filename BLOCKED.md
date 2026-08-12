@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active human blocker. B-007 option 1 was implemented by `5afa0cc35` and the independent D-019 review passed.
+No active human blocker. Phase 1 passed its independent done-bar review and Recovery/QA gate; Phase 2 design may begin.
 
 ## B-007 — Resolve the remaining literal D-019 audit evidence
 

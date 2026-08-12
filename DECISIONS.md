@@ -490,3 +490,16 @@ No production Storage API, serialization format, SQLite backend, child process, 
 The final audit instruments the real repository-owned Memory handle from `MemorySessionRepo.create()` onward. A fixed clock and deterministic O/P/S/R/U generator make metadata, operation state, entry envelopes, reservation identity, and every transaction value independently exact. Its prefix includes repository initialization, configuration seed, acceptance, ready, intent, settlement, and terminal cleanup. Every fresh `repo.open()` handle is separately instrumented and proves that open, attach, action planning, and close commit nothing and never resolve a model.
 
 Commit `5afa0cc35` adds only test coverage. Focused repository/runtime-shell tests pass 114/114, Harness runtime passes 230/230, session-storage passes 31/31, `npm run check` passes, `git diff --check` passes, and the independent D-019 review reports PASS with all historical and B-007 findings resolved.
+
+## D-020 — Accept Phase 1 and advance to durable tools only after two independent final gates
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: accepted
+- References: D-003–D-019; Phase 1 mission done bar; `packages/agent/docs/harness-v3.md` minimal no-tool runtime and testing tiers
+
+### Decision
+
+Phase 1 is complete. The independent whole-phase reviewer traced the actual no-tool state machine, storage transactions, provider effect sandwich, terminal cleanup, package boundaries, forbidden-legacy absence, and D-018/D-019 recovery evidence and returned PASS. A separate Recovery/QA pass then reran Harness runtime 230/230, session-storage 31/31, pi-ai provider-lease 44/44, coding-agent lease integration 6/6, `npm run check`, and `git diff --check`; all passed from a clean worktree.
+
+Unknown-effect execution, retry, public completion promises, automatic drive, tools, abort, queues, hooks/events, SQLite, and OS-process durability remain explicit later-phase work rather than Phase 1 gaps. Phase 2 may now begin, but only after re-reading its authoritative tool, recovery, abort, terminal, API, and testing sections.
