@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. B-008 is resolved; Phase 2 may continue after identity-migration verification and design correction.
+No active blocker. B-008 is resolved and the identity migration passed independent review in `b8d312e62`; Phase 2 package-boundary design may continue.
 
 ## B-008 — Choose the `agent-loop` package visibility
 

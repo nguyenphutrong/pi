@@ -508,7 +508,7 @@ Unknown-effect execution, retry, public completion promises, automatic drive, to
 
 - Date: 2026-08-12
 - Phase: 2
-- Status: confirmed by human after B-008 escalation; identity migration in implementation/review
+- Status: implemented by `b8d312e62` after independent review
 - References: B-008; target `packages/agent-loop` boundary
 
 ### Options
@@ -532,3 +532,5 @@ Visibility option 1 and scope option 2.
 The private package establishes the required internal boundary without prematurely creating a public API. A single fork-owned scope makes ownership explicit and avoids introducing a mixed identity convention for new fork-only modules. Therefore the existing packages become `@nguyenphutrong/pi-harness-runtime` and `@nguyenphutrong/pi-session-storage`, and the future package will be `@nguyenphutrong/pi-agent-loop`.
 
 Public upstream packages retain their existing `@earendil-works` scope, including `@earendil-works/pi-ai` and `@earendil-works/pi-agent-core`. The coding-agent installer identity also remains under its existing upstream scope. This decision changes npm identity only and does not change package directories or production behavior.
+
+Commit `b8d312e62` applies the two existing package renames, source and tooling resolution updates, internal-workspace recognition for both scopes, and the regenerated root lockfile. Session storage passes 31/31, Harness runtime passes 230/230, script tests pass 5/5, `npm run check` passes, `git diff --check` passes, fresh local workspace links resolve under `@nguyenphutrong`, and the independent review reports PASS.
