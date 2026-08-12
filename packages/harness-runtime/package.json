@@ -1,6 +1,7 @@
 {
 	"name": "@nguyenphutrong/pi-harness-runtime",
 	"version": "0.84.1",
+	"private": true,
 	"description": "Typed Harness session runtime and memory repository",
 	"type": "module",
 	"main": "./dist/index.js",
