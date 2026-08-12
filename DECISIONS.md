@@ -426,3 +426,32 @@ The Harness-owned narrow durable result is `{ operationId, kind:"run", outcome:"
 Close-first prevents terminal admission and reopen plans `finish_run`; finish-first commits completely and close waits. A commit or codec failure faults without publishing idle state or a result, subject to D-015 first-terminal-condition ordering. Public results, prompt completion promises, generic outcomes, queues, abort, hooks/events, and structural operations remain deferred.
 
 Commit `1576b20bb` implements the conditional terminal transition, exact narrow result codec, deterministic operation-register cleanup, committed-only internal result, and shell execution boundary. Harness runtime tests pass 218/218, session-storage tests pass 31/31, `npm run check` passes, `git diff --check` passes, and the independent conformance review reports PASS with no blocking findings.
+
+## D-018 — Complete Phase 1 Tier A coverage by durable state, not process-local effect status
+
+- Date: 2026-08-12
+- Phase: 1
+- Status: accepted
+- References: D-010–D-017; `packages/agent/docs/harness-v3.md` §§1.3–1.7, 3.2–3.7, 3.13, 4.1–4.8, 5.1–5.2, 8, 9.1–9.3
+
+### Options
+
+1. Add only the missing close/reopen integration cases to the existing runtime-shell tests and retain current complete boundary tests.
+2. Duplicate every Phase 1 boundary in one new table-driven recovery suite.
+3. Extract shared recovery fixtures into a new test-support surface and create a separate Phase 1 recovery file.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Phase 1 has six distinct durable recovery positions: idle, checkpoint `need_assistant`, assistant `ready`, assistant `effect_pending` with absent reservations, assistant `effect_pending` with matching materialized reservations, and checkpoint `may_finish`. The terminal transaction returns the lane to idle.
+
+Provider effect statuses `planned`, `running`, and `settled` are process-local sub-boundaries over the same durable `effect_pending` state. Close writes nothing and discards their local lease, controller, promise, or settled message, so every such close/reopen deterministically plans `recover_assistant_effect`. Matching materialized response and usage reservations are different bounded durable evidence and retain precedence, planning `repair_materialized_assistant`.
+
+Existing tests already provide complete close/reopen coverage for accepted `need_assistant`, absent-reservation `effect_pending` at planned/running/settled local positions, settled `may_finish`, failed terminal commit, and terminal idle. The increment adds only the missing durable `ready` and matching-materialization close/reopen cases. It does not duplicate Tier C close races or add process-kill mechanics, which belong to the next work item.
+
+Recovery authority remains `lane.state/main` to `op.meta/O` and `op.state/O`, with bounded exact entry and usage hydration. Restore performs no history, branch, configuration, register, or usage-ledger scan. Close performs no durable write. A committed terminal state restores idle without reading `lane.lastResult/main`.
+
+Matching materialization is a supported recovery prefix, not a normal assistant settlement boundary: ordinary settlement still inserts the reserved response and usage and advances the total operation state in one atomic transaction. No production behavior, Storage contract, LaneRecord API, provider adapter, public completion API, or new test-support abstraction is introduced.

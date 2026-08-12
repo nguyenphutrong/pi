@@ -4,12 +4,12 @@
 
 - Phase: 1 — Minimal durable run
 - Work item: 1.12 — Close/reopen Tier A coverage for every Phase 1 action and transition boundary
-- Status: Item 1.11 implemented by `1576b20bb`; Harness runtime 218/218, Storage 31/31, root check PASS, and independent conformance review PASS
+- Status: D-018 selects the two missing durable-state integrations: reopened assistant `ready` and reopened matching materialized response/usage reservations
 - Done bar: `prompt → provider → final response` on one `main` lane, with deterministic close/reopen recovery at every commit boundary
 
 ## Queue
 
-1. Build the authoritative Phase 1 boundary matrix and fill close/reopen Tier A coverage gaps.
+1. Add the two missing close/reopen Tier A cases selected by D-018 and run the independent review gate.
 2. Add kill-at-every-boundary recovery coverage.
 3. Run independent Phase 1 done-bar review.
 4. Run the Phase 1 recovery/QA pass.
