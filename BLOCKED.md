@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Phase 3 passed both acceptance gates; Phase 4 queue and interactive-control design is in progress.
+No active blockers. Phase 4.1a is complete; operation-owned queue implementation is in progress.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 

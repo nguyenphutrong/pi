@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.1a — Lane-owned next-run vertical slice
-- Status: D-047 passed independent design review; implement pending payload hydration, `nextRun`, cancellation, atomic prompt capture, and `skipInboxOnce` without enabling active inbox state
+- Work item: 4.1b — Operation-owned steer/follow-up vertical slice
+- Status: lane-owned next-run is implemented and independently reviewed at `2cc6a0e12`; implement active queues, drains, cancellation, abort payload retention, and terminal cleanup as one complete slice
 - Done bar: `steer`, `followUp`, `nextRun`, `cancelQueued`, deferred tree writes, one-at-a-time/all drain modes, `waitForIdle`, `runWhenIdle`, and full abort behavior are durable and verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement and verify lane-owned `nextRun`, cancellation, prompt capture, and `skipInboxOnce` as one complete vertical slice.
-2. Implement active `steer`/`followUp`, all/one-at-a-time drains, cancellation, abort drains, and terminal cleanup as one complete vertical slice.
+1. Implement active `steer`/`followUp`, all/one-at-a-time drains, cancellation, abort drains, and terminal cleanup as one complete vertical slice.
+2. Add representative SQLite process-death cuts for the completed queue kernel.
 3. Design and implement deferred tree writes.
 4. Add `waitForIdle` and `runWhenIdle`.
 5. Complete whole-Phase-4 acceptance.
