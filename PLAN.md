@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.1 — Queue acceptance, cancellation, and drain design
-- Status: Phase 3 passed separate Recovery/QA and independent acceptance; design the first Phase 4 slice from the durable inbox and queue-control spec
+- Work item: 4.1a — Lane-owned next-run vertical slice
+- Status: D-047 passed independent design review; implement pending payload hydration, `nextRun`, cancellation, atomic prompt capture, and `skipInboxOnce` without enabling active inbox state
 - Done bar: `steer`, `followUp`, `nextRun`, `cancelQueued`, deferred tree writes, one-at-a-time/all drain modes, `waitForIdle`, `runWhenIdle`, and full abort behavior are durable and verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design durable `steer`, `followUp`, `nextRun`, and `cancelQueued` acceptance/cancellation/drain semantics.
-2. Implement and verify the smallest sequential queue slice with exact crash/race coverage.
+1. Implement and verify lane-owned `nextRun`, cancellation, prompt capture, and `skipInboxOnce` as one complete vertical slice.
+2. Implement active `steer`/`followUp`, all/one-at-a-time drains, cancellation, abort drains, and terminal cleanup as one complete vertical slice.
 3. Design and implement deferred tree writes.
-4. Add one-at-a-time/all modes, `waitForIdle`, and `runWhenIdle`.
-5. Complete full abort composition and whole-Phase-4 acceptance.
+4. Add `waitForIdle` and `runWhenIdle`.
+5. Complete whole-Phase-4 acceptance.
 
 ## Phase order
 

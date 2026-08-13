@@ -1348,3 +1348,32 @@ The parent checks exact initial ActionInfo identities, combined provider context
 Commit `6c0706d19` implements D-046. All 34 isolated cases self-terminate the initial process with `SIGKILL`, reopen at exact lease expiry in a fresh process, and reach the exact terminal state for both replay policies at every action prefix. The strict protocol, complete ActionInfo/effect evidence, all-nine-table semantic oracle, and fresh idle no-effect/no-write lifecycle pass focused 34/34, Harness 468/468, SQLite 216/216, root check, and diff check. Fresh independent implementation review reports PASS with no blocking or non-conformance finding.
 
 Whole-Phase-3 acceptance is complete. Separate Recovery/QA passes Memory/storage 38/38, SQLite 216/216, Harness 468/468, agent-loop 95/95, root check, and diff check with a clean worktree. A fresh independent phase review finds the schema, `BEGIN IMMEDIATE` transaction discipline, fencing/takeover, shared conformance, reopen, D-045 SQL atomicity, and D-046 RuntimeShell process-loss recovery satisfy the Phase 3 done bar. Phase 4 is unblocked.
+
+## D-047 — Activate durable queues only as complete vertical state-machine slices
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: accepted after corrected independent design review
+- References: `packages/agent/docs/harness-v3.md` §§1.2–1.4, 2.2, 3.2–3.6, 3.11–3.13, 4.1–4.7, 5.1, 5.4, 9.1–9.3
+
+### Options
+
+1. Enable queue codecs and writers incrementally, then add planner, abort, and terminal behavior later.
+2. Land every queue capability in one large Phase 4 change.
+3. Keep one private `StoredSession` queue kernel, but activate lane-owned and operation-owned queue states in two complete vertical increments.
+
+### Choice
+
+Option 3. No production writer or accepted codec may make a nonempty durable queue state reachable until that same increment supplies its valid next actions, cancellation, terminal ownership, and reopen behavior.
+
+### Rationale
+
+The first proposed sequence was rejected because nonempty inboxes could become durable while the current planner still skipped them, abort left them undrained, and finish required them empty. This could create an accepted operation with no valid path to terminal. The corrected design therefore activates two independently complete state-machine slices rather than treating codecs as passive schema work.
+
+Increment 4.1a owns lane-level reservations. A distinct `RuntimeAttachment.pendingEntries` map hydrates only `pending.entry` registers directly named by current state; pending content never enters the placed-entry map. For this slice each value is exactly `{type:"message",payload:<validated Message>}`. Nonempty `pendingNextRun`, `nextRun`, lane-owned `cancelQueued`, prompt capture, `skipInboxOnce`, assistant-ready clearing, terminal preservation, and close/reopen land together. Prompt reloads the latest lane state on the `StoredSession` mutation line, captures all current next-run ids FIFO before caller entries, deletes exactly their pending registers, excludes them from `intent.promptEntryIds`, and tolerates a lane sequence advance only when current ownership, leaf, configuration, and identities remain valid. `nextRun` that wins first is captured; one that wins after prompt remains pending for the following run.
+
+Increment 4.1b then activates operation-owned state in one vertical change: nonempty steer/follow-up and drained arrays, active writers, all/one-at-a-time planner drains, active cancellation, first-abort queue movement, write-free repeated abort payloads, existing Phase 2 effect reconciliation, and terminal deletion of operation-owned pending registers while preserving lane-owned next-run. Deferred writes remain invalid until their own later slice.
+
+Current-state hydration validates the unique union of directly referenced pending ids: UUIDv7 identity, no duplicates within or across lists, exact payload codec, required register presence, and pending-versus-materialized exclusivity. It does not scan the entire namespace for unreferenced orphan registers: §§3.3 and 4.4 define bounded recovery from current state, and arbitrary pending values contain no ownership metadata. Adding an orphan scan would change the storage/recovery contract rather than implement this phase.
+
+Queue writes remain private `StoredSession` transitions serialized on its mutation line; the planner sees typed consume actions, not Storage writes. No Storage, SQLite schema, `pi-ai`, agent-loop, legacy record/reducer, or public-package change is required. Tier A covers every new state and reopen, Tier B exact writer order, Tier C both permitted race histories, and representative SQLite process-death cuts cross-cut admission, placement/deletion, abort drain, and terminal cleanup. Independent corrected design review reports PASS with no §6 escalation.
