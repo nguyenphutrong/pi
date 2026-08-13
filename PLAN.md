@@ -4,14 +4,14 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.4 — First complete durable tool-plan commit
-- Status: item 2.3 implemented by `e6e6b1cd0` after independent final review; tool-plan design is next
+- Status: D-026 passed independent design review; implementation is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the tool settlement/recovery sections and design the first atomic tool-batch plan boundary.
-2. Implement and test the complete durable tool-plan commit before clearance or effects.
+1. Implement and test the complete durable tool-plan settlement before clearance or effects.
+2. Independently review the implementation against D-026 and the exact writer transaction.
 3. Add durable clearance, persisted effective arguments, replay policy, and sequential tool settlement.
 4. Add durable abort/reconciliation after sequential tool states are abort-ready.
 5. Add close/reopen crash matrices at every Phase 2 commit boundary and run the done-bar gate.

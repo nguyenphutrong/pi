@@ -673,3 +673,32 @@ Option 2 loses the deadline on reopen and violates the specified durable `retry_
 Replacing a below-cap intent with `retry_wait` intentionally leaves its old response/usage strings unmaterialized and no longer reserved: current-state invariant 15 gives reservation authority only to ids named by the latest `op.state`. Tier A covers uncertain attempts below and at the cap, invalid attempt/policy relationships, exact timer-proof matching, every new durable prefix, fresh later ids, exact independently verifiable synthetic response/usage/provenance relationships, bounded write-free restore, and failed terminal cleanup. Writer/close-reopen coverage proves recovery intent, timer, ready release, later request intent, exact cap synthesis including provider/model/timestamp, and failed finish remain distinct boundaries. No public Harness API, provider adapter, private agent-loop behavior, Storage contract, history reducer, or forbidden legacy record surface changes.
 
 Commit `e6e6b1cd0` implements the complete boundary. Recovery and retry-release transitions carry exact planned `op.state` and `lane.state` sequence authority, so even an identical-value rewrite makes an old action stale before clock capture or commit. Harness runtime passes 266/266, `npm run check` and `git diff --check` pass, and the independent final review reports PASS with no blocking or non-blocking findings.
+
+## D-026 — Settle a tool-bearing response with its complete batch plan atomically
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: approved by independent design review; implementation pending
+- References: D-024–D-025; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.7–3.8, 4.1, 4.4–4.5, 9.1–9.3; `packages/agent/docs/harness-v2.md` tool-batch crash catalog
+
+### Options
+
+1. Commit the assistant response and usage first, then allocate and commit the tool batch in a second transition, preserving v2's X1 prefix.
+2. In the assistant settlement transaction, insert the response, move the leaf, insert usage, and replace generation state with the complete all-planned tool batch and all reserved result ids.
+3. Reserve possible tool-result ids in the assistant effect intent before provider dispatch, then select the used subset at settlement.
+
+### Choice
+
+Option 2.
+
+### Rationale
+
+Harness v3 makes the operation state the program counter and explicitly folds the complete tool plan into assistant settlement. The transaction writes, in order, the reserved response entry, `lane.leaf/main`, the reserved usage row, and total `op.state` with `latestAssistantEntryId` equal to that response and `phase.tools.batch` containing every source call. The only crash prefixes are therefore the prior assistant `effect_pending`, recovered under D-025, or the complete all-planned batch. There is no durable response-without-usage or response-without-plan state.
+
+The batch copies the producing generation's captured `configuration`, uses its `stepId` as `turnId`, and derives source calls from the durable assistant entry. Tool-call id, name, and raw arguments are not duplicated in state. Calls contain consecutive `sourceIndex` values and pairwise-distinct result ids reserved before the transaction; those ids are followers of the response id so assistant and results share a timestamp partition. Allocation validates pairwise distinction from every directly known correlation and reservation id, absence from the shared entry/usage id namespace, and any explicitly conflicting current operation-register identity before any write. Arbitrary register keys do not join the entry/usage namespace. The settlement remains one atomic commit, so failed validation, allocation, occupancy checks, or storage commit publish none of it.
+
+Restore hydrates the batch's assistant entry and any completed result entries by exact id. For the all-planned slice it validates `assistantEntryId === latestAssistantEntryId === lane.leaf`, a complete ordered source-index mapping onto the response's tool calls, a UUIDv7 `turnId`, and unique unmaterialized result reservations. It reads no tool-argument register because planned calls have none, resolves no model or tool identity, scans no history, and writes nothing. The planner identifies source index zero under its existing result id as the first unfinished call. A later resume may enter clearance only after the required tool identity and batch context resolve; otherwise it reports missing identities without a write. Item 2.4 parks before lookup, argument preparation, hook, or tool effect.
+
+Option 1 carries a superseded v2 record-era crash prefix into the v3 register state machine and requires a new intermediate state solely for implementation sequencing. Option 3 cannot know call count or order before the provider response and would create unused reservations. Neither is acceptable.
+
+This item changes no Storage contract, provider adapter, `pi-ai` surface, public Harness API, or private `agent-loop` behavior. Clearance, `op.tool_args`, replay, dispatch, tool settlement, abort, genuine-length explanatory results, and batch completion remain later Phase 2 work.
