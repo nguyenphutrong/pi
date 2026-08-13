@@ -1168,3 +1168,36 @@ Commit `4a94c253c` implements D-039's projection increment and D-040. Concrete c
 Commit `c0ad1066b` implements D-039's guarded-reader increment. Both branch APIs first materialize one agreed structure-only closure, then apply ordering, inclusive stop, filtering, directional cursor, and limit. Payload reads reconcile bounded `ix_be_seq` or `ix_be_type` ranges one-to-one against that canonical plan before returning in plan order. SQLite passes 151/151 tests, its package build, `npm run check`, and `git diff --check`; independent final review reports PASS. The unchanged full Storage conformance gate remains separate and next.
 
 Commit `886bb34ad` closes D-039 with the unchanged full conformance factory running directly against fresh real SQLite handles. All 20 shared cases pass exactly once, SQLite passes 171/171, Memory/session-storage passes 38/38, both package builds, `npm run check`, and `git diff --check` pass. Independent review confirms there is no cast, fake backend, wrapper, seed substitute, or weakened shared case. Phase 3.3e is complete; explicit repair and Harness integration remain next.
+
+## D-041 — Keep repair administrative and integrate SQLite through complete handles
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-032–D-040; `packages/agent/docs/harness-v3.md` §§2.6, 2.8, 8 slice 14, 9.1–9.3
+
+### Options
+
+1. Add repair to an active `Storage` or `Session` handle and let runtime callers invoke it.
+2. Expose a generic repository transaction or SQL callback and implement repair in Harness.
+3. Give the concrete SQLite repository one explicit administrative repair operation, then adapt its complete handles to `StoredSession` through a workspace-private `SqliteSessionRepo`.
+
+### Choice
+
+Option 3. Repair remains outside `Storage`, `Session`, `RuntimeShell`, open, reads, and restore. Runtime branch corruption continues to fail, seal only the affected handle, and never trigger repair or a parent-walk fallback.
+
+### Rationale
+
+`entries` is the only repair input. Registers and usage remain authoritative durable stores but do not participate in branch reconstruction. The repository validates exact metadata, synchronously reserves the session against local producers and active handles, and submits repair to D-037's file-wide FIFO. One concrete engine operation owns exactly one `BEGIN IMMEDIATE`: it verifies the catalog, current storage version, and a positive safe `next_seq`; acquires an absent or exactly expired writer lease with a checked fence; and rejects an unexpired owner.
+
+The engine decodes all canonical entries in ascending sequence with the complete storage envelope validator. Entry sequences must be unique, strictly increasing, positive safe integers below `next_seq`; gaps and multiple roots are valid, while every non-null parent must already have appeared. It then deletes `branch_entries` before `branch_meta`, replays the detached entries through the ordinary `projectSqliteEntry`, and independently resolves every rebuilt entry closure so every canonical id has sound projection membership. Finally it deletes the exact repair owner/fence lease before the same commit. Any metadata, canonical-data, projection, validation, SQL, or release failure rolls back the lease takeover and replacement, preserving both all canonical rows and the old projection. A successful repair replaces the old projection completely and deterministically.
+
+The private SQLite package adds only a workspace integration seam for `SqliteStorageRepository`, its repository errors/options/metadata, and a complete structural `SqliteStorageSession extends Storage` return type. Existing private adapter, schema, and type exports remain; concrete handles, engine operations, and transaction callbacks gain no new export. Emitted repository signatures use the complete interface rather than leaking `SqliteStorageHandle`. Boundary tests lock both runtime exports and declarations.
+
+The private Harness package depends on the private SQLite package; SQLite continues to depend only on session storage and never imports Harness. Root build order follows that direction. `SqliteSessionRepo` accepts only an exact `{ path }`, creates the existing Node SQLite factory internally, owns one low-level repository, and exposes the existing `Session` and RuntimeShell behavior without passing database, factory, timer, SQL, lease, or fence capabilities upward.
+
+Creation supplies exactly one low-level `initialTransaction`: `lane.leaf/main = null`, then idle `lane.state/main`. Catalog, sequence, stats, lease, and both registers therefore commit atomically with no second initialization commit. Open applies the existing exact metadata and directional storage-version checks, acquires a complete handle, validates the main lane, and closes that handle on validation failure while preserving the original error. `StoredSession.close()` owns handle closure once; repository close delegates the low-level drain and idempotent connection close. Low-level validation, missing/duplicate ownership, busy writer, version/metadata mismatch, closure, persisted corruption, and adapter faults map to existing `SessionError` codes; no durable or supported public contract changes.
+
+Focused repair gates cover damaged, missing, and conflicting projections over forests, divergence, and compaction; repeat determinism; malformed canonical payload/sequence/parent data; failures after deletion and during replay; exact rollback; local and external ownership; expiry/fence/FIFO/close behavior; `BEGIN IMMEDIATE`; sibling isolation; repaired reads and append; and absence of automatic repair. Harness gates cover atomic creation, exact metadata/version/error mapping, ownership and cleanup, real-file close/fresh-repository reopen, and complete no-tool and tool RuntimeShell terminal restoration. The unchanged shared Storage suite remains green. Subprocess SQL, creation, and all Phase 2 RuntimeShell crash cuts remain the next work item and are required before the Phase 3 done bar is claimed.
+
+Implementation stays incremental: repair core and repository operation; additive private package seam; Harness repository and lifecycle tests; real RuntimeShell SQLite acceptance; then subprocess crash matrices and whole-phase Recovery/QA. Final independent design review reports PASS with no §6 escalation.
