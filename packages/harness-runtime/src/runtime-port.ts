@@ -11,6 +11,7 @@ import {
 	type FinishRunTransition,
 	type PrepareAssistantEffectResult,
 	type PrepareAssistantEffectTransition,
+	type QueueMutationResult,
 	type RecoverAssistantEffectTransition,
 	type RecoveryTransitionResult,
 	type ReleaseAssistantRetryTransition,
@@ -81,6 +82,21 @@ export function acceptPrompt(session: Session, transition: AcceptPromptTransitio
 	if (!(session instanceof StoredSession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.acceptPrompt(transition);
+}
+
+export function nextRun(
+	session: Session,
+	message: Parameters<StoredSession["nextRun"]>[0],
+): Promise<QueueMutationResult> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.nextRun(message);
+}
+
+export function cancelQueued(session: Session, entryId: string): Promise<QueueMutationResult> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.cancelQueued(entryId);
 }
 
 export function prepareAssistantEffect(

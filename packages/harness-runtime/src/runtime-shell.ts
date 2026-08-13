@@ -22,15 +22,17 @@ import {
 	type PreparedToolCall,
 	prepareToolCall,
 } from "@nguyenphutrong/pi-agent-loop";
-import type { JsonValue } from "@nguyenphutrong/pi-session-storage";
+import { isUuidV7, type JsonValue } from "@nguyenphutrong/pi-session-storage";
 import { encodeMessage } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction, toolEffectKey } from "./planner.ts";
 import {
 	acceptPrompt,
 	attachRuntime,
+	cancelQueued,
 	clearToolCall,
 	finishRun,
+	nextRun,
 	prepareAssistantEffect,
 	recoverAssistantEffect,
 	refreshRuntimeAttachment,
@@ -911,7 +913,6 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const result = await finishRun(this.#session, {
 					operationId: action.info.operationId,
 					expectedOperationStateSeq: action.expected.operationStateSeq,
-					expectedLaneStateSeq: action.expected.laneStateSeq,
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
@@ -1082,6 +1083,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					messages,
 					expectedConfigurationSeq: expected.laneConfiguration.seq,
 					expectedLaneStateSeq: expected.laneState.seq,
+					expectedPendingNextRun: expected.laneState.value.pendingNextRun,
 					expectedLeafSeq: expected.mainLeaf.seq,
 					expectedProvider: expected.laneConfiguration.value.model.provider,
 					expectedModelId: expected.laneConfiguration.value.model.modelId,
@@ -1094,6 +1096,40 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					throw new RuntimeShellError("unavailable", "Configured provider/model is unavailable");
 				return result.attachment;
 			});
+		});
+	}
+
+	nextRun(input: Message): Promise<{ readonly entryId: string }> {
+		if (this.#fault) return Promise.reject(this.#fault);
+		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
+		let message: Message;
+		try {
+			message = encodeMessage(input) as unknown as Message;
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		return this.#admit(async () => {
+			const result = await nextRun(this.#session, message).catch((cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			});
+			this.#publish(result.attachment);
+			if (!result.entryId) throw new RuntimeShellError("fault", "Next-run admission omitted its entry id");
+			return Object.freeze({ entryId: result.entryId });
+		});
+	}
+
+	cancelQueued(entryId: string): Promise<{ readonly kind: "cancelled" | "already_consumed" | "not_found" }> {
+		if (this.#fault) return Promise.reject(this.#fault);
+		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
+		if (typeof entryId !== "string" || !isUuidV7(entryId))
+			return Promise.reject(new RuntimeShellError("unavailable", "Queued entry id must be a UUIDv7"));
+		return this.#admit(async () => {
+			const result = await cancelQueued(this.#session, entryId).catch((cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			});
+			this.#publish(result.attachment);
+			if (!result.outcome) throw new RuntimeShellError("fault", "Queue cancellation omitted its outcome");
+			return Object.freeze({ kind: result.outcome });
 		});
 	}
 

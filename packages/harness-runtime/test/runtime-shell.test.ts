@@ -1049,7 +1049,7 @@ describe("Phase 1 runtime shell", () => {
 		await shell.close();
 	});
 
-	it.each(["lane.config", "lane.state", "lane.leaf"] as const)(
+	it.each(["lane.config", "lane.leaf"] as const)(
 		"refreshes stale %s without acceptance IDs or writes",
 		async (namespace) => {
 			const fixture = await rooted("idle");
@@ -1070,6 +1070,22 @@ describe("Phase 1 runtime shell", () => {
 			await shell.close();
 		},
 	);
+
+	it("accepts a prompt after a lane-state sequence advance with unchanged authority", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const runtimeSession = session(storage);
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const current = await storage.getRegister("lane.state", "main");
+		await fixture.storage.commit({
+			writes: [{ kind: "register", op: "set", namespace: "lane.state", key: "main", value: current!.value }],
+		});
+		await expect(shell.prompt(user("prompt"))).resolves.toMatchObject({
+			laneState: { value: { pendingNextRun: [] } },
+		});
+		await shell.close();
+	});
 
 	it("serializes concurrent prompts so exactly one wins and the loser preserves the operation", async () => {
 		const fixture = await rooted("idle");
@@ -4904,12 +4920,10 @@ describe("Phase 1 runtime shell", () => {
 		const instrumented = instrumentStorage(fixture.storage);
 		const runtimeSession = session(instrumented);
 		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
-		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
 		const persisted = (await fixture.storage.getEntries([fixture.response])).get(fixture.response)!;
 		const result = await runtimeSession.finishRun({
 			operationId: fixture.operationId,
 			expectedOperationStateSeq: operationState.seq,
-			expectedLaneStateSeq: laneState.seq,
 		});
 		expect(result).toEqual({
 			status: "committed",
@@ -4941,23 +4955,21 @@ describe("Phase 1 runtime shell", () => {
 		await runtimeSession.close();
 	});
 
-	it.each(["lane.state", "op.state"] as const)(
-		"reloads a sequence-stale finish without writing (%s)",
-		async (namespace) => {
-			const fixture = await rooted("finish");
-			const instrumented = instrumentStorage(fixture.storage);
-			const shell = await createRuntimeShell(session(instrumented), config());
-			const key = namespace === "lane.state" ? "main" : fixture.operationId;
-			const current = (await fixture.storage.getRegister(namespace, key))!;
-			await fixture.storage.commit({
-				writes: [{ kind: "register", op: "set", namespace, key, value: current.value }],
-			});
-			await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
-			expect(instrumented.committedTransactions).toHaveLength(0);
-			expect(await shell.peekAction()).toMatchObject({ kind: "finish_run" });
-			await shell.close();
-		},
-	);
+	it("reloads an operation-state-sequence-stale finish without writing", async () => {
+		const fixture = await rooted("finish");
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		const current = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		await fixture.storage.commit({
+			writes: [
+				{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: current.value },
+			],
+		});
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+		expect(instrumented.committedTransactions).toHaveLength(0);
+		expect(await shell.peekAction()).toMatchObject({ kind: "finish_run" });
+		await shell.close();
+	});
 
 	it("keeps wrong operation ownership and an invalid finish boundary write-free in direct transitions", async () => {
 		const wrongOwner = await rooted("finish");
@@ -4975,11 +4987,9 @@ describe("Phase 1 runtime shell", () => {
 				},
 			],
 		});
-		const laneState = (await wrongOwner.storage.getRegister("lane.state", "main"))!;
 		const obsolete = await wrongOwnerSession.finishRun({
 			operationId: wrongOwner.operationId,
 			expectedOperationStateSeq: operationState.seq,
-			expectedLaneStateSeq: laneState.seq,
 		});
 		expect(obsolete).toMatchObject({ status: "obsolete" });
 		expect(obsolete).not.toHaveProperty("result");
@@ -4999,12 +5009,10 @@ describe("Phase 1 runtime shell", () => {
 		const invalidInstrumented = instrumentStorage(invalid.storage);
 		const invalidSession = session(invalidInstrumented);
 		const latestState = (await invalid.storage.getRegister("op.state", invalid.operationId))!;
-		const invalidLane = (await invalid.storage.getRegister("lane.state", "main"))!;
 		await expect(
 			invalidSession.finishRun({
 				operationId: invalid.operationId,
 				expectedOperationStateSeq: latestState.seq,
-				expectedLaneStateSeq: invalidLane.seq,
 			}),
 		).rejects.toMatchObject({ code: "corruption" });
 		expect(invalidInstrumented.committedTransactions).toHaveLength(0);
@@ -5016,12 +5024,10 @@ describe("Phase 1 runtime shell", () => {
 		const instrumented = instrumentStorage(fixture.storage);
 		const runtimeSession = session(instrumented);
 		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
-		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
 		await expect(
 			runtimeSession.finishRun({
 				operationId: fixture.operationId,
 				expectedOperationStateSeq: operationState.seq,
-				expectedLaneStateSeq: laneState.seq,
 			}),
 		).rejects.toMatchObject({ code: "corruption" });
 		expect(instrumented.committedTransactions).toHaveLength(0);
@@ -5081,6 +5087,56 @@ describe("Phase 1 runtime shell", () => {
 		await expect(finish).resolves.toMatchObject({ kind: "finish_run" });
 		await close;
 		expect(instrumented.committedTransactions).toHaveLength(1);
+	});
+
+	it("preserves a production next-run committed after finish authority was captured", async () => {
+		const fixture = await rooted("finish");
+		const storage = instrumentStorage(fixture.storage);
+		const runtimeSession = session(storage);
+		const operationState = (await storage.getRegister("op.state", fixture.operationId))!;
+		const queuedPayload = user("after");
+		const queued = await runtimeSession.nextRun(queuedPayload);
+		const entryId = queued.entryId;
+		if (!entryId) throw new Error("next-run entry id missing");
+		const result = await runtimeSession.finishRun({
+			operationId: fixture.operationId,
+			expectedOperationStateSeq: operationState.seq,
+		});
+		expect(result.status).toBe("committed");
+		expect(storage.committedTransactions[1].writes.at(-1)).toEqual({
+			kind: "register",
+			op: "set",
+			namespace: "lane.state",
+			key: "main",
+			value: { currentOperationId: null, pendingNextRun: [entryId] },
+		});
+		expect(result.attachment.pendingEntries.get(entryId)?.payload).toEqual(queuedPayload);
+		expect(() => (result.attachment.pendingEntries as unknown as Map<string, unknown>).set(entryId, {})).toThrow();
+		expect(await storage.getRegister("op.meta", fixture.operationId)).toBeUndefined();
+		expect(await storage.getRegister("op.state", fixture.operationId)).toBeUndefined();
+		expect(await storage.getRegister("pending.entry", entryId)).toBeDefined();
+		await runtimeSession.close();
+	});
+
+	it("queues a production next-run on idle after a direct finish", async () => {
+		const fixture = await rooted("finish");
+		const storage = instrumentStorage(fixture.storage);
+		const runtimeSession = session(storage);
+		const operationState = (await storage.getRegister("op.state", fixture.operationId))!;
+		await expect(
+			runtimeSession.finishRun({
+				operationId: fixture.operationId,
+				expectedOperationStateSeq: operationState.seq,
+			}),
+		).resolves.toMatchObject({ status: "committed" });
+		const { entryId } = await runtimeSession.nextRun(user("idle"));
+		if (!entryId) throw new Error("next-run entry id missing");
+		const lane = await fixture.storage.getRegister("lane.state", "main");
+		expect(lane?.value).toEqual({ currentOperationId: null, pendingNextRun: [entryId] });
+		expect(await fixture.storage.getRegister("pending.entry", entryId)).toMatchObject({
+			value: { type: "message", payload: user("idle") },
+		});
+		await runtimeSession.close();
 	});
 
 	it("close is idempotent, write-free, and rejects later admission", async () => {

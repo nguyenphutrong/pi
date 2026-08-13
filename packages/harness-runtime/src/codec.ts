@@ -184,6 +184,23 @@ export function encodeMessage(message: Message): JsonValue {
 	return encoded;
 }
 
+export interface PendingMessageEntry {
+	readonly type: "message";
+	readonly payload: Message;
+}
+
+export function encodePendingMessageEntry(message: Message): JsonValue {
+	return { type: "message", payload: encodeMessage(message) };
+}
+
+export function decodePendingMessageEntry(value: unknown): PendingMessageEntry {
+	const pending = object(value, "corruption", "pending entry");
+	fields(pending, ["type", "payload"], [], "corruption", "pending entry");
+	if (pending.type !== "message") fail("corruption", "Pending entry type must be message");
+	validateMessage(pending.payload, "corruption");
+	return Object.freeze({ type: "message", payload: structuredClone(pending.payload) });
+}
+
 export function decodeMessageEntry(candidate: Entry): MessageEntry {
 	try {
 		assertEntry(candidate);

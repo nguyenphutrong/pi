@@ -327,9 +327,17 @@ describe("Phase 1 durable codecs", () => {
 			{ ...common(phases.ready), inbox: { steer: [TRIGGER_ID], followUp: [], writes: [] } },
 		];
 		for (const candidate of invalidStates) expectCorruption(() => decodeState(candidate));
-		expectCorruption(() =>
+		expect(
 			decodeLaneStateRegister(
 				register("lane.state", "main", { currentOperationId: null, pendingNextRun: [OPERATION_ID] }),
+			).value.pendingNextRun,
+		).toEqual([OPERATION_ID]);
+		expect(decodeState(common({ ...phases.needAssistant, skipInboxOnce: true })).value.phase).toMatchObject({
+			skipInboxOnce: true,
+		});
+		expectCorruption(() =>
+			decodeLaneStateRegister(
+				register("lane.state", "main", { currentOperationId: null, pendingNextRun: [OPERATION_ID, OPERATION_ID] }),
 			),
 		);
 		for (const deferred of [true, { window: "15m" }]) {

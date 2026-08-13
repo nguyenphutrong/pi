@@ -17,7 +17,13 @@ import {
 	type Write,
 } from "@nguyenphutrong/pi-session-storage";
 import { classifyAssistantSettlement } from "./assistant-settlement.ts";
-import { decodeMessageEntry, encodeMessage } from "./codec.ts";
+import {
+	decodeMessageEntry,
+	decodePendingMessageEntry,
+	encodeMessage,
+	encodePendingMessageEntry,
+	type PendingMessageEntry,
+} from "./codec.ts";
 import {
 	type CurrentRegister,
 	decodeConfigurationRegister,
@@ -126,19 +132,67 @@ function decodeIdleMainStateRegister(candidate: unknown): void {
 
 interface CurrentStateHydration {
 	readonly entries: ReadonlyMap<string, MessageEntry>;
+	readonly pendingEntries: ReadonlyMap<string, PendingMessageEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
 	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
+}
+
+class ImmutableMap<K, V> implements ReadonlyMap<K, V> {
+	readonly #values: Map<K, V>;
+
+	constructor(values?: Iterable<readonly [K, V]>) {
+		this.#values = new Map(values);
+		Object.freeze(this);
+	}
+
+	get size(): number {
+		return this.#values.size;
+	}
+
+	get(key: K): V | undefined {
+		return this.#values.get(key);
+	}
+
+	has(key: K): boolean {
+		return this.#values.has(key);
+	}
+
+	entries(): MapIterator<[K, V]> {
+		return this.#values.entries();
+	}
+
+	keys(): MapIterator<K> {
+		return this.#values.keys();
+	}
+
+	values(): MapIterator<V> {
+		return this.#values.values();
+	}
+
+	forEach(callbackfn: (value: V, key: K, map: ReadonlyMap<K, V>) => void, thisArg?: unknown): void {
+		for (const [key, value] of this.#values) callbackfn.call(thisArg, value, key, this);
+	}
+
+	[Symbol.iterator](): MapIterator<[K, V]> {
+		return this.#values[Symbol.iterator]();
+	}
+
+	get [Symbol.toStringTag](): string {
+		return "Map";
+	}
 }
 
 async function hydrateCurrentState(
 	storage: Storage,
 	mainLeaf: CurrentRegister<string | null>,
+	laneState: CurrentRegister<LaneState>,
 	runOperation?: CurrentRegister<RunOperation>,
 	runState?: CurrentRegister<RunState>,
 ): Promise<CurrentStateHydration> {
 	const entryIds = new Set<string>();
 	const usageIds = new Set<string>();
 	if (mainLeaf.value !== null) entryIds.add(mainLeaf.value);
+	for (const id of laneState.value.pendingNextRun) entryIds.add(id);
 
 	let triggerEntryId: string | undefined;
 	let responseEntryId: string | undefined;
@@ -174,6 +228,9 @@ async function hydrateCurrentState(
 		if (runState.value.latestAssistantEntryId !== null) entryIds.add(runState.value.latestAssistantEntryId);
 	}
 
+	const pendingRegisters = await Promise.all(
+		laneState.value.pendingNextRun.map((id) => storage.getRegister("pending.entry", id)),
+	);
 	const [storedEntries, storedUsageRows] = await Promise.all([
 		storage.getEntries([...entryIds]),
 		storage.getUsageRows([...usageIds]),
@@ -195,6 +252,21 @@ async function hydrateCurrentState(
 		if (entry.id !== id || !entryIds.has(id))
 			throw new SessionError("corruption", "Current-state entry lookup returned the wrong identity");
 		entries.set(id, entry);
+	}
+	const pendingEntries = new Map<string, PendingMessageEntry>();
+	for (let index = 0; index < laneState.value.pendingNextRun.length; index++) {
+		const id = laneState.value.pendingNextRun[index];
+		const register = pendingRegisters[index];
+		if (!register) throw new SessionError("corruption", "pendingNextRun references a missing pending entry");
+		try {
+			assertRegister(register);
+		} catch (error) {
+			throw new SessionError("corruption", "Malformed pending entry register", error);
+		}
+		if (register.namespace !== "pending.entry" || register.key !== id)
+			throw new SessionError("corruption", "Pending entry register has the wrong identity");
+		if (storedEntries.has(id)) throw new SessionError("corruption", "Pending entry is also materialized");
+		pendingEntries.set(id, decodePendingMessageEntry(register.value));
 	}
 	const usageRows = new Map<string, UsageRow>();
 	for (const [id, candidate] of storedUsageRows) {
@@ -222,9 +294,10 @@ async function hydrateCurrentState(
 			throw new SessionError("corruption", "A Phase 1 run must contain a prompt entry");
 		let expectedParent = operation.sourceLeafId;
 		if (expectedParent !== null) requireEntry(expectedParent, "Operation source leaf");
-		for (const id of operation.intent.promptEntryIds) {
+		for (let index = 0; index < operation.intent.promptEntryIds.length; index++) {
+			const id = operation.intent.promptEntryIds[index];
 			const prompt = requireEntry(id, "Run prompt");
-			if (prompt.parentId !== expectedParent)
+			if (index > 0 && prompt.parentId !== expectedParent)
 				throw new SessionError("corruption", "Run prompt entries do not extend the operation source in order");
 			expectedParent = id;
 		}
@@ -377,7 +450,7 @@ async function hydrateCurrentState(
 		if (usage && (usage.id !== usageId || usage.adjustment || usage.entryId !== responseEntryId))
 			throw new SessionError("corruption", "Materialized usage reservation does not match its response");
 	}
-	return Object.freeze({ entries, usageRows, toolArguments });
+	return Object.freeze({ entries, pendingEntries: new ImmutableMap(pendingEntries), usageRows, toolArguments });
 }
 
 export async function validateMainLane(storage: Storage): Promise<void> {
@@ -408,7 +481,7 @@ export async function validateMainLane(storage: Storage): Promise<void> {
 			runOperation = decodeRunOperationRegister(metadata, operationId);
 			runState = decodeRunStateRegister(state, operationId);
 		}
-		await hydrateCurrentState(storage, leaf, runOperation, runState);
+		await hydrateCurrentState(storage, leaf, laneState, runOperation, runState);
 	} catch (error) {
 		throw storageFailure(error);
 	}
@@ -421,6 +494,7 @@ export interface RuntimeAttachment {
 	readonly runOperation?: CurrentRegister<RunOperation>;
 	readonly runState?: CurrentRegister<RunState>;
 	readonly entries: ReadonlyMap<string, MessageEntry>;
+	readonly pendingEntries: ReadonlyMap<string, PendingMessageEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
 	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
@@ -439,6 +513,7 @@ export interface AcceptPromptTransition {
 	readonly messages: readonly Message[];
 	readonly expectedConfigurationSeq: number;
 	readonly expectedLaneStateSeq: number;
+	readonly expectedPendingNextRun: readonly string[];
 	readonly expectedLeafSeq: number;
 	readonly expectedProvider: string;
 	readonly expectedModelId: string;
@@ -449,6 +524,14 @@ export type AcceptPromptResult =
 	| { readonly status: "committed"; readonly attachment: RuntimeAttachment }
 	| { readonly status: "stale" | "busy" | "unavailable"; readonly attachment: RuntimeAttachment };
 
+export type CancelQueuedOutcome = "cancelled" | "already_consumed" | "not_found";
+
+export interface QueueMutationResult {
+	readonly attachment: RuntimeAttachment;
+	readonly entryId?: string;
+	readonly outcome?: CancelQueuedOutcome;
+}
+
 export interface RuntimeTransitionResult {
 	readonly committed: boolean;
 	readonly attachment: RuntimeAttachment;
@@ -457,7 +540,6 @@ export interface RuntimeTransitionResult {
 export interface FinishRunTransition {
 	readonly operationId: string;
 	readonly expectedOperationStateSeq: number;
-	readonly expectedLaneStateSeq: number;
 }
 
 export interface RecoverAssistantEffectTransition {
@@ -839,7 +921,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadata, operationId);
 				runState = decodeRunStateRegister(currentState, operationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
 		});
 		this.#mutationLine = operation.then(
@@ -877,8 +959,113 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadataCandidate, operationId);
 				runState = decodeRunStateRegister(stateCandidate, operationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	nextRun(message: Message): Promise<QueueMutationResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		let payload: JsonValue;
+		try {
+			payload = encodePendingMessageEntry(message);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			const entryId = this.idGenerator.next();
+			const [entries, usage, meta, state, pending] = await Promise.all([
+				this.#storage.getEntries([entryId]),
+				this.#storage.getUsageRows([entryId]),
+				this.#storage.getRegister("op.meta", entryId),
+				this.#storage.getRegister("op.state", entryId),
+				this.#storage.getRegister("pending.entry", entryId),
+			]);
+			if (entries.size > 0 || usage.size > 0 || meta || state || pending)
+				throw new SessionError("storage", "Generated next-run entry ID is already occupied");
+			const nextLaneState: LaneState = {
+				...attachment.laneState.value,
+				pendingNextRun: [...attachment.laneState.value.pendingNextRun, entryId],
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{ kind: "register", op: "set", namespace: "pending.entry", key: entryId, value: payload },
+					{
+						kind: "register",
+						op: "set",
+						namespace: STATE_NAMESPACE,
+						key: MAIN,
+						value: nextLaneState as unknown as JsonValue,
+					},
+				],
+			});
+			const pendingEntries = new Map(attachment.pendingEntries);
+			pendingEntries.set(entryId, decodePendingMessageEntry(payload));
+			return Object.freeze({
+				entryId,
+				attachment: Object.freeze({
+					...attachment,
+					laneState: Object.freeze({ seq: committed.seqs[1], value: structuredClone(nextLaneState) }),
+					pendingEntries: new ImmutableMap(pendingEntries),
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	cancelQueued(entryId: string): Promise<QueueMutationResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		if (!isUuidV7(entryId))
+			return Promise.reject(new SessionError("invalid_query", "Queued entry id must be a UUIDv7"));
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			if (!attachment.laneState.value.pendingNextRun.includes(entryId)) {
+				const entry = await this.#storage.getEntries([entryId]);
+				return Object.freeze({
+					attachment,
+					outcome: entry.has(entryId) ? ("already_consumed" as const) : ("not_found" as const),
+				});
+			}
+			const nextLaneState: LaneState = {
+				...attachment.laneState.value,
+				pendingNextRun: attachment.laneState.value.pendingNextRun.filter((id) => id !== entryId),
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: STATE_NAMESPACE,
+						key: MAIN,
+						value: nextLaneState as unknown as JsonValue,
+					},
+					{ kind: "register", op: "delete", namespace: "pending.entry", key: entryId },
+				],
+			});
+			const pendingEntries = new Map(attachment.pendingEntries);
+			pendingEntries.delete(entryId);
+			return Object.freeze({
+				outcome: "cancelled" as const,
+				attachment: Object.freeze({
+					...attachment,
+					laneState: Object.freeze({ seq: committed.seqs[0], value: structuredClone(nextLaneState) }),
+					pendingEntries: new ImmutableMap(pendingEntries),
+				}),
+			});
 		});
 		this.#mutationLine = operation.then(
 			() => undefined,
@@ -958,7 +1145,7 @@ export class StoredSession implements Session {
 			mainLeaf,
 			runOperation,
 			runState,
-			...(await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState)),
+			...(await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState)),
 		});
 	}
 
@@ -1045,7 +1232,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
 				state = decodeRunStateRegister(stateCandidate, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, state);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, state);
 			const phase = state?.value.phase;
 			const current =
 				configuration.seq === transition.expectedConfigurationSeq &&
@@ -1157,7 +1344,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
 				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -1278,7 +1465,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(meta, currentOperationId);
 				runState = decodeRunStateRegister(state, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -1475,7 +1662,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(meta, currentOperationId);
 				runState = decodeRunStateRegister(state, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -1561,7 +1748,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
 				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -1788,7 +1975,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(meta, currentOperationId);
 				runState = decodeRunStateRegister(state, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -2049,7 +2236,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(meta, currentOperationId);
 				runState = decodeRunStateRegister(state, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -2299,7 +2486,7 @@ export class StoredSession implements Session {
 				runOperation = decodeRunOperationRegister(metadataCandidate, currentOperationId);
 				runState = decodeRunStateRegister(stateCandidate, currentOperationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -2308,11 +2495,7 @@ export class StoredSession implements Session {
 				runState,
 				...hydrated,
 			});
-			if (
-				laneState.seq !== transition.expectedLaneStateSeq ||
-				currentOperationId !== transition.operationId ||
-				runState?.seq !== transition.expectedOperationStateSeq
-			)
+			if (currentOperationId !== transition.operationId || runState?.seq !== transition.expectedOperationStateSeq)
 				return Object.freeze({ status: "obsolete" as const, attachment });
 			if (!runOperation || !runState)
 				throw new SessionError("corruption", "Validated finish authority changed inside the mutation line");
@@ -2481,6 +2664,7 @@ export class StoredSession implements Session {
 					laneState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextLaneState) }),
 					mainLeaf,
 					entries: hydrated.entries,
+					pendingEntries: hydrated.pendingEntries,
 					usageRows: hydrated.usageRows,
 					toolArguments: new Map(),
 				}),
@@ -2523,7 +2707,13 @@ export class StoredSession implements Session {
 				currentRunOperation = decodeRunOperationRegister(metadataCandidate, operationId);
 				currentRunState = decodeRunStateRegister(stateCandidate, operationId);
 			}
-			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, currentRunOperation, currentRunState);
+			const hydrated = await hydrateCurrentState(
+				this.#storage,
+				mainLeaf,
+				laneState,
+				currentRunOperation,
+				currentRunState,
+			);
 			const attachment = Object.freeze({
 				laneConfiguration: configuration,
 				laneState,
@@ -2537,7 +2727,6 @@ export class StoredSession implements Session {
 				configuration.value.model.modelId === transition.expectedModelId;
 			if (
 				configuration.seq !== transition.expectedConfigurationSeq ||
-				laneState.seq !== transition.expectedLaneStateSeq ||
 				mainLeaf.seq !== transition.expectedLeafSeq ||
 				!expectedIdentity
 			)
@@ -2547,8 +2736,10 @@ export class StoredSession implements Session {
 
 			const operationId = this.idGenerator.next();
 			const entryIds = transition.messages.map(() => this.idGenerator.next());
+			const capturedIds = [...laneState.value.pendingNextRun];
 			const candidates = [operationId, ...entryIds];
-			if (new Set(candidates).size !== candidates.length)
+			const reservedIds = new Set(capturedIds);
+			if (new Set(candidates).size !== candidates.length || candidates.some((id) => reservedIds.has(id)))
 				throw new SessionError("storage", "Generated prompt acceptance IDs are not unique");
 			const [occupiedEntries, occupiedUsageRows, ...occupiedRegisters] = await Promise.all([
 				this.#storage.getEntries(candidates),
@@ -2556,6 +2747,7 @@ export class StoredSession implements Session {
 				...candidates.flatMap((id) => [
 					this.#storage.getRegister("op.meta", id),
 					this.#storage.getRegister("op.state", id),
+					this.#storage.getRegister("pending.entry", id),
 				]),
 			]);
 			if (occupiedEntries.size > 0 || occupiedUsageRows.size > 0 || occupiedRegisters.some(Boolean))
@@ -2581,22 +2773,39 @@ export class StoredSession implements Session {
 					kind: "checkpoint",
 					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
 					triggerEntryId: entryIds.at(-1)!,
+					...(capturedIds.length === 0 ? {} : { skipInboxOnce: true as const }),
 				},
 				inbox: { steer: [], followUp: [], writes: [] },
 				latestAssistantEntryId: null,
 			};
+			const capturedWrites = capturedIds.map((id, index) => ({
+				kind: "entry" as const,
+				entry: {
+					id,
+					parentId: index === 0 ? mainLeaf.value : capturedIds[index - 1],
+					type: "message" as const,
+					payload: encodeMessage(hydrated.pendingEntries.get(id)!.payload),
+				},
+			}));
 			const writes = transition.messages.map((message, index) => ({
 				kind: "entry" as const,
 				entry: {
 					id: entryIds[index],
-					parentId: index === 0 ? mainLeaf.value : entryIds[index - 1],
+					parentId: index === 0 ? (capturedIds.at(-1) ?? mainLeaf.value) : entryIds[index - 1],
 					type: "message" as const,
 					payload: encodeMessage(message),
 				},
 			}));
 			const committed = await this.#storage.commit({
 				writes: [
+					...capturedWrites,
 					...writes,
+					...capturedIds.map((key) => ({
+						kind: "register" as const,
+						op: "delete" as const,
+						namespace: "pending.entry",
+						key,
+					})),
 					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: entryIds.at(-1)! },
 					{
 						kind: "register",
@@ -2617,36 +2826,57 @@ export class StoredSession implements Session {
 						op: "set",
 						namespace: STATE_NAMESPACE,
 						key: MAIN,
-						value: { currentOperationId: operationId, pendingNextRun: [] },
+						value: {
+							currentOperationId: operationId,
+							pendingNextRun: laneState.value.pendingNextRun.slice(capturedIds.length),
+						},
 					},
 				],
 			});
 			const entries = new Map(hydrated.entries);
+			for (let index = 0; index < capturedIds.length; index++) {
+				const id = capturedIds[index];
+				entries.set(
+					id,
+					Object.freeze({
+						id,
+						parentId: index === 0 ? mainLeaf.value : capturedIds[index - 1],
+						seq: committed.seqs[index],
+						timestamp: committed.timestamp,
+						type: "message" as const,
+						message: structuredClone(hydrated.pendingEntries.get(id)!.payload),
+					}),
+				);
+			}
 			for (let index = 0; index < transition.messages.length; index++)
 				entries.set(
 					entryIds[index],
 					Object.freeze({
 						id: entryIds[index],
-						parentId: index === 0 ? mainLeaf.value : entryIds[index - 1],
-						seq: committed.seqs[index],
+						parentId: index === 0 ? (capturedIds.at(-1) ?? mainLeaf.value) : entryIds[index - 1],
+						seq: committed.seqs[capturedIds.length + index],
 						timestamp: committed.timestamp,
 						type: "message" as const,
 						message: structuredClone(transition.messages[index]),
 					}),
 				);
-			const offset = transition.messages.length;
+			const offset = capturedIds.length + transition.messages.length + capturedIds.length;
 			return Object.freeze({
 				status: "committed" as const,
 				attachment: Object.freeze({
 					laneConfiguration: configuration,
 					laneState: Object.freeze({
 						seq: committed.seqs[offset + 3],
-						value: { currentOperationId: operationId, pendingNextRun: [] },
+						value: {
+							currentOperationId: operationId,
+							pendingNextRun: laneState.value.pendingNextRun.slice(capturedIds.length),
+						},
 					}),
 					mainLeaf: Object.freeze({ seq: committed.seqs[offset], value: entryIds.at(-1)! }),
 					runOperation: Object.freeze({ seq: committed.seqs[offset + 1], value: structuredClone(runOperation) }),
 					runState: Object.freeze({ seq: committed.seqs[offset + 2], value: structuredClone(runState) }),
 					entries,
+					pendingEntries: new ImmutableMap<string, PendingMessageEntry>(),
 					usageRows: hydrated.usageRows,
 					toolArguments: hydrated.toolArguments,
 				}),

@@ -108,6 +108,7 @@ function attachment(
 		entries: new Map(
 			materialized ? [[responseEntryId, { marker: true }]] : [],
 		) as unknown as RuntimeAttachment["entries"],
+		pendingEntries: new Map(),
 		usageRows: new Map(
 			materialized ? [[usageId, { marker: true }]] : [],
 		) as unknown as RuntimeAttachment["usageRows"],

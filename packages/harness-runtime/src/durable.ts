@@ -270,7 +270,8 @@ export function decodeLaneState(value: unknown): LaneState {
 	const state = object(value, ["currentOperationId", "pendingNextRun"], "lane state");
 	uuidOrNull(state.currentOperationId, "currentOperationId");
 	strings(state.pendingNextRun, "pendingNextRun", true);
-	if (state.pendingNextRun.length !== 0) fail("Phase 1 pendingNextRun must be empty");
+	if (new Set(state.pendingNextRun).size !== state.pendingNextRun.length)
+		fail("pendingNextRun must not contain duplicates");
 	return state as unknown as LaneState;
 }
 
@@ -513,8 +514,10 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				"checkpoint",
 			);
 			uuid(checkpoint.triggerEntryId, "checkpoint triggerEntryId");
-			if (checkpoint.thresholdCheckedTriggerEntryId !== undefined || checkpoint.skipInboxOnce !== undefined)
-				fail("Phase 1 checkpoint threshold and skip fields must be absent");
+			if (checkpoint.thresholdCheckedTriggerEntryId !== undefined)
+				fail("Phase 1 checkpoint threshold field must be absent");
+			if (checkpoint.skipInboxOnce !== undefined && checkpoint.skipInboxOnce !== true)
+				fail("checkpoint skipInboxOnce must be true when present");
 			const continuation = semanticObject(checkpoint.continuation, "checkpoint continuation");
 			if (continuation.kind === "need_assistant") {
 				if (object(continuation, ["kind", "overflowRecoveryUsed"], "need_assistant").overflowRecoveryUsed !== false)
