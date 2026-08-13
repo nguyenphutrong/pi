@@ -2,7 +2,28 @@
 
 ## Current status
 
-No active blocker. D-033 passed corrected independent review; private SQLite adapter/schema implementation is next.
+No active blocker. B-012 option 1 was implemented in `2cf987b40` and passed independent final review; the ordered SQLite transaction engine is next.
+
+## B-012 — Confirm the exact canonical SQLite DDL validation approach
+
+- Date: 2026-08-13
+- Phase: 3
+- Work item: 3.3a — private SQLite adapter and canonical schema
+- Trigger: two independent review-agent rejections for the same exact-schema validation boundary
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; recorded in D-034 and implemented by `2cf987b40` after independent final review PASS
+
+### Context
+
+The first review rejected schema reopen validation that compared only table/index/trigger names. The rework added durable-object inventory and canonical SQL validation, but the second review correctly found that testing whether an object's normalized SQL was a substring of the full schema could still accept a table missing trailing `WITHOUT ROWID`.
+
+The current uncommitted rework derives one exact normalized DDL fingerprint for every canonical `(type, name)` pair from the executable schema and compares each reopened `sqlite_schema.sql` value by equality. Regressions now cover an extra view, a same-name index with changed columns, and a same-name canonical table missing `WITHOUT ROWID`. The complete package passes 17/17 tests; the schema and adapter subset passes 15/15. `npm run check` and `git diff --check` pass. The first post-decision review found no implementation defect and rejected only this stale checkpoint, which is now corrected.
+
+### Decision
+
+1. **Selected:** approve the current exact `(type, name) → normalized DDL` map, run a fresh independent review, and commit only if it passes.
+2. Replace the derived exact map with 18 separately declared DDL constants before review. This makes comparisons visibly direct but duplicates and fragments the executable schema.
+3. Validate only object inventory and trust `user_version` for definitions. This is smaller but accepts malformed current-version schemas and repeats the rejected behavior.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

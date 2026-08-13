@@ -953,3 +953,26 @@ Branch scans materialize and validate the complete root-to-start closure before 
 Explicit repair is the sole parent-walking path. Under a valid lease and one transaction it inventories entries in ascending sequence, validates detached structural envelopes and that each parent has a lower entry sequence, deletes branch rows then metadata, and replays every entry through the ordinary projection using the same segment identity and compaction rules. It validates every rebuilt chain before commit and rolls back to the prior complete cache on failure. Repair never infers deleted register history: gaps are legal because superseded/deleted registers leave no rows. It requires only safe unique current sequences below `next_seq`; no log or history fold is introduced.
 
 Focused gates cover exact schema/triggers, `BEGIN IMMEDIATE`, ordered references, shared ids, stats and sequence rollback, caller-error reuse, branch candidate agreement, nested compaction/base chains, zero-copy divergence, Memory-equivalent query ordering, query plans, deterministic repair, leases/heartbeat/close/fault precedence, reopen, and process crash. The final corrected independent design review reports PASS with no §6 escalation.
+
+## D-034 — Validate current SQLite schemas against exact canonical DDL
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: confirmed by human after B-012 escalation
+- References: D-033; `packages/agent/docs/harness-v3.md` §§1.7, 7, 8 slice 14, 9.3
+
+### Options
+
+1. Derive one exact normalized DDL fingerprint for every canonical `(type, name)` pair from the executable schema and require equality on reopen.
+2. Duplicate the schema as 18 separately declared canonical DDL constants.
+3. Validate only object names and trust `user_version` for definitions.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Names and `user_version` do not prove that a current-version object still has its canonical constraints, indexes, `WITHOUT ROWID`, or trigger body. Substring comparison is also insufficient because a damaged table missing a trailing clause can remain a prefix of the canonical definition. Exact per-object equality closes both gaps while retaining one executable schema source of truth. Normalization ignores whitespace and a trailing statement terminator only; any other textual definition drift is rejected. Regressions cover extra objects, a changed same-name index, and a same-name table missing `WITHOUT ROWID`.
+
+Commit `2cf987b40` implements D-034 together with the Phase 3.3a private SQLite adapter/schema foundation. The complete package passes 17/17 tests, `npm run check` and `git diff --check` pass, and the final independent review reports PASS.
