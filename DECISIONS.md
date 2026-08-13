@@ -784,3 +784,38 @@ Tier A covers real success, tool/error normalization, `after_tool` patches and f
 Replay/interrupted recovery, public abort and cancelled-output reconciliation, parallel tools, full hooks/events, and genuine-length explanatory results remain later Phase 2 items. This changes no durable schema, Storage contract, public Harness API, `pi-ai`, provider adapter, legacy agent package, or forbidden record/history surface. The corrected independent design review reports PASS and requires no §6 escalation.
 
 Commit `711f5d97c` implements the complete live sequential-effect boundary. The planner exposes four stable process-local actions; RuntimeShell retains one context-bound prepared lease through registered execution and source-ordered finalization; Session semantically settles against the latest state in one result/leaf/optional-usage/cleanup/state transaction. Real result messages snapshot finalized usage while a fresh commit-time row records the same charge, and completed durable calls drop pending-only replay data. Harness runtime passes 341/341, `npm run check` and `git diff --check` pass, and the corrected independent final review reports PASS after close/fault and real-result reopen evidence closed its two test-only findings.
+
+## D-029 — Recover restored tool effects from persisted arguments
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: approved by corrected independent design review; implementation pending
+- References: D-024–D-028; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.8, 3.13, 4.1–4.7, 5.7, 9.1–9.3
+
+### Options
+
+1. Hydrate exact persisted tool arguments, replay through the existing process-local effect stages only when both durable and current declarations are `safe`, and otherwise reuse ordinary tool settlement for a synthetic interruption.
+2. Synthetically interrupt every restored `effect_pending` tool call.
+3. Return the call to `planned`, rerun clearance, or compare newly persisted implementation/schema revisions before replay.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The planner exposes one JSON-safe `recover_tool_effect` action carrying operation, assistant, turn, source-index, and reserved-result identities. It selects that action only for the first unfinished durable `effect_pending` call with no matching process-local effect. Existing local `planned`, `running`, `raw`, and `finalized` states continue through D-028's `dispatch → await → finalize → settle` stages.
+
+Current-state hydration point-reads and validates each deterministic `op.tool_args/{operationId}:{turnId}:{sourceIndex}` register as before, but now retains a detached read-only argument map in the internal runtime attachment. Recovery and settlement reuse that hydrated value; they do not scan, reread history, or rerun argument preparation. This is an internal bounded-hydration addition, not a durable schema, Storage, or public Harness API change.
+
+The persisted declaration is the pending call's `replay` value. The current declaration is only the captured-active-name membership and exact source-name lookup in the current runtime registry, with omitted replay normalized to `never`. There is no function, schema, hash, object-identity, or revision comparison because no such identity is durable. A pending source absent from the batch's captured `activeToolNames` is corruption: D-027 clearance could only have persisted an intent for an active resolved tool. After that membership check, a missing or non-safe current definition is an ordinary non-replay case, not `MissingIdentities`, because restored `effect_pending` follows unknown-effect recovery and synthetic settlement needs no tool identity.
+
+When both declarations are `safe`, RuntimeShell resolves `toolContext`, binds the current definition, and constructs `PreparedToolCall` directly from the durable source call and exact persisted effective arguments. It does not invoke `prepareArguments`, schema validation, `prepareToolCall`, or `beforeToolCall`. The local plan is published only after all recovery checks and context binding succeed; dispatch, execution, source-ordered `afterToolCall`, optional replay usage, and real settlement then reuse D-028 unchanged. A `toolContext` throw or rejection remains the trusted runtime-contract fault established by D-027, writes nothing, and leaves the durable call pending.
+
+Every non-replay case atomically settles the reserved result through `Session.settleToolCall` with exactly `content:[{type:"text",text:"Tool outcome unknown after interruption"}]`, `details:{}`, `isError:true`, and durable `terminate:false`. It runs no tool or hook, allocates no usage id, writes no usage row, and adds no tool names. The ordinary semantic settlement reload verifies the same operation, batch, first-unfinished position, source, result reservation, completed-prefix parent and leaf, and hydrated exact arguments before committing the result entry, leaf, final sorted argument cleanup when applicable, and latest total state. It then continues in source order or reaches the normal checkpoint.
+
+Close before local publication or commit writes nothing. Close after replay-plan publication but before dispatch loses only process-local state, so reopen applies the same policy again. Close during or after an unsettled replay treats its outcome as unknown. An admitted synthetic or real settlement commits completely before close. Stale semantic authority publishes no replay plan or result and discards matching local artifacts; corruption and storage failures fault instead of being normalized to interruption. Public abort and cancelled-output reconciliation remain the next separate item.
+
+Tier A covers the full persisted/current `safe|never|missing` matrix, captured-active-name corruption, exact detached arguments, absent preparation hooks, context faults, exact synthetic payload and optional-field absence, reserved identities and parents, multi-call continuation, final cleanup, and close/fresh-reopen continuation at every recovery/effect/settlement boundary. Tier B proves no clearance write or argument reread during replay, no tool/context lookup for durable `never`, exact effect/hook order for safe replay, and one no-usage synthetic settlement transaction. Tier C covers close, fault, stale authority, and settlement in both orders and compares fresh-reopen recovery with uninterrupted recovery.
+
+Options 2 and 3 are rejected. Option 2 violates the specified safe-replay capability. Option 3 can change effective arguments or rerun `before_tool`, creates an unnecessary durable program-counter state, or requires a new declaration-revision contract not present in the spec. The corrected independent design review reports PASS with no §6 blocker.
