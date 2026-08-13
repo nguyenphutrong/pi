@@ -854,3 +854,30 @@ The aborted terminal transaction runs only after every intended assistant/tool o
 Options 1 and 2 are rejected. Option 1 cannot atomically reconcile an already-running effect or preserve the specified live-result and post-hook race. Option 2 duplicates the existing program counter, diverges from the canonical control shape, and adds a migration without improving recovery. The selected design changes no Storage contract, namespace set, `pi-ai`, provider adapter, public package contract, or forbidden history surface. Queues, deferred cancellation, parallel tools, automatic drive, events, and structural operations remain later ordered work. The corrected independent design review reports PASS with no §6 escalation.
 
 Commit `4fdb212cf` implements the complete boundary with an orthogonal durable cancellation marker, serialized start gates, assistant and tool reconciliation, and defensive terminal cleanup. Crash-cut recovery converges at every implemented boundary; Harness passes 385/385, `npm run check` and `git diff --check` pass, and the corrected independent final review reports PASS.
+
+## D-031 — Compose the canonical manual driver and full Phase 2 acceptance path
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: implemented by `9e04a44c6` after independent implementation and whole-phase reviews
+- References: D-024–D-030; `packages/agent/docs/harness-v3.md` §§3.3, 3.7–3.8, 3.13, 4.1–4.8, 5.1, 9.1–9.3
+
+### Options
+
+1. Add the spec-shaped `runToCompletion(): Promise<void>` as a loop over the canonical one-action interpreter, retaining the private RuntimeShell's acceptance-only `prompt()` behavior.
+2. Add temporary private acceptance, resume, and terminal-result APIs around a second operation driver.
+3. Change `prompt()` to auto-drive and return a final outcome before automatic drive and the public AgentHarness surface are implemented.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+`runToCompletion()` repeatedly invokes `executeAction()` until the planner reports no action. It holds no outer admission reservation, so provider, tool, abort, close, and nested action ordering remain exactly those of the existing interpreter. It adds no automatic mode, durable state, Storage method, public package export, or temporary result contract. Post-crash applications will eventually reconcile through the spec's public `getLastResult()` path; the Phase 2 acceptance gate can inspect the existing durable `lane.lastResult` register without inventing that later API now.
+
+The first composed prompt-to-tool test exposed an invalid recovery assumption: current-state hydration treated the final accepted prompt as the parent of every later assistant response. After tool settlement, the next assistant correctly parents the tool result, while the prior generation trigger is intentionally absent from the replacement checkpoint/tool/failure state. Harness v3 restore validates only entries directly named by current state and never walks history to reconstruct discarded triggers. Hydration therefore no longer compares post-settlement failure, tool-batch, or final-assistant parents to the original prompt. It retains the exact response-parent check while `effect_pending` still directly owns `GenerationContext.triggerEntryId`, plus all prompt-chain, leaf, role, latest-assistant, tool source/result, reservation, and usage checks.
+
+The acceptance suite starts from a real prompt and fixes the exact 16-action uninterrupted sequence through a real sequential tool, durable result, post-tool provider request, final assistant, and terminal cleanup. It closes and reopens fresh handles at all 17 boundaries for both `replay:"safe"` and `replay:"never"`. Assertions distinguish permitted provider uncertainty and safe tool replay from durable duplication, verify the synthetic interrupted result for non-replay, and prove one durable transcript, usage ledger, leaf, `lane.lastResult`, operation/argument cleanup, and idle reopen.
+
+Commit `9e04a44c6` implements the driver, corrects bounded closure validation, and adds the full acceptance matrix. Harness runtime passes 388/388; the complete Phase 2 relevant suites pass 514/514 with 34 recovery scenarios across all 17 cuts; `npm run check` and `git diff --check` pass. Independent implementation review, whole-phase spec review, and Recovery/QA all report PASS. Phase 3 is unblocked.

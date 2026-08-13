@@ -2,19 +2,19 @@
 
 ## Current checkpoint
 
-- Phase: 2 — Durable tools and abort
-- Work item: Phase 2 final acceptance — complete crash matrix
-- Status: D-030 implementation committed by `4fdb212cf` after corrected independent final review PASS
-- Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
+- Phase: 3 — SQLite and production durability
+- Work item: 3.1 — SQLite backend and writer-ownership design
+- Status: Phase 2 completed by `9e04a44c6`; independent whole-phase review and Recovery/QA both PASS
+- Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Audit the whole Phase 2 crash matrix and done bar.
-2. Run an independent whole-phase done-bar review.
-3. Run a separate Recovery/QA gate.
-4. Checkpoint Phase 2 after both gates pass.
-5. Only if Phase 2 passes, start Phase 3 SQLite design and specification reread.
+1. Re-read the Harness v3 SQLite schema, transaction, ownership, recovery, and testing sections.
+2. Audit the current Storage contract, Memory conformance coverage, and package boundaries.
+3. Design `@nguyenphutrong/pi-session-sqlite`, including schema and writer lease/fencing, without changing the approved Storage contract unless the spec makes it unavoidable.
+4. Implement the smallest SQLite backend slice against the shared conformance suite.
+5. Add reopen and process-crash tests before the Phase 3 final gate.
 
 ## Phase order
 
