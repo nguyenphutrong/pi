@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-037 is implemented by `a470d2bb5` after 71/71 package tests and final independent review PASS. Ordinary bounded reads and shared backend conformance are next.
+No active blocker. D-038 passed corrected independent design review in `acb71408b`; ordinary bounded reads and shared seeded test vectors are next.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 
