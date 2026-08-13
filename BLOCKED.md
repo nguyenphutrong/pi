@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-032 passed the corrected independent design gate; Phase 3.2a `StoredSession` rename is next.
+No active blocker. `StoredSession` landed as `7a0447f3b`; exact SQLite core design is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 
