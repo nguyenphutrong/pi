@@ -7,6 +7,9 @@ import {
 	MemorySession,
 	type PrepareAssistantEffectResult,
 	type PrepareAssistantEffectTransition,
+	type RecoverAssistantEffectTransition,
+	type RecoveryTransitionResult,
+	type ReleaseAssistantRetryTransition,
 	type RuntimeAttachment,
 	type RuntimeTransitionResult,
 	type SettleAssistantEffectResult,
@@ -53,6 +56,24 @@ export function settleAssistantEffect(
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.settleAssistantEffect(transition);
+}
+
+export function recoverAssistantEffect(
+	session: Session,
+	transition: RecoverAssistantEffectTransition,
+): Promise<RecoveryTransitionResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.recoverAssistantEffect(transition);
+}
+
+export function releaseAssistantRetry(
+	session: Session,
+	transition: ReleaseAssistantRetryTransition,
+): Promise<RecoveryTransitionResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.releaseAssistantRetry(transition);
 }
 
 export function finishRun(session: Session, transition: FinishRunTransition): Promise<FinishRunResult> {

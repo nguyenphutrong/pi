@@ -50,7 +50,7 @@ function session(storage: Storage): MemorySession {
 	return new MemorySession(metadata(), storage, () => undefined);
 }
 
-type Position = "need_assistant" | "ready" | "effect_pending" | "may_finish";
+type Position = "need_assistant" | "ready" | "effect_pending" | "retry_wait" | "failure_drain" | "may_finish";
 
 function operationFixture(position: Position = "need_assistant", materialized = false) {
 	const operationId = id();
@@ -58,7 +58,7 @@ function operationFixture(position: Position = "need_assistant", materialized = 
 	const prompt = id();
 	const response = id();
 	const usage = id();
-	const finished = position === "may_finish";
+	const finished = position === "may_finish" || position === "failure_drain";
 	const trigger = finished ? response : prompt;
 	const context = {
 		stepId: id(),
@@ -69,31 +69,68 @@ function operationFixture(position: Position = "need_assistant", materialized = 
 		overflowRecoveryUsed: false,
 	};
 	const phase =
-		position === "ready"
-			? { kind: "assistant", generation: { status: "ready", context, nextAttempt: 1 } }
-			: position === "effect_pending"
+		position === "failure_drain"
+			? {
+					kind: "failure_drain",
+					error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+					provenance: { kind: "response", entryId: response },
+				}
+			: position === "retry_wait"
 				? {
 						kind: "assistant",
 						generation: {
-							status: "effect_pending",
-							context,
-							attempt: 1,
-							responseEntryId: response,
-							usageId: usage,
-							intendedOutputLimit: 1,
-							contextWindow: 2,
+							status: "retry_wait",
+							context: { ...context, retryPolicy: { maxAttempts: 3, baseDelayMs: 10 } },
+							nextAttempt: 2,
+							notBefore: 100,
+							errorMessage: "Provider outcome unknown after interruption",
 						},
 					}
-				: {
-						kind: "checkpoint",
-						continuation: finished
-							? { kind: "may_finish", includeFinalAssistant: true }
-							: { kind: "need_assistant", overflowRecoveryUsed: false },
-						triggerEntryId: trigger,
-					};
+				: position === "ready"
+					? { kind: "assistant", generation: { status: "ready", context, nextAttempt: 1 } }
+					: position === "effect_pending"
+						? {
+								kind: "assistant",
+								generation: {
+									status: "effect_pending",
+									context,
+									attempt: 1,
+									responseEntryId: response,
+									usageId: usage,
+									intendedOutputLimit: 1,
+									contextWindow: 2,
+								},
+							}
+						: {
+								kind: "checkpoint",
+								continuation: finished
+									? { kind: "may_finish", includeFinalAssistant: true }
+									: { kind: "need_assistant", overflowRecoveryUsed: false },
+								triggerEntryId: trigger,
+							};
 	const responseWrites: Write[] =
 		finished || (position === "effect_pending" && materialized)
-			? [{ kind: "entry", entry: { id: response, parentId: prompt, type: "message", payload: json(assistant()) } }]
+			? [
+					{
+						kind: "entry",
+						entry: {
+							id: response,
+							parentId: prompt,
+							type: "message",
+							payload: json(
+								position === "failure_drain"
+									? {
+											...assistant("error"),
+											content: [],
+											api: "harness",
+											usage: structuredClone(ZERO_USAGE),
+											errorMessage: "Provider outcome unknown after interruption",
+										}
+									: assistant(),
+							),
+						},
+					},
+				]
 			: [];
 	const usageWrites: Write[] =
 		position === "effect_pending" && materialized
@@ -293,7 +330,7 @@ describe("runtime attachment boundary", () => {
 		await runtimeSession.close();
 	});
 
-	it.each(["need_assistant", "ready", "effect_pending", "may_finish"] as const)(
+	it.each(["need_assistant", "ready", "effect_pending", "retry_wait", "failure_drain", "may_finish"] as const)(
 		"restores the valid %s closure with one unique exact batch per kind and no scans",
 		async (position) => {
 			const fixture = operationFixture(position);
@@ -304,7 +341,7 @@ describe("runtime attachment boundary", () => {
 			const expectedEntries = [
 				fixture.source,
 				fixture.prompt,
-				...(position === "may_finish" ? [fixture.response] : []),
+				...(position === "may_finish" || position === "failure_drain" ? [fixture.response] : []),
 				...(position === "effect_pending" ? [fixture.response, fixture.usage] : []),
 			];
 			expect(entryLookups).toHaveLength(1);
@@ -317,6 +354,112 @@ describe("runtime attachment boundary", () => {
 			await runtimeSession.close();
 		},
 	);
+
+	it("hydrates retry_wait without old reservation ids or lane.lastResult and writes nothing", async () => {
+		const fixture = operationFixture("retry_wait");
+		const instrumented = instrumentStorage(await storageWith(fixture.writes));
+		const reads: string[] = [];
+		const getRegister = instrumented.getRegister.bind(instrumented);
+		instrumented.getRegister = async (namespace, key) => {
+			reads.push(`${namespace}/${key}`);
+			return getRegister(namespace, key);
+		};
+		const entryLookups: string[][] = [];
+		const usageLookups: string[][] = [];
+		const getEntries = instrumented.getEntries.bind(instrumented);
+		const getUsageRows = instrumented.getUsageRows.bind(instrumented);
+		instrumented.getEntries = async (ids) => {
+			entryLookups.push([...ids]);
+			return getEntries(ids);
+		};
+		instrumented.getUsageRows = async (ids) => {
+			usageLookups.push([...ids]);
+			return getUsageRows(ids);
+		};
+		const runtimeSession = session(instrumented);
+		await expect(attachRuntime(runtimeSession, seed())).resolves.toBeDefined();
+		expect(entryLookups.flat()).not.toContain(fixture.response);
+		expect(entryLookups.flat()).not.toContain(fixture.usage);
+		expect(usageLookups).toEqual([[]]);
+		expect(reads).not.toContain("lane.lastResult/main");
+		expect(instrumented.committedTransactions).toEqual([]);
+		await runtimeSession.close();
+	});
+
+	it("accepts the D-025 failure_drain boundary with alternate typed entry-owned identity fields", async () => {
+		const fixture = operationFixture("failure_drain");
+		const writes = fixture.writes.map((write): Write => {
+			if (write.kind !== "entry" || write.entry.id !== fixture.response) return write;
+			return {
+				...write,
+				entry: {
+					...write.entry,
+					payload: {
+						...(write.entry.payload as Record<string, JsonValue>),
+						provider: "alternate-provider",
+						model: "alternate-model",
+						timestamp: 1234.5,
+					},
+				},
+			};
+		});
+		await expect(validateMainLane(await storageWith(writes))).resolves.toBeUndefined();
+	});
+
+	it.each([
+		"missing response",
+		"wrong parent",
+		"wrong role",
+		"wrong stop reason",
+		"wrong provenance",
+		"wrong phase error code",
+		"wrong phase error message",
+		"wrong response error message",
+		"missing response error message",
+		"wrong response api",
+		"non-empty response content",
+		"nonzero response usage",
+		"optional response usage field",
+		"optional response field",
+	])("rejects failure_drain corruption: %s", async (kind) => {
+		const fixture = operationFixture("failure_drain");
+		const writes = fixture.writes
+			.filter(
+				(write) => kind !== "missing response" || write.kind !== "entry" || write.entry.id !== fixture.response,
+			)
+			.map((write): Write => {
+				if (write.kind === "entry" && write.entry.id === fixture.response) {
+					if (kind === "wrong parent") return { ...write, entry: { ...write.entry, parentId: fixture.source } };
+					if (kind === "wrong role") return { ...write, entry: { ...write.entry, payload: json(user("wrong")) } };
+					if (kind === "wrong stop reason")
+						return { ...write, entry: { ...write.entry, payload: json(assistant("stop")) } };
+					const payload = structuredClone(write.entry.payload) as Record<string, JsonValue>;
+					if (kind === "wrong response error message") payload.errorMessage = "different";
+					if (kind === "missing response error message") delete payload.errorMessage;
+					if (kind === "wrong response api") payload.api = "anthropic-messages";
+					if (kind === "non-empty response content") payload.content = [{ type: "text", text: "unexpected" }];
+					if (kind === "nonzero response usage") (payload.usage as Record<string, JsonValue>).input = 1;
+					if (kind === "optional response usage field") (payload.usage as Record<string, JsonValue>).reasoning = 0;
+					if (kind === "optional response field") payload.responseId = "response-1";
+					return { ...write, entry: { ...write.entry, payload } };
+				}
+				if (write.kind === "register" && write.op === "set" && write.namespace === "op.state") {
+					const value = structuredClone(write.value) as Record<string, JsonValue>;
+					const phase = value.phase as Record<string, JsonValue>;
+					if (kind === "wrong provenance") {
+						phase.provenance = { kind: "response", entryId: fixture.prompt };
+						value.latestAssistantEntryId = fixture.prompt;
+					}
+					if (kind === "wrong phase error code")
+						(phase.error as Record<string, JsonValue>).code = "provider_error";
+					if (kind === "wrong phase error message")
+						(phase.error as Record<string, JsonValue>).message = "different";
+					return { ...write, value };
+				}
+				return write;
+			});
+		await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+	});
 });
 
 describe("bounded Phase 1 closure validation", () => {

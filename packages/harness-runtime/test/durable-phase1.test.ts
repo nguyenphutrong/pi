@@ -77,6 +77,21 @@ const phases = {
 			contextWindow: 128_000,
 		},
 	},
+	retryWait: {
+		kind: "assistant",
+		generation: {
+			status: "retry_wait",
+			context: context(),
+			nextAttempt: 2,
+			notBefore: 123,
+			errorMessage: "Provider outcome unknown after interruption",
+		},
+	},
+	failureDrain: {
+		kind: "failure_drain",
+		error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+		provenance: { kind: "response", entryId: RESPONSE_ID },
+	},
 	mayFinish: {
 		kind: "checkpoint",
 		continuation: { kind: "may_finish", includeFinalAssistant: true },
@@ -97,11 +112,58 @@ describe("Phase 1 durable codecs", () => {
 		["checkpoint need_assistant", phases.needAssistant, null],
 		["assistant ready", phases.ready, null],
 		["assistant effect_pending", phases.effectPending, null],
+		["assistant retry_wait", phases.retryWait, null],
+		["failure drain", phases.failureDrain, RESPONSE_ID],
 		["checkpoint may_finish", phases.mayFinish, TRIGGER_ID],
 	] as const)("accepts the exact canonical %s fixture", (_label, phase, latest) => {
 		const decoded = decodeState(common(phase, latest));
 		expect(decoded).toEqual({ seq: 17, value: common(phase, latest) });
 		expect(decoded.value).not.toBe(common(phase, latest));
+	});
+
+	it.each([1, 2, 3])("accepts ready and effect_pending attempt %i through the captured cap", (attempt) => {
+		expect(
+			decodeState(common({ ...phases.ready, generation: { ...phases.ready.generation, nextAttempt: attempt } }))
+				.value,
+		).toBeDefined();
+		expect(
+			decodeState(common({ ...phases.effectPending, generation: { ...phases.effectPending.generation, attempt } }))
+				.value,
+		).toBeDefined();
+	});
+
+	it.each([0, 4])("rejects ready and effect_pending attempt %i outside the captured cap", (attempt) => {
+		expectCorruption(() =>
+			decodeState(common({ ...phases.ready, generation: { ...phases.ready.generation, nextAttempt: attempt } })),
+		);
+		expectCorruption(() =>
+			decodeState(common({ ...phases.effectPending, generation: { ...phases.effectPending.generation, attempt } })),
+		);
+	});
+
+	it("validates the exact retry_wait and failure_drain shapes", () => {
+		for (const nextAttempt of [2, 3])
+			expect(
+				decodeState(common({ ...phases.retryWait, generation: { ...phases.retryWait.generation, nextAttempt } }))
+					.value,
+			).toBeDefined();
+		for (const generation of [
+			{ ...phases.retryWait.generation, nextAttempt: 1 },
+			{ ...phases.retryWait.generation, nextAttempt: 4 },
+			{ ...phases.retryWait.generation, notBefore: -1 },
+			{ ...phases.retryWait.generation, notBefore: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...phases.retryWait.generation, errorMessage: 1 },
+			{ ...phases.retryWait.generation, errorMessage: "different" },
+			{ ...phases.retryWait.generation, extra: true },
+		])
+			expectCorruption(() => decodeState(common({ kind: "assistant", generation })));
+		for (const phase of [
+			{ ...phases.failureDrain, extra: true },
+			{ ...phases.failureDrain, error: { ...phases.failureDrain.error, extra: true } },
+			{ ...phases.failureDrain, provenance: { kind: "structural", entryId: RESPONSE_ID } },
+			{ ...phases.failureDrain, provenance: { kind: "response", entryId: id() } },
+		])
+			expectCorruption(() => decodeState(common(phase, RESPONSE_ID)));
 	});
 
 	it("preserves canonical register identity, sequence, and common run fields", () => {
@@ -210,8 +272,6 @@ describe("Phase 1 durable codecs", () => {
 				{ ...phases.mayFinish, continuation: { kind: "may_finish", includeFinalAssistant: false } },
 				TRIGGER_ID,
 			),
-			common({ ...phases.ready, generation: { ...phases.ready.generation, nextAttempt: 2 } }),
-			common({ ...phases.effectPending, generation: { ...phases.effectPending.generation, attempt: 2 } }),
 			common({
 				...phases.ready,
 				generation: { ...phases.ready.generation, context: { ...context(), overflowRecoveryUsed: true } },

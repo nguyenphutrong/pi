@@ -20,14 +20,20 @@ export interface LaneState {
 	pendingNextRun: string[];
 }
 
-export interface LaneLastResult {
+export interface OperationError {
+	code: string;
+	message: string;
+}
+
+export type LaneLastResult = {
 	operationId: string;
 	kind: "run";
-	outcome: "completed";
 	leafId: string;
 	finalAssistantEntryId: string;
-	runCompletion: "assistant";
-}
+} & (
+	| { outcome: "completed"; runCompletion: "assistant" }
+	| { outcome: "failed"; error: OperationError; runCompletion?: never }
+);
 
 export interface RunOperation {
 	operationId: string;
@@ -82,6 +88,13 @@ type AssistantPhase = {
 	generation:
 		| { status: "ready"; context: GenerationContext; nextAttempt: number }
 		| {
+				status: "retry_wait";
+				context: GenerationContext;
+				nextAttempt: number;
+				notBefore: number;
+				errorMessage: string;
+		  }
+		| {
 				status: "effect_pending";
 				context: GenerationContext;
 				attempt: number;
@@ -90,6 +103,12 @@ type AssistantPhase = {
 				intendedOutputLimit: number;
 				contextWindow: number;
 		  };
+};
+
+type FailureDrainPhase = {
+	kind: "failure_drain";
+	error: OperationError;
+	provenance: { kind: "response"; entryId: string };
 };
 
 export interface RunState {
@@ -101,7 +120,7 @@ export interface RunState {
 		followUpMode: "all" | "one-at-a-time";
 		toolExecution: "sequential" | "parallel";
 	};
-	phase: CheckpointPhase | AssistantPhase;
+	phase: CheckpointPhase | AssistantPhase | FailureDrainPhase;
 	inbox: { steer: []; followUp: []; writes: [] };
 	latestAssistantEntryId: string | null;
 }
@@ -235,19 +254,36 @@ export function decodeLaneState(value: unknown): LaneState {
 }
 
 export function decodeLaneLastResult(value: unknown): LaneLastResult {
-	const result = object(
-		value,
-		["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
-		"lane last result",
-	);
+	const candidate = semanticObject(value, "lane last result");
+	const result =
+		candidate.outcome === "completed"
+			? object(
+					candidate,
+					["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
+					"lane last result",
+				)
+			: object(
+					candidate,
+					["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "error"],
+					"lane last result",
+				);
 	uuid(result.operationId, "lane last result operationId");
 	uuid(result.leafId, "lane last result leafId");
 	uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
-	if (result.kind !== "run" || result.outcome !== "completed" || result.runCompletion !== "assistant")
-		fail("Unsupported Phase 1 lane last result");
+	if (result.kind !== "run") fail("Unsupported lane last result kind");
+	if (result.outcome === "completed") {
+		if (result.runCompletion !== "assistant") fail("Unsupported completed lane last result");
+	} else if (result.outcome === "failed") decodeOperationError(result.error, "lane last result error");
+	else fail("Unsupported lane last result outcome");
 	if (result.leafId !== result.finalAssistantEntryId)
 		fail("Completed Phase 1 lane last result leaf must equal its final assistant");
 	return result as unknown as LaneLastResult;
+}
+
+function decodeOperationError(value: unknown, name: string): OperationError {
+	const error = object(value, ["code", "message"], name);
+	if (typeof error.code !== "string" || typeof error.message !== "string") fail(`${name} fields must be strings`);
+	return error as unknown as OperationError;
 }
 
 export function encodeLaneLastResult(value: LaneLastResult): JsonValue {
@@ -444,8 +480,22 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 			const generation = semanticObject(assistant.generation, "assistant generation");
 			if (generation.status === "ready") {
 				const ready = object(generation, ["status", "context", "nextAttempt"], "ready generation");
-				generationContext(ready.context);
-				if (ready.nextAttempt !== 1) fail("Phase 1 nextAttempt must be 1");
+				const context = generationContext(ready.context);
+				safe(ready.nextAttempt, "nextAttempt", 1);
+				if (ready.nextAttempt > context.retryPolicy.maxAttempts) fail("nextAttempt exceeds maxAttempts");
+				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
+			} else if (generation.status === "retry_wait") {
+				const wait = object(
+					generation,
+					["status", "context", "nextAttempt", "notBefore", "errorMessage"],
+					"retry wait",
+				);
+				const context = generationContext(wait.context);
+				safe(wait.nextAttempt, "nextAttempt", 2);
+				if (wait.nextAttempt > context.retryPolicy.maxAttempts) fail("nextAttempt exceeds maxAttempts");
+				safe(wait.notBefore, "notBefore");
+				if (wait.errorMessage !== "Provider outcome unknown after interruption")
+					fail("Unsupported retry wait errorMessage");
 				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
 			} else if (generation.status === "effect_pending") {
 				const pending = object(
@@ -454,7 +504,8 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 					"pending generation",
 				);
 				const context = generationContext(pending.context);
-				if (pending.attempt !== 1) fail("Phase 1 attempt must be 1");
+				safe(pending.attempt, "attempt", 1);
+				if (pending.attempt > context.retryPolicy.maxAttempts) fail("attempt exceeds maxAttempts");
 				uuid(pending.responseEntryId, "responseEntryId");
 				uuid(pending.usageId, "usageId");
 				const reserved = [pending.responseEntryId, pending.usageId];
@@ -467,6 +518,14 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				safe(pending.contextWindow, "contextWindow");
 				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
 			} else fail("Unsupported assistant generation state");
+		} else if (phase.kind === "failure_drain") {
+			const drain = object(phase, ["kind", "error", "provenance"], "failure drain");
+			decodeOperationError(drain.error, "failure drain error");
+			const provenance = object(drain.provenance, ["kind", "entryId"], "failure provenance");
+			if (provenance.kind !== "response") fail("Unsupported failure provenance");
+			uuid(provenance.entryId, "failure response entryId");
+			if (state.latestAssistantEntryId !== provenance.entryId)
+				fail("Failure response must equal latest assistant entry");
 		} else fail("Unsupported run phase");
 		return state as unknown as RunState;
 	});

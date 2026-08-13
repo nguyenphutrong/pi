@@ -15,6 +15,8 @@ import {
 	attachRuntime,
 	finishRun,
 	prepareAssistantEffect,
+	recoverAssistantEffect,
+	releaseAssistantRetry,
 	settleAssistantEffect,
 	startAssistantStep,
 } from "./runtime-port.ts";
@@ -76,6 +78,7 @@ export class RuntimeShell {
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
 	readonly #assistantEffects = new Map<string, AssistantEffectState>();
+	readonly #retryElapsed = new Set<string>();
 	#current: RuntimeAttachment;
 	#sealed = false;
 	#fault: RuntimeShellError | undefined;
@@ -100,6 +103,8 @@ export class RuntimeShell {
 		return planAction(this.#current, {
 			settingsRevision: this.#settings.peek().revision,
 			assistantEffectStatus: (key) => this.#assistantEffects.get(key)?.status,
+			retryElapsed: (operationId, stepId, nextAttempt, notBefore) =>
+				this.#retryElapsed.has(`${operationId}:${stepId}:${nextAttempt}:${notBefore}`),
 		});
 	}
 
@@ -152,6 +157,72 @@ export class RuntimeShell {
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "wait_assistant_retry") {
+				const info = action.info;
+				let remaining = Math.max(0, info.notBefore - Date.now());
+				while (remaining > 0) {
+					const delay = Math.min(remaining, 2_147_483_647);
+					let timer: ReturnType<typeof setTimeout> | undefined;
+					try {
+						await Promise.race([
+							new Promise<void>((resolve) => {
+								timer = setTimeout(resolve, delay);
+							}),
+							this.#shutdownNotice,
+						]);
+					} finally {
+						if (timer !== undefined) clearTimeout(timer);
+					}
+					if (this.#fault) throw this.#fault;
+					if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+					remaining = Math.max(0, info.notBefore - Date.now());
+				}
+				if (this.#fault) throw this.#fault;
+				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+				this.#retryElapsed.add(`${info.operationId}:${info.stepId}:${info.nextAttempt}:${info.notBefore}`);
+				return info;
+			}
+			if (action.info.kind === "release_assistant_retry") {
+				const info = action.info;
+				const proof = `${info.operationId}:${info.stepId}:${info.nextAttempt}:${info.notBefore}`;
+				const result = await releaseAssistantRetry(this.#session, {
+					operationId: info.operationId,
+					stepId: info.stepId,
+					nextAttempt: info.nextAttempt,
+					notBefore: info.notBefore,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLaneStateSeq: action.expected.laneStateSeq,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#current = result.attachment;
+				this.#retryElapsed.delete(proof);
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Assistant retry wait is no longer authoritative");
+				return info;
+			}
+			if (action.info.kind === "recover_assistant_effect") {
+				const info = action.info;
+				const phase = this.#current.runState?.value.phase;
+				const generation = phase?.kind === "assistant" ? phase.generation : undefined;
+				if (generation?.status !== "effect_pending")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer recoverable");
+				const result = await recoverAssistantEffect(this.#session, {
+					operationId: info.operationId,
+					stepId: info.stepId,
+					attempt: info.attempt,
+					responseEntryId: generation.responseEntryId,
+					usageId: generation.usageId,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLaneStateSeq: action.expected.laneStateSeq,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#current = result.attachment;
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
+				return info;
+			}
 			if (action.info.kind === "dispatch_assistant_effect") {
 				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
 				const effectKey = action.info.effectKey;
@@ -248,7 +319,7 @@ export class RuntimeShell {
 					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
 				return action.info;
 			}
-			if (action.info.kind === "finish_run") {
+			if (action.info.kind === "finish_run" || action.info.kind === "finish_failed_run") {
 				const result = await finishRun(this.#session, {
 					operationId: action.info.operationId,
 					expectedOperationStateSeq: action.expected.operationStateSeq,
@@ -417,6 +488,7 @@ export class RuntimeShell {
 		this.#closePromise = this.#admissionLine.then(() => {
 			this.#abortRunningEffects();
 			this.#assistantEffects.clear();
+			this.#retryElapsed.clear();
 			return this.#session.close();
 		});
 		return this.#closePromise;

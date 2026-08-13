@@ -1,12 +1,15 @@
 import type { RetryPolicy } from "@earendil-works/pi-ai";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { RunState, StreamOptions } from "../src/durable.ts";
 import { assistantEffectKey, planAction } from "../src/planner.ts";
 import { RuntimeSettingsOwner } from "../src/runtime-settings.ts";
 import type { RuntimeAttachment } from "../src/session.ts";
 import { id } from "./fixtures.ts";
 
-function attachment(position: "idle" | "need" | "ready" | "pending" | "finish", materialized = false) {
+function attachment(
+	position: "idle" | "need" | "ready" | "pending" | "wait" | "failure" | "finish",
+	materialized = false,
+) {
 	const operationId = id();
 	const triggerEntryId = id();
 	const stepId = id();
@@ -25,29 +28,46 @@ function attachment(position: "idle" | "need" | "ready" | "pending" | "finish", 
 		overflowRecoveryUsed: false,
 	};
 	const phase: RunState["phase"] =
-		position === "ready"
-			? { kind: "assistant", generation: { status: "ready", context, nextAttempt: 1 } }
-			: position === "pending"
+		position === "failure"
+			? {
+					kind: "failure_drain",
+					error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+					provenance: { kind: "response", entryId: triggerEntryId },
+				}
+			: position === "wait"
 				? {
 						kind: "assistant",
 						generation: {
-							status: "effect_pending",
-							context,
-							attempt: 1,
-							responseEntryId,
-							usageId,
-							intendedOutputLimit: 10,
-							contextWindow: 100,
+							status: "retry_wait",
+							context: { ...context, retryPolicy: { maxAttempts: 3, baseDelayMs: 1000 } },
+							nextAttempt: 2,
+							notBefore: 5000,
+							errorMessage: "Provider outcome unknown after interruption",
 						},
 					}
-				: {
-						kind: "checkpoint",
-						continuation:
-							position === "finish"
-								? { kind: "may_finish", includeFinalAssistant: true }
-								: { kind: "need_assistant", overflowRecoveryUsed: false },
-						triggerEntryId,
-					};
+				: position === "ready"
+					? { kind: "assistant", generation: { status: "ready", context, nextAttempt: 1 } }
+					: position === "pending"
+						? {
+								kind: "assistant",
+								generation: {
+									status: "effect_pending",
+									context,
+									attempt: 1,
+									responseEntryId,
+									usageId,
+									intendedOutputLimit: 10,
+									contextWindow: 100,
+								},
+							}
+						: {
+								kind: "checkpoint",
+								continuation:
+									position === "finish"
+										? { kind: "may_finish", includeFinalAssistant: true }
+										: { kind: "need_assistant", overflowRecoveryUsed: false },
+								triggerEntryId,
+							};
 	const value: RuntimeAttachment = {
 		laneConfiguration: { seq: 11, value: context.configuration },
 		laneState: {
@@ -81,7 +101,7 @@ function attachment(position: "idle" | "need" | "ready" | "pending" | "finish", 
 							},
 							phase,
 							inbox: { steer: [], followUp: [], writes: [] },
-							latestAssistantEntryId: position === "finish" ? triggerEntryId : null,
+							latestAssistantEntryId: position === "finish" || position === "failure" ? triggerEntryId : null,
 						},
 					},
 				}),
@@ -163,6 +183,40 @@ describe("pure Phase 1 action planner", () => {
 					assistantEffectStatus: (candidate) => (keys.has(candidate) ? "running" : undefined),
 				})?.info.kind,
 			).toBe("recover_assistant_effect");
+	});
+
+	it("keeps retry waits stable without exact elapsed proof and releases only on an exact proof", () => {
+		const fixture = attachment("wait");
+		const expectedWait = {
+			kind: "wait_assistant_retry",
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			nextAttempt: 2,
+			notBefore: 5000,
+		};
+		for (const retryElapsed of [undefined, () => false])
+			expect(
+				planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined, retryElapsed })
+					?.info,
+			).toEqual(expectedWait);
+		const exact = vi.fn(
+			(operationId, stepId, nextAttempt, notBefore) =>
+				operationId === fixture.operationId && stepId === fixture.stepId && nextAttempt === 2 && notBefore === 5000,
+		);
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined, retryElapsed: exact })
+				?.info,
+		).toEqual({ ...expectedWait, kind: "release_assistant_retry" });
+		expect(exact).toHaveBeenCalledWith(fixture.operationId, fixture.stepId, 2, 5000);
+	});
+
+	it("plans failed finish directly from failure_drain", () => {
+		const fixture = attachment("failure");
+		expect(planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info).toEqual({
+			kind: "finish_failed_run",
+			operationId: fixture.operationId,
+			responseEntryId: fixture.triggerEntryId,
+		});
 	});
 
 	it("is repeatable and does not mutate attachments, maps, or the input set", () => {

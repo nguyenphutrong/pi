@@ -7,8 +7,11 @@ export type ActionInfo =
 	| { kind: "await_assistant_effect"; operationId: string; effectKey: string }
 	| { kind: "settle_assistant_effect"; operationId: string; effectKey: string }
 	| { kind: "recover_assistant_effect"; operationId: string; stepId: string; attempt: number }
+	| { kind: "wait_assistant_retry"; operationId: string; stepId: string; nextAttempt: number; notBefore: number }
+	| { kind: "release_assistant_retry"; operationId: string; stepId: string; nextAttempt: number; notBefore: number }
 	| { kind: "repair_materialized_assistant"; operationId: string; responseEntryId: string; usageId: string }
-	| { kind: "finish_run"; operationId: string; triggerEntryId: string };
+	| { kind: "finish_run"; operationId: string; triggerEntryId: string }
+	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string };
 
 export interface PlannedAction {
 	readonly info: ActionInfo;
@@ -29,6 +32,7 @@ export function planAction(
 	inputs: {
 		readonly settingsRevision: number;
 		readonly assistantEffectStatus: (key: string) => "planned" | "running" | "settled" | undefined;
+		readonly retryElapsed?: (operationId: string, stepId: string, nextAttempt: number, notBefore: number) => boolean;
 	},
 ): PlannedAction | undefined {
 	const operation = attachment.runOperation;
@@ -42,7 +46,13 @@ export function planAction(
 	});
 	const phase = state.value.phase;
 	let info: ActionInfo;
-	if (phase.kind === "checkpoint") {
+	if (phase.kind === "failure_drain") {
+		info = {
+			kind: "finish_failed_run",
+			operationId: operation.value.operationId,
+			responseEntryId: phase.provenance.entryId,
+		};
+	} else if (phase.kind === "checkpoint") {
 		info =
 			phase.continuation.kind === "need_assistant"
 				? {
@@ -58,6 +68,29 @@ export function planAction(
 			stepId: phase.generation.context.stepId,
 			nextAttempt: phase.generation.nextAttempt,
 		};
+	} else if (phase.generation.status === "retry_wait") {
+		const generation = phase.generation;
+		info =
+			inputs.retryElapsed?.(
+				operation.value.operationId,
+				generation.context.stepId,
+				generation.nextAttempt,
+				generation.notBefore,
+			) === true
+				? {
+						kind: "release_assistant_retry",
+						operationId: operation.value.operationId,
+						stepId: generation.context.stepId,
+						nextAttempt: generation.nextAttempt,
+						notBefore: generation.notBefore,
+					}
+				: {
+						kind: "wait_assistant_retry",
+						operationId: operation.value.operationId,
+						stepId: generation.context.stepId,
+						nextAttempt: generation.nextAttempt,
+						notBefore: generation.notBefore,
+					};
 	} else {
 		const generation = phase.generation;
 		const key = assistantEffectKey(operation.value.operationId, generation.context.stepId, generation.attempt);

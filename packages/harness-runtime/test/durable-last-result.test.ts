@@ -24,6 +24,26 @@ describe("LaneLastResult codec", () => {
 		expect(decodeLaneLastResult(encoded).operationId).not.toBe(candidate.operationId);
 	});
 
+	it("round-trips the exact failed-run shape without runCompletion", () => {
+		const finalAssistantEntryId = id();
+		const candidate: LaneLastResult = {
+			operationId: id(),
+			kind: "run",
+			outcome: "failed",
+			leafId: finalAssistantEntryId,
+			finalAssistantEntryId,
+			error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+		};
+		expect(decodeLaneLastResult(encodeLaneLastResult(candidate))).toEqual(candidate);
+		for (const invalid of [
+			{ ...candidate, runCompletion: "assistant" },
+			{ ...candidate, error: { ...candidate.error, extra: true } },
+			{ ...candidate, error: { code: 1, message: candidate.error.message } },
+			{ ...candidate, leafId: id() },
+		])
+			expect(() => decodeLaneLastResult(invalid)).toThrowError(expect.objectContaining({ code: "corruption" }));
+	});
+
 	it.each([
 		["extra field", (candidate: LaneLastResult) => ({ ...candidate, extra: true })],
 		["missing field", ({ runCompletion: _, ...candidate }: LaneLastResult) => candidate],

@@ -28,11 +28,18 @@ async function rooted(
 	storage: Storage = new MemoryStorage(),
 	streamOptions: JsonValue = {},
 	finalPayload?: JsonValue,
+	recovery: { attempt: number; maxAttempts: number; baseDelayMs: number } = {
+		attempt: 1,
+		maxAttempts: 1,
+		baseDelayMs: 1,
+	},
 ) {
 	const operationId = id();
 	const source = id();
 	const prompt = id();
 	const response = id();
+	const reservedResponse = id();
+	const reservedUsage = id();
 	const stepId = id();
 	const writes: Write[] = [
 		{
@@ -57,7 +64,7 @@ async function rooted(
 			triggerEntryId: trigger,
 			configuration: config(),
 			streamOptions,
-			retryPolicy: { maxAttempts: 1, baseDelayMs: 1 },
+			retryPolicy: { maxAttempts: recovery.maxAttempts, baseDelayMs: recovery.baseDelayMs },
 			overflowRecoveryUsed: false,
 		};
 		const phase =
@@ -69,9 +76,9 @@ async function rooted(
 							generation: {
 								status: "effect_pending",
 								context,
-								attempt: 1,
-								responseEntryId: id(),
-								usageId: id(),
+								attempt: recovery.attempt,
+								responseEntryId: reservedResponse,
+								usageId: reservedUsage,
 								intendedOutputLimit: 1,
 								contextWindow: 2,
 							},
@@ -160,7 +167,7 @@ async function rooted(
 		);
 	}
 	await storage.commit({ writes });
-	return { storage, operationId, prompt, response, source, stepId };
+	return { storage, operationId, prompt, response, source, stepId, reservedResponse, reservedUsage };
 }
 
 function session(storage: Storage) {
@@ -247,11 +254,12 @@ async function expectUncertainReopen(state: MemoryStorageState): Promise<void> {
 	const lease = vi.spyOn(models, "lease");
 	const shell = await createRuntimeShell(session(instrumented), config(), { models });
 	expect(await shell.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
-	await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+	await expect(shell.executeAction()).resolves.toMatchObject({ kind: "recover_assistant_effect" });
 	expect(lease).not.toHaveBeenCalled();
-	expect(instrumented.committedTransactions).toHaveLength(0);
+	expect(instrumented.committedTransactions).toHaveLength(1);
+	expect(await shell.peekAction()).toMatchObject({ kind: "finish_failed_run" });
 	await shell.close();
-	expect(instrumented.committedTransactions).toHaveLength(0);
+	expect(instrumented.committedTransactions).toHaveLength(1);
 }
 
 const commitCuts = [
@@ -1113,7 +1121,8 @@ describe("Phase 1 runtime shell", () => {
 		await shell.close();
 	});
 
-	it.each(["ready", "pending"] as const)("keeps parked %s actions visible and write-free", async (position) => {
+	it("keeps parked ready actions visible and write-free", async () => {
+		const position = "ready" as const;
 		const fixture = await rooted(position);
 		const instrumented = instrumentStorage(fixture.storage);
 		const shell = await createRuntimeShell(session(instrumented), config());
@@ -1122,6 +1131,401 @@ describe("Phase 1 runtime shell", () => {
 		await expect(shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
 		expect(await shell.peekAction()).toEqual(action);
 		expect(instrumented.committedTransactions).toHaveLength(0);
+		await shell.close();
+	});
+
+	it("recovers a parked pending action at the captured cap without resolving a provider", async () => {
+		const fixture = await rooted("pending");
+		const instrumented = instrumentStorage(fixture.storage);
+		const models = createModels();
+		const lease = vi.spyOn(models, "lease");
+		const shell = await createRuntimeShell(session(instrumented), config(), { models });
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "recover_assistant_effect" });
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(lease).not.toHaveBeenCalled();
+		expect(await shell.peekAction()).toMatchObject({ kind: "finish_failed_run" });
+		await shell.close();
+	});
+
+	it("crosses a below-cap durable retry boundary, then prepares fresh attempt-two reservations", async () => {
+		const now = 2_000_000;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+		const state = new MemoryStorageState();
+		const fixture = await rooted("pending", state.createStorage(), {}, undefined, {
+			attempt: 1,
+			maxAttempts: 3,
+			baseDelayMs: 25,
+		});
+		const firstStorage = instrumentStorage(fixture.storage);
+		const firstModels = createModels();
+		const firstLease = vi.spyOn(firstModels, "lease");
+		const first = await createRuntimeShell(session(firstStorage), config(), { models: firstModels });
+		expect(await first.executeAction()).toEqual({
+			kind: "recover_assistant_effect",
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			attempt: 1,
+		});
+		expect(firstStorage.committedTransactions).toHaveLength(1);
+		expect(firstStorage.committedTransactions[0].writes).toEqual([
+			expect.objectContaining({ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId }),
+		]);
+		const waiting = (await fixture.storage.getRegister("op.state", fixture.operationId))!
+			.value as unknown as RunState;
+		expect(waiting.phase).toEqual({
+			kind: "assistant",
+			generation: {
+				status: "retry_wait",
+				context: expect.objectContaining({
+					stepId: fixture.stepId,
+					configuration: config(),
+					retryPolicy: { maxAttempts: 3, baseDelayMs: 25 },
+				}),
+				nextAttempt: 2,
+				notBefore: now + 25,
+				errorMessage: "Provider outcome unknown after interruption",
+			},
+		});
+		expect(await fixture.storage.getEntries([fixture.reservedResponse])).toEqual(new Map());
+		expect(await fixture.storage.getUsageRows([fixture.reservedUsage])).toEqual(new Map());
+		expect((await fixture.storage.getRegister("lane.leaf", "main"))?.value).toBe(fixture.prompt);
+		expect(firstLease).not.toHaveBeenCalled();
+		await first.close();
+
+		const secondStorage = instrumentStorage(state.createStorage());
+		const second = await createRuntimeShell(session(secondStorage), config());
+		const wait = {
+			kind: "wait_assistant_retry" as const,
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			nextAttempt: 2,
+			notBefore: now + 25,
+		};
+		expect(await second.peekAction()).toEqual(wait);
+		expect(secondStorage.committedTransactions).toEqual([]);
+		clock.mockReturnValue(now + 25);
+		expect(await second.peekAction()).toEqual(wait);
+		expect(await second.executeAction()).toEqual(wait);
+		expect(secondStorage.committedTransactions).toEqual([]);
+		expect(await second.peekAction()).toEqual({ ...wait, kind: "release_assistant_retry" });
+		expect(await second.executeAction()).toEqual({ ...wait, kind: "release_assistant_retry" });
+		expect(secondStorage.committedTransactions).toHaveLength(1);
+		expect(secondStorage.committedTransactions[0].writes).toEqual([
+			expect.objectContaining({ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId }),
+		]);
+		await second.close();
+
+		const thirdStorage = instrumentStorage(state.createStorage());
+		const thirdSession = session(thirdStorage);
+		const response2 = id();
+		const usage2 = id();
+		vi.spyOn(thirdSession.idGenerator, "next").mockReturnValueOnce(response2).mockReturnValueOnce(usage2);
+		const available = availableModels();
+		const third = await createRuntimeShell(thirdSession, config(), { models: available.models });
+		expect(await third.peekAction()).toEqual({
+			kind: "prepare_assistant_effect",
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			nextAttempt: 2,
+		});
+		await third.executeAction();
+		const pending = (await thirdStorage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		expect(pending.phase).toEqual({
+			kind: "assistant",
+			generation: expect.objectContaining({
+				status: "effect_pending",
+				attempt: 2,
+				responseEntryId: response2,
+				usageId: usage2,
+				context: expect.objectContaining({
+					retryPolicy: { maxAttempts: 3, baseDelayMs: 25 },
+					configuration: config(),
+				}),
+			}),
+		});
+		expect([response2, usage2]).not.toContain(fixture.reservedResponse);
+		expect([response2, usage2]).not.toContain(fixture.reservedUsage);
+		await third.close();
+		const fourth = await createRuntimeShell(session(state.createStorage()), config());
+		expect(await fourth.peekAction()).toEqual({
+			kind: "recover_assistant_effect",
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			attempt: 2,
+		});
+		await fourth.close();
+		clock.mockRestore();
+	});
+
+	it("cancels a retry timer on close without proof or durable writes", async () => {
+		vi.useFakeTimers();
+		try {
+			vi.setSystemTime(10_000);
+			const state = new MemoryStorageState();
+			const fixture = await rooted("pending", state.createStorage(), {}, undefined, {
+				attempt: 1,
+				maxAttempts: 2,
+				baseDelayMs: 1_000,
+			});
+			const initial = await createRuntimeShell(session(fixture.storage), config());
+			await initial.executeAction();
+			await initial.close();
+			const storage = instrumentStorage(state.createStorage());
+			const shell = await createRuntimeShell(session(storage), config());
+			const waiting = shell.executeAction();
+			await vi.advanceTimersByTimeAsync(100);
+			const closing = shell.close();
+			await expect(waiting).rejects.toMatchObject({ code: "closed" });
+			await closing;
+			expect(storage.committedTransactions).toEqual([]);
+			await vi.runAllTimersAsync();
+			const reopened = await createRuntimeShell(session(state.createStorage()), config());
+			expect(await reopened.peekAction()).toMatchObject({ kind: "wait_assistant_retry", notBefore: 11_000 });
+			await reopened.close();
+		} finally {
+			vi.useRealTimers();
+		}
+	});
+
+	it("writes the exact capped synthetic failure and exact failed terminal transaction", async () => {
+		const now = 9_876;
+		const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+		const state = new MemoryStorageState();
+		const fixture = await rooted("pending", state.createStorage(), {}, undefined, {
+			attempt: 3,
+			maxAttempts: 3,
+			baseDelayMs: 7,
+		});
+		const storage = instrumentStorage(fixture.storage);
+		const runtimeSession = session(storage);
+		const ids = vi.spyOn(runtimeSession.idGenerator, "next");
+		const models = createModels();
+		const lease = vi.spyOn(models, "lease");
+		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		await shell.executeAction();
+		const zero = ZERO_USAGE;
+		const error = { code: "provider_interrupted", message: "Provider outcome unknown after interruption" };
+		expect(storage.committedTransactions[0].writes).toEqual([
+			{
+				kind: "entry",
+				entry: {
+					id: fixture.reservedResponse,
+					parentId: fixture.prompt,
+					type: "message",
+					payload: {
+						role: "assistant",
+						content: [],
+						api: "harness",
+						provider: "test",
+						model: "current",
+						usage: zero,
+						stopReason: "error",
+						errorMessage: error.message,
+						timestamp: now,
+					},
+				},
+			},
+			{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: fixture.reservedResponse },
+			{
+				kind: "usage",
+				row: { id: fixture.reservedUsage, entryId: fixture.reservedResponse, usage: zero, adjustment: false },
+			},
+			expect.objectContaining({ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId }),
+		]);
+		const drainWrite = storage.committedTransactions[0].writes[3];
+		if (drainWrite.kind !== "register" || drainWrite.op !== "set") throw new Error("failure state write missing");
+		expect((drainWrite.value as unknown as RunState).phase).toEqual({
+			kind: "failure_drain",
+			error,
+			provenance: { kind: "response", entryId: fixture.reservedResponse },
+		});
+		expect((drainWrite.value as unknown as RunState).latestAssistantEntryId).toBe(fixture.reservedResponse);
+		expect(ids).not.toHaveBeenCalled();
+		expect(lease).not.toHaveBeenCalled();
+		await shell.close();
+
+		const terminalStorage = instrumentStorage(state.createStorage());
+		const terminalModels = createModels();
+		const terminalLease = vi.spyOn(terminalModels, "lease");
+		const terminalShell = await createRuntimeShell(session(terminalStorage), config(), { models: terminalModels });
+		expect(await terminalShell.peekAction()).toEqual({
+			kind: "finish_failed_run",
+			operationId: fixture.operationId,
+			responseEntryId: fixture.reservedResponse,
+		});
+		expect(terminalStorage.committedTransactions).toEqual([]);
+		await terminalShell.executeAction();
+		expect(terminalStorage.committedTransactions[0].writes).toEqual([
+			{ kind: "register", op: "delete", namespace: "op.meta", key: fixture.operationId },
+			{ kind: "register", op: "delete", namespace: "op.state", key: fixture.operationId },
+			{
+				kind: "register",
+				op: "set",
+				namespace: "lane.lastResult",
+				key: "main",
+				value: {
+					operationId: fixture.operationId,
+					kind: "run",
+					outcome: "failed",
+					leafId: fixture.reservedResponse,
+					finalAssistantEntryId: fixture.reservedResponse,
+					error,
+				},
+			},
+			{
+				kind: "register",
+				op: "set",
+				namespace: "lane.state",
+				key: "main",
+				value: {
+					currentOperationId: null,
+					pendingNextRun: [],
+				},
+			},
+		]);
+		expect(await terminalShell.peekAction()).toBeUndefined();
+		expect(terminalLease).not.toHaveBeenCalled();
+		await terminalShell.close();
+		clock.mockRestore();
+	});
+
+	it.each([
+		["exponential", 1_000, 2, 7, 1_014],
+		["saturated", Number.MAX_SAFE_INTEGER - 5, 2, Number.MAX_SAFE_INTEGER, Number.MAX_SAFE_INTEGER],
+	] as const)(
+		"computes the exact %s retry deadline in the Session transition",
+		async (_label, now, attempt, baseDelayMs, deadline) => {
+			const clock = vi.spyOn(Date, "now").mockReturnValue(now);
+			const fixture = await rooted("pending", new MemoryStorage(), {}, undefined, {
+				attempt,
+				maxAttempts: 3,
+				baseDelayMs,
+			});
+			const instrumented = instrumentStorage(fixture.storage);
+			const runtimeSession = session(instrumented);
+			const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+			const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
+			const result = await runtimeSession.recoverAssistantEffect({
+				operationId: fixture.operationId,
+				stepId: fixture.stepId,
+				attempt,
+				responseEntryId: fixture.reservedResponse,
+				usageId: fixture.reservedUsage,
+				expectedOperationStateSeq: operationState.seq,
+				expectedLaneStateSeq: laneState.seq,
+			});
+			expect(result.status).toBe("committed");
+			const phase = result.attachment.runState?.value.phase;
+			expect(phase?.kind === "assistant" ? phase.generation : undefined).toEqual(
+				expect.objectContaining({
+					status: "retry_wait",
+					nextAttempt: 3,
+					notBefore: deadline,
+				}),
+			);
+			expect(instrumented.committedTransactions).toHaveLength(1);
+			await runtimeSession.close();
+			clock.mockRestore();
+		},
+	);
+
+	it("makes mismatched recovery and retry-release proofs obsolete and commits each exact proof once", async () => {
+		const fixture = await rooted("pending", new MemoryStorage(), {}, undefined, {
+			attempt: 1,
+			maxAttempts: 3,
+			baseDelayMs: 10,
+		});
+		const instrumented = instrumentStorage(fixture.storage);
+		const runtimeSession = session(instrumented);
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
+		const exactRecovery = {
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			attempt: 1,
+			responseEntryId: fixture.reservedResponse,
+			usageId: fixture.reservedUsage,
+			expectedOperationStateSeq: operationState.seq,
+			expectedLaneStateSeq: laneState.seq,
+		};
+		for (const transition of [
+			{
+				...exactRecovery,
+				operationId: id(),
+			},
+			{
+				...exactRecovery,
+				stepId: id(),
+			},
+			{
+				...exactRecovery,
+				attempt: 2,
+			},
+			{
+				...exactRecovery,
+				responseEntryId: id(),
+			},
+			{ ...exactRecovery, expectedOperationStateSeq: exactRecovery.expectedOperationStateSeq + 1 },
+			{ ...exactRecovery, expectedLaneStateSeq: exactRecovery.expectedLaneStateSeq + 1 },
+		])
+			expect(await runtimeSession.recoverAssistantEffect(transition)).toMatchObject({ status: "obsolete" });
+		expect(instrumented.committedTransactions).toEqual([]);
+		const recovered = await runtimeSession.recoverAssistantEffect(exactRecovery);
+		const generation = recovered.attachment.runState?.value.phase;
+		if (generation?.kind !== "assistant" || generation.generation.status !== "retry_wait")
+			throw new Error("wait missing");
+		const exact = {
+			operationId: fixture.operationId,
+			stepId: fixture.stepId,
+			nextAttempt: 2,
+			notBefore: generation.generation.notBefore,
+			expectedOperationStateSeq: recovered.attachment.runState!.seq,
+			expectedLaneStateSeq: recovered.attachment.laneState.seq,
+		};
+		for (const wrong of [
+			{ ...exact, operationId: id() },
+			{ ...exact, stepId: id() },
+			{ ...exact, nextAttempt: 3 },
+			{ ...exact, notBefore: exact.notBefore + 1 },
+			{ ...exact, expectedOperationStateSeq: exact.expectedOperationStateSeq + 1 },
+			{ ...exact, expectedLaneStateSeq: exact.expectedLaneStateSeq + 1 },
+		])
+			expect(await runtimeSession.releaseAssistantRetry(wrong)).toMatchObject({ status: "obsolete" });
+		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(await runtimeSession.releaseAssistantRetry(exact)).toMatchObject({ status: "committed" });
+		expect(await runtimeSession.releaseAssistantRetry(exact)).toMatchObject({ status: "obsolete" });
+		expect(instrumented.committedTransactions).toHaveLength(2);
+		await runtimeSession.close();
+	});
+
+	it("rejects stale recovery after identical operation and lane state rewrites", async () => {
+		const fixture = await rooted("pending");
+		const instrumented = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(instrumented), config());
+		expect(await shell.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const laneState = (await fixture.storage.getRegister("lane.state", "main"))!;
+		await fixture.storage.commit({
+			writes: [
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: fixture.operationId,
+					value: operationState.value,
+				},
+				{ kind: "register", op: "set", namespace: "lane.state", key: "main", value: laneState.value },
+			],
+		});
+
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+		expect(instrumented.committedTransactions).toEqual([]);
+		const current = (await fixture.storage.getRegister("op.state", fixture.operationId))!
+			.value as unknown as RunState;
+		expect(current.phase).toMatchObject({
+			kind: "assistant",
+			generation: { status: "effect_pending" },
+		});
 		await shell.close();
 	});
 
@@ -1641,7 +2045,7 @@ describe("Phase 1 runtime shell", () => {
 		expect(usageLookups).toHaveLength(1);
 		expect(lease).not.toHaveBeenCalled();
 		expect(await reopened.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
-		await expect(reopened.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+		await expect(reopened.executeAction()).resolves.toMatchObject({ kind: "recover_assistant_effect" });
 		expect(lease).not.toHaveBeenCalled();
 		await reopened.close();
 	});
@@ -2340,7 +2744,7 @@ describe("Phase 1 runtime shell", () => {
 			},
 		});
 		expect(result.status).toBe("committed");
-		if (result.status === "committed") {
+		if (result.status === "committed" && result.result.kind === "completed") {
 			expect(result.result.finalMessage).not.toBe(persisted.payload);
 			result.result.finalMessage.content[0] = { type: "text", text: "result mutation" };
 			expect((await fixture.storage.getEntries([fixture.response])).get(fixture.response)?.payload).toEqual(
