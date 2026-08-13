@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. B-016 is resolved and corrected D-050 passed independent design review.
+No active blockers. D-050 increment 4.2a is complete; runtime attachment ownership and SessionTree façade are next.
 
 ## B-016 — Choose the custom-entry projector timing contract
 
