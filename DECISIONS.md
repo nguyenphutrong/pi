@@ -1409,7 +1409,7 @@ The implementation adds write-free source-order rejection and a no-scan regressi
 
 - Date: 2026-08-13
 - Phase: 4
-- Status: accepted after corrected independent design review
+- Status: implemented by `219526a1a` and accepted after fresh independent implementation review
 - References: D-045–D-048; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.2, 3.3–3.4, 3.11–3.13, 4.1, 4.4–4.7, 9.1–9.3
 
 ### Options
@@ -1437,3 +1437,7 @@ The oracle additionally checks entry/register exclusivity for S, F, and N; exact
 Implementation stays in dedicated Harness SQLite queue process-crash test, child, and support files so D-046's provider/tool grammar remains unchanged. This is a test-evidence choice with no §6 ambiguity.
 
 Fresh independent design review verifies both earlier findings are closed and every production sequence assignment is exact. It confirms the five-prefix economy covers both sides of all four queue transactions, S0's public admission identity is non-circular, lease acquisition does not affect Harness sequences or stats, delete writes consume sequence numbers, S2 may abort without executing its planned generation, and no §6 escalation is needed.
+
+Implementation uses three dedicated test files and no production seam. The first implementation review correctly rejected a `toolStarts` counter that was not connected to RuntimeShell. The corrected fixture registers a real `RuntimeToolDefinition` spy on every initial, recovery, and final-idle shell, so zero tool starts is observed at the effect boundary rather than assumed. A fresh independent review confirms that finding is closed and the complete S0–S4 grammar, exact durable oracle, fencing, effect, and idle-write requirements pass.
+
+Focused queue/process recovery passes 40/40, the complete Harness runtime passes 562/562, `npm run check` passes, and `git diff --check` passes. Phase 4.1 is complete; deferred tree writes are next.

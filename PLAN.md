@@ -3,17 +3,17 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.1c — Representative SQLite queue process-death cuts
-- Status: D-049's five-prefix, ten-process SQLite queue crash matrix is independently approved; implement its exact test-only protocol and all-nine-table oracle
-- Done bar: real SQLite process death cross-cuts queue admission, placement/deletion, abort drain, and terminal cleanup; fresh reopen observes the exact pre-commit or complete post-commit state and never duplicates placement or cleanup
+- Work item: 4.2 — Deferred tree writes design
+- Status: Phase 4.1 queue durability is complete; re-read the deferred-write, recovery, public API, and testing sections before producing concrete design options
+- Done bar: an approved design fixes durable admission, cancellation, checkpoint consumption, placement ordering, recovery validation, and Tier A/B/C evidence for deferred tree writes without widening the Storage contract or reintroducing history-derived recovery
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design and implement representative SQLite process-death cuts for the completed queue kernel.
-2. Design and implement deferred tree writes.
+1. Design deferred tree writes and obtain independent design approval.
+2. Implement the approved deferred-write vertical slice with Tier A/B/C coverage.
 3. Add `waitForIdle` and `runWhenIdle`.
-4. Complete whole-Phase-4 acceptance.
+4. Complete whole-Phase-4 acceptance and independent done-bar review.
 
 ## Phase order
 

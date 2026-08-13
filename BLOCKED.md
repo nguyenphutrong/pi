@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Phase 4.1b is complete at `2700b7a58`; representative SQLite queue process-death cuts are next.
+No active blockers. Phase 4.1 is complete at `219526a1a`; deferred tree writes are next.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 
