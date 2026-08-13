@@ -5,8 +5,10 @@ import {
 	StorageError,
 	type UsageRow,
 } from "@nguyenphutrong/pi-session-storage";
+import { SQLITE_SCHEMA_VERSION } from "../schema.ts";
 import type { SqliteDatabase } from "../types.ts";
 import { projectSqliteEntry } from "./branch-projection.ts";
+import { rebuildBranchProjection } from "./branch-repair.ts";
 import { throwPersistedCorruption } from "./persisted-corruption.ts";
 import type { PreparedTransaction } from "./prepared-transaction.ts";
 
@@ -515,6 +517,66 @@ export function deleteSqliteSession(
 			if (context.db.prepare("DELETE FROM sessions WHERE session_id = ?").run(metadata.id).changes !== 1)
 				throw new SqliteEngineError("missing", `Session ${metadata.id} disappeared`);
 			return true;
+		},
+		metadata.id,
+		now,
+	);
+}
+
+export function repairSqliteBranchProjection(
+	db: SqliteDatabase,
+	metadata: SessionMetadataRow,
+	ownerId: string,
+	now: () => number,
+	ttlMs: number,
+): void {
+	assertLeaseInput(metadata.id, ownerId, ttlMs);
+	if (metadata.storageVersion !== SQLITE_SCHEMA_VERSION)
+		throw new SqliteEngineError("version_mismatch", "Metadata is not current");
+	runImmediate(
+		db,
+		(context) => {
+			const row = context.db
+				.prepare(
+					"SELECT created_at, parent_session_id, storage_version, metadata FROM sessions WHERE session_id = ?",
+				)
+				.get<{
+					created_at: number;
+					parent_session_id: string | null;
+					storage_version: number;
+					metadata: string | null;
+				}>(metadata.id);
+			if (!row) throw new SqliteEngineError("missing", `Unknown session ${metadata.id}`);
+			if (
+				row.metadata !== null ||
+				row.created_at !== metadata.createdAt ||
+				row.storage_version !== metadata.storageVersion ||
+				row.parent_session_id !== (metadata.parentSessionId ?? null)
+			)
+				throw new SqliteEngineError("metadata_mismatch", "Metadata does not match the catalog");
+			const sequence = context.db
+				.prepare(
+					"SELECT typeof(next_seq) AS storage_type, CAST(next_seq AS TEXT) AS next_seq_text FROM session_sequences WHERE session_id = ?",
+				)
+				.get<{ storage_type: unknown; next_seq_text: unknown }>(metadata.id);
+			if (
+				!sequence ||
+				sequence.storage_type !== "integer" ||
+				typeof sequence.next_seq_text !== "string" ||
+				!/^\d+$/.test(sequence.next_seq_text)
+			)
+				throwPersistedCorruption("Invalid canonical sequence row");
+			const nextSeq = BigInt(sequence.next_seq_text);
+			if (nextSeq < 1n || nextSeq > BigInt(Number.MAX_SAFE_INTEGER))
+				throwPersistedCorruption("Invalid canonical sequence row");
+			const fence = acquireInTransaction(context, ownerId, ttlMs);
+			rebuildBranchProjection(context, Number(nextSeq));
+			if (
+				context.db
+					.prepare("DELETE FROM writer_leases WHERE session_id = ? AND owner_id = ? AND fence = ?")
+					.run(metadata.id, ownerId, fence).changes !== 1
+			)
+				throw new SqliteEngineError("missing", `Repair lease disappeared for ${metadata.id}`);
 		},
 		metadata.id,
 		now,

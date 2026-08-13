@@ -18,7 +18,7 @@ const EXACT_LOOKUP_CHUNK_SIZE = 900;
 export const READ_REGISTERS_SQL =
 	"SELECT namespace, key, value, seq FROM registers WHERE session_id = ? AND namespace = ?";
 
-interface EntryRow {
+export interface CanonicalEntryRow {
 	id: unknown;
 	parent_id: unknown;
 	seq: unknown;
@@ -58,7 +58,7 @@ function json(text: unknown, label: string): JsonValue {
 	}
 }
 
-function decodeEntry(row: EntryRow): Entry {
+export function decodeCanonicalEntryRow(row: CanonicalEntryRow): Entry {
 	const entry = {
 		id: row.id,
 		parentId: row.parent_id,
@@ -112,9 +112,9 @@ export function readEntries(db: SqliteDatabase, sessionId: string, ids: readonly
 			.prepare(
 				`SELECT id, parent_id, seq, timestamp, type, custom_type, payload FROM entries WHERE session_id = ? AND id IN (${chunk.map(() => "?").join(", ")})`,
 			)
-			.all<EntryRow>(sessionId, ...chunk);
+			.all<CanonicalEntryRow>(sessionId, ...chunk);
 		for (const row of rows) {
-			const entry = decodeEntry(row);
+			const entry = decodeCanonicalEntryRow(row);
 			if (!chunk.includes(entry.id) || found.has(entry.id))
 				throwPersistedCorruption("Impossible exact entry result");
 			found.set(entry.id, entry);
@@ -194,8 +194,8 @@ export function readEntryScan(db: SqliteDatabase, sessionId: string, query: Entr
 		.prepare(
 			`SELECT id, parent_id, seq, timestamp, type, custom_type, payload FROM entries INDEXED BY ix_entry_seq WHERE ${predicates.join(" AND ")} ORDER BY seq ${query.order === "desc" ? "DESC" : "ASC"}${query.limit === undefined ? "" : " LIMIT ?"}`,
 		)
-		.all<EntryRow>(...params)
-		.map(decodeEntry);
+		.all<CanonicalEntryRow>(...params)
+		.map(decodeCanonicalEntryRow);
 }
 
 export function readStats(db: SqliteDatabase, sessionId: string): SessionStats {

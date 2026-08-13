@@ -9,6 +9,7 @@ import {
 	acquireSqliteSession,
 	createSqliteSession,
 	deleteSqliteSession,
+	repairSqliteBranchProjection,
 	SqliteEngineError,
 } from "./transaction-engine.ts";
 
@@ -295,6 +296,46 @@ export class SqliteStorageRepository {
 				.catch((error) => {
 					throw this.#mapEngineError(error);
 				});
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	repairBranchProjection(metadata: SqliteHandleMetadata): Promise<void> {
+		try {
+			this.#admit();
+			const input = plain(metadata, ["id", "createdAt", "storageVersion", "parentSessionId"], "metadata");
+			const id = sessionId(input.id, "metadata.id");
+			if (!Number.isSafeInteger(input.createdAt) || (input.createdAt as number) < 0)
+				throw new SqliteRepositoryError("validation", "Metadata timestamp is invalid");
+			if (input.storageVersion !== SQLITE_SCHEMA_VERSION)
+				throw new SqliteRepositoryError("version_mismatch", "Metadata is not current");
+			const parentSessionId =
+				input.parentSessionId === undefined
+					? undefined
+					: sessionId(input.parentSessionId, "metadata.parentSessionId");
+			const ownerId = this.#newOwner();
+			this.#reserve(id);
+			return this.#queue
+				.enqueue(() => {
+					if (this.#sealed) throw new SqliteRepositoryError("closed", "Repository is closed");
+					repairSqliteBranchProjection(
+						this.#database(),
+						{
+							id,
+							createdAt: input.createdAt as number,
+							storageVersion: input.storageVersion as number,
+							...(parentSessionId ? { parentSessionId } : {}),
+						},
+						ownerId,
+						this.#now,
+						this.#ttlMs,
+					);
+				})
+				.catch((error) => {
+					throw this.#mapEngineError(error);
+				})
+				.finally(() => this.#reservations.delete(id));
 		} catch (error) {
 			return Promise.reject(error);
 		}
