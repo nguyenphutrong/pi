@@ -5,8 +5,10 @@ import {
 	baselineTransaction,
 	CLOCK,
 	CRASH_OWNER,
+	type CrashMode,
 	commitTransaction,
 	createCrashFactory,
+	createTransaction,
 	PROTOCOL_VERSION,
 	type ProtocolEvent,
 	SESSION_ID,
@@ -24,25 +26,37 @@ function emit(event: ProtocolEvent): void {
 	writeSync(1, `${JSON.stringify(event)}\n`);
 }
 
-const path = process.argv[2];
-const cut = process.argv[3] === "trace" ? undefined : process.argv[3];
-if (!path || !process.argv[3]) throw new Error("Expected database path and cut");
+const mode = process.argv[2] as CrashMode | undefined;
+const path = process.argv[3];
+const cutArgument = process.argv[4];
+const cut = cutArgument === "trace" ? undefined : cutArgument;
+if ((mode !== "commit" && mode !== "create") || !path || !cutArgument)
+	throw new Error("Expected mode, database path, and cut");
 const timers = new DormantTimers();
-const baseline = new SqliteStorageRepository({
-	factory: createNodeSqliteFactory(),
-	path,
-	now: () => CLOCK,
-	ownerId: () => "baseline-owner",
-	leaseTtlMs: TTL,
-	heartbeatMs: 500,
-	timers,
-});
-const seeded = await baseline.create({ id: SESSION_ID, initialTransaction: baselineTransaction });
-const metadata = seeded.metadata;
-await seeded.close();
-await baseline.close();
+if (mode === "create") {
+	// Complete schema initialization before arming, without creating a session or baseline rows.
+	const schema = new SqliteStorageRepository({ factory: createNodeSqliteFactory(), path, timers });
+	await schema.list();
+	await schema.close();
+}
+let metadata = { id: SESSION_ID, createdAt: CLOCK, storageVersion: 1 };
+if (mode === "commit") {
+	const baseline = new SqliteStorageRepository({
+		factory: createNodeSqliteFactory(),
+		path,
+		now: () => CLOCK,
+		ownerId: () => "baseline-owner",
+		leaseTtlMs: TTL,
+		heartbeatMs: 500,
+		timers,
+	});
+	const seeded = await baseline.create({ id: SESSION_ID, initialTransaction: baselineTransaction });
+	metadata = seeded.metadata;
+	await seeded.close();
+	await baseline.close();
+}
 
-const crash = createCrashFactory(createNodeSqliteFactory(), cut, emit);
+const crash = createCrashFactory(createNodeSqliteFactory(), mode, cut, emit);
 const repository = new SqliteStorageRepository({
 	factory: crash.factory,
 	path,
@@ -52,10 +66,12 @@ const repository = new SqliteStorageRepository({
 	heartbeatMs: 500,
 	timers,
 });
-const handle = await repository.open(metadata);
+const opened = mode === "commit" ? await repository.open(metadata) : undefined;
 crash.arm();
 emit({ v: PROTOCOL_VERSION, event: "armed" });
-await handle.commit(commitTransaction);
+const handle =
+	mode === "create" ? await repository.create({ id: SESSION_ID, initialTransaction: createTransaction }) : opened!;
+if (mode === "commit") await handle.commit(commitTransaction);
 if (cut !== undefined) throw new Error(`Unknown cut was not reached: ${cut}`);
 emit({ v: PROTOCOL_VERSION, event: "catalog", cuts: crash.catalog() });
 emit({ v: PROTOCOL_VERSION, event: "complete" });

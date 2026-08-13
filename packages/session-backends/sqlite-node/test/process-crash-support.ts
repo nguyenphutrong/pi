@@ -9,6 +9,7 @@ export const TTL = 1_000;
 export const CRASH_OWNER = "crash-owner";
 export const TAKEOVER_OWNER = "takeover-owner";
 export const PROTOCOL_VERSION = 1;
+export type CrashMode = "commit" | "create";
 
 export interface ProtocolEvent {
 	readonly v: 1;
@@ -62,12 +63,35 @@ export const commitTransaction = {
 	],
 };
 
+export const createTransaction = {
+	writes: [
+		{ kind: "register" as const, op: "set" as const, namespace: "lane.leaf", key: "main", value: null },
+		{
+			kind: "register" as const,
+			op: "set" as const,
+			namespace: "lane.state",
+			key: "main",
+			value: { currentOperationId: null, pendingNextRun: [] },
+		},
+	],
+};
+
 function normalize(sql: string): string {
 	return sql.replace(/\s+/g, " ").trim().toUpperCase();
 }
 
-function classify(sql: string, params: readonly unknown[]): string | undefined {
+function classify(mode: CrashMode, sql: string, params: readonly unknown[]): string | undefined {
 	const normalized = normalize(sql);
+	if (mode === "create") {
+		if (normalized.startsWith("INSERT INTO SESSIONS ")) return "session-catalog-insert";
+		if (normalized.startsWith("INSERT INTO SESSION_SEQUENCES ")) return "session-sequences-insert";
+		if (normalized.startsWith("INSERT INTO SESSION_STATS ")) return "session-stats-initial-insert";
+		if (normalized.startsWith("INSERT INTO WRITER_LEASES ")) return "writer-lease-insert";
+		if (normalized.startsWith("INSERT INTO REGISTERS ")) return `register-set:${String(params[1])}`;
+		if (normalized.startsWith("UPDATE SESSION_STATS SET")) return "final-stats-update";
+		if (normalized.startsWith("UPDATE SESSION_SEQUENCES SET")) return "final-sequence-update";
+		return undefined;
+	}
 	if (normalized.startsWith("UPDATE WRITER_LEASES SET EXPIRES_AT_MS")) return "lease-renew";
 	if (normalized.startsWith("INSERT INTO ENTRIES ")) return "entry-insert";
 	if (normalized.startsWith("INSERT INTO BRANCH_ENTRIES ")) return "branch-entry-insert";
@@ -86,6 +110,7 @@ function isMutating(sql: string): boolean {
 
 export function createCrashFactory(
 	inner: SqliteDatabaseFactory,
+	mode: CrashMode,
 	cut: string | undefined,
 	emit: (event: ProtocolEvent) => void,
 ): { readonly factory: SqliteDatabaseFactory; arm(): void; disarm(): void; catalog(): readonly string[] } {
@@ -109,7 +134,7 @@ export function createCrashFactory(
 							run(...params: unknown[]): SqliteRunResult {
 								const result = statement.run(...params);
 								if (armed) {
-									const site = classify(sql, params);
+									const site = classify(mode, sql, params);
 									if (site) reach(site);
 									else if (isMutating(sql)) throw new Error(`Unclassified armed mutation: ${normalize(sql)}`);
 								}

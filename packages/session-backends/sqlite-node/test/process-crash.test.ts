@@ -11,6 +11,7 @@ import {
 	CHILD_ID,
 	CLOCK,
 	CRASH_OWNER,
+	type CrashMode,
 	PROTOCOL_VERSION,
 	type ProtocolEvent,
 	ROOT_ID,
@@ -55,6 +56,18 @@ const CUTS = [
 	"register-delete:absent",
 	"stats-update",
 	"sequence-update",
+	"after-commit",
+] as const;
+const CREATE_CUTS = [
+	"before-first-operation",
+	"session-catalog-insert",
+	"session-sequences-insert",
+	"session-stats-initial-insert",
+	"writer-lease-insert",
+	"register-set:lane.leaf",
+	"register-set:lane.state",
+	"final-stats-update",
+	"final-sequence-update",
 	"after-commit",
 ] as const;
 const ZERO_USAGE =
@@ -158,6 +171,37 @@ const EXPECTED_COMPLETE: Snapshot = {
 		{ session_id: SESSION_ID, branch_id: BRANCH_ID, entry_seq: 4, entry_id: CHILD_ID, entry_type: "message" },
 	],
 };
+const EMPTY: Snapshot = {
+	sessions: [],
+	session_sequences: [],
+	entries: [],
+	registers: [],
+	usage_ledger: [],
+	session_stats: [],
+	writer_leases: [],
+	branch_meta: [],
+	branch_entries: [],
+};
+const EXPECTED_CREATE_COMPLETE: Snapshot = {
+	sessions: [SESSION],
+	session_sequences: [{ session_id: SESSION_ID, next_seq: 3 }],
+	entries: [],
+	registers: [
+		{ session_id: SESSION_ID, namespace: "lane.leaf", key: "main", value: "null", seq: 1 },
+		{
+			session_id: SESSION_ID,
+			namespace: "lane.state",
+			key: "main",
+			value: '{"currentOperationId":null,"pendingNextRun":[]}',
+			seq: 2,
+		},
+	],
+	usage_ledger: [],
+	session_stats: [{ session_id: SESSION_ID, message_count: 0, usage_payload: ZERO_USAGE }],
+	writer_leases: [LEASE],
+	branch_meta: [],
+	branch_entries: [],
+};
 
 interface ChildResult {
 	readonly events: readonly ProtocolEvent[];
@@ -172,9 +216,9 @@ interface CrashCase {
 	readonly state: Snapshot;
 }
 
-function runChild(path: string, cut: string): Promise<ChildResult> {
+function runChild(mode: CrashMode, path: string, cut: string): Promise<ChildResult> {
 	return new Promise((resolve, reject) => {
-		const child = spawn(process.execPath, ["--no-warnings", CHILD, path, cut], {
+		const child = spawn(process.execPath, ["--no-warnings", CHILD, mode, path, cut], {
 			shell: false,
 			stdio: ["ignore", "pipe", "pipe"],
 		});
@@ -280,11 +324,11 @@ function snapshot(path: string): Snapshot {
 	}
 }
 
-async function makeCase(cut: string): Promise<CrashCase> {
+async function makeCase(cut: string, mode: CrashMode = "commit"): Promise<CrashCase> {
 	const dir = await mkdtemp(join(tmpdir(), "pi-sqlite-crash-"));
 	const path = join(dir, "session.sqlite");
 	try {
-		const result = await runChild(path, cut);
+		const result = await runChild(mode, path, cut);
 		if (cut !== "trace") await Promise.all([access(`${path}-wal`), access(`${path}-shm`)]);
 		return { dir, path, result, state: snapshot(path) };
 	} catch (error) {
@@ -346,6 +390,67 @@ async function verifyTakeover(path: string, committed: boolean): Promise<void> {
 	}
 }
 
+async function verifyCreateRecovery(path: string, committed: boolean): Promise<void> {
+	const timers = new DormantTimers();
+	const repository = new SqliteStorageRepository({
+		factory: createNodeSqliteFactory(),
+		path,
+		now: () => CLOCK + TTL,
+		ownerId: () => TAKEOVER_OWNER,
+		leaseTtlMs: TTL,
+		heartbeatMs: 500,
+		timers,
+	});
+	try {
+		const metadata = { id: SESSION_ID, createdAt: CLOCK, storageVersion: 1 };
+		expect(await repository.list()).toEqual(committed ? [metadata] : []);
+		if (!committed) return;
+		const handle = await repository.open(metadata);
+		try {
+			const lease = new DatabaseSync(path, { readOnly: true });
+			try {
+				expect(lease.prepare("SELECT owner_id, fence, expires_at_ms FROM writer_leases").get()).toEqual({
+					owner_id: TAKEOVER_OWNER,
+					fence: 2,
+					expires_at_ms: CLOCK + TTL * 2,
+				});
+			} finally {
+				lease.close();
+			}
+			expect(await handle.getStats()).toEqual({
+				messageCount: 0,
+				usage: JSON.parse(ZERO_USAGE) as unknown,
+			});
+			expect(await handle.getRegister("lane.leaf", "main")).toEqual({
+				namespace: "lane.leaf",
+				key: "main",
+				value: null,
+				seq: 1,
+			});
+			expect(await handle.getRegister("lane.state", "main")).toEqual({
+				namespace: "lane.state",
+				key: "main",
+				value: { currentOperationId: null, pendingNextRun: [] },
+				seq: 2,
+			});
+			const result = await handle.commit({
+				writes: [{ kind: "register", op: "set", namespace: "test", key: "takeover", value: true }],
+			});
+			expect(result.seqs).toEqual([3]);
+		} finally {
+			await handle.close();
+		}
+	} finally {
+		await repository.close();
+	}
+	const db = new DatabaseSync(path, { readOnly: true });
+	try {
+		expect(db.prepare("SELECT * FROM writer_leases").all()).toEqual([]);
+	} finally {
+		db.close();
+	}
+}
+
 describe.skipIf(process.platform === "win32")("SQLite ordinary commit process crash atomicity", () => {
 	it(
 		"discovers every semantic mutation and accepts only complete atomic states at every cut",
@@ -390,4 +495,41 @@ describe.skipIf(process.platform === "win32")("SQLite ordinary commit process cr
 			}
 		},
 	);
+
+	it("keeps atomic repository creation absent or complete at every semantic cut", { timeout: 180_000 }, async () => {
+		const trace = await makeCase("trace", "create");
+		let absent: CrashCase | undefined;
+		let complete: CrashCase | undefined;
+		try {
+			expect(trace.result).toMatchObject({ code: 0, signal: null });
+			expect(trace.result.events).toEqual([
+				{ v: PROTOCOL_VERSION, event: "armed" },
+				{ v: PROTOCOL_VERSION, event: "catalog", cuts: CREATE_CUTS },
+				{ v: PROTOCOL_VERSION, event: "complete" },
+			]);
+			expect(trace.state).toEqual({ ...EXPECTED_CREATE_COMPLETE, writer_leases: [] });
+			absent = await makeCase("before-first-operation", "create");
+			complete = await makeCase("after-commit", "create");
+			for (const cut of CREATE_CUTS) {
+				const crash: CrashCase =
+					cut === "before-first-operation"
+						? absent
+						: cut === "after-commit"
+							? complete
+							: await makeCase(cut, "create");
+				try {
+					assertKilled(crash.result, cut);
+					const committed = cut === "after-commit";
+					expect(crash.state).toEqual(committed ? EXPECTED_CREATE_COMPLETE : EMPTY);
+					await verifyCreateRecovery(crash.path, committed);
+				} finally {
+					if (crash !== absent && crash !== complete) await rm(crash.dir, { recursive: true, force: true });
+				}
+			}
+		} finally {
+			await rm(trace.dir, { recursive: true, force: true });
+			if (absent) await rm(absent.dir, { recursive: true, force: true });
+			if (complete) await rm(complete.dir, { recursive: true, force: true });
+		}
+	});
 });
