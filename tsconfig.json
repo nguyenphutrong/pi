@@ -22,7 +22,7 @@
 				"./packages/agent/src/harness/session/testing/index.ts"
 			],
 			"@earendil-works/pi-agent-core/*": ["./packages/agent/src/*"],
-			"@earendil-works/pi-session-backend-sqlite-node": ["./packages/session-backends/sqlite-node/src/index.ts"],
+			"@nguyenphutrong/pi-session-sqlite": ["./packages/session-backends/sqlite-node/src/index.ts"],
 			"@earendil-works/pi-coding-agent": ["./packages/coding-agent/src/index.ts"],
 			"@earendil-works/pi-coding-agent/hooks": ["./packages/coding-agent/src/core/hooks/index.ts"],
 			"@earendil-works/pi-coding-agent/*": ["./packages/coding-agent/src/*"],

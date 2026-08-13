@@ -1,5 +1,14 @@
-import { describe, expect, it } from "vitest";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
 import { createNodeSqliteFactory } from "../src/index.ts";
+
+const tempDirs: string[] = [];
+
+afterEach(() => {
+	while (tempDirs.length > 0) rmSync(tempDirs.pop()!, { recursive: true, force: true });
+});
 
 describe("node:sqlite adapter", () => {
 	it("commits a synchronous transaction and returns its result", async () => {
@@ -52,6 +61,60 @@ describe("node:sqlite adapter", () => {
 			expect(db.prepare("SELECT value FROM values_table").all()).toEqual([]);
 		} finally {
 			db.close();
+		}
+	});
+
+	it("rolls back a failed transaction", async () => {
+		const db = await createNodeSqliteFactory().open(":memory:");
+		try {
+			db.exec("CREATE TABLE values_table (value INTEGER NOT NULL)");
+			expect(() =>
+				db.transaction(() => {
+					db.prepare("INSERT INTO values_table (value) VALUES (?)").run(42);
+					throw new Error("stop");
+				}),
+			).toThrow("stop");
+			expect(db.prepare("SELECT value FROM values_table").all()).toEqual([]);
+		} finally {
+			db.close();
+		}
+	});
+
+	it("takes the write lock before a read can create a stale WAL snapshot", async () => {
+		const directory = mkdtempSync(join(tmpdir(), "pi-session-sqlite-transaction-"));
+		tempDirs.push(directory);
+		const path = join(directory, "transactions.sqlite");
+		const factory = createNodeSqliteFactory();
+		const first = await factory.open(path);
+		const second = await factory.open(path);
+		try {
+			first.exec(
+				"PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1; CREATE TABLE values_table (value INTEGER NOT NULL)",
+			);
+			second.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=1");
+
+			first.exec("BEGIN");
+			first.prepare("SELECT value FROM values_table").all();
+			second.transaction(() => second.prepare("INSERT INTO values_table VALUES (?)").run(1));
+			expect(() => first.prepare("INSERT INTO values_table VALUES (?)").run(2)).toThrow(/locked/i);
+			first.exec("ROLLBACK");
+
+			first.transaction(() => {
+				first.prepare("SELECT value FROM values_table").all();
+				expect(() =>
+					second.transaction(() => second.prepare("INSERT INTO values_table VALUES (?)").run(2)),
+				).toThrow(/locked/i);
+				first.prepare("INSERT INTO values_table VALUES (?)").run(2);
+			});
+			second.transaction(() => second.prepare("INSERT INTO values_table VALUES (?)").run(3));
+			expect(first.prepare("SELECT value FROM values_table ORDER BY value").all()).toEqual([
+				{ value: 1 },
+				{ value: 2 },
+				{ value: 3 },
+			]);
+		} finally {
+			first.close();
+			second.close();
 		}
 	});
 });

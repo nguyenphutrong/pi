@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Breaking Changes
+
+- Replaced the legacy public agent-core backend with the private `@nguyenphutrong/pi-session-sqlite` package and canonical Storage schema boundary.
+
 ## [0.84.1] - 2026-08-07
 
 ### Added

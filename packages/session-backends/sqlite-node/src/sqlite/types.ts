@@ -1,5 +1,3 @@
-import type { FileSystem, SessionCreateOptions, SessionMetadata } from "@earendil-works/pi-agent-core";
-
 /** Result of a prepared SQLite statement execution. */
 export interface SqliteRunResult {
 	/** Number of rows changed by the statement. */
@@ -27,25 +25,3 @@ export interface SqliteDatabase {
 export interface SqliteDatabaseFactory {
 	open(path: string): Promise<SqliteDatabase>;
 }
-
-export interface SqliteSessionMetadata extends SessionMetadata {
-	cwd: string;
-	path: string;
-	parentSessionId?: string;
-	/** Current session name projected from SQLite global facts. */
-	name?: string;
-	/** Opaque application-owned metadata. */
-	metadata?: Record<string, unknown>;
-}
-
-export interface SqliteSessionCreateOptions extends SessionCreateOptions {
-	cwd: string;
-	parentSessionId?: string;
-	metadata?: Record<string, unknown>;
-}
-
-export interface SqliteSessionListOptions {
-	cwd?: string;
-}
-
-export type SqliteSessionRepositoryEnv = Pick<FileSystem, "absolutePath" | "createDir" | "exists">;
