@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.2b — Runtime attachment ownership and SessionTree façade
-- Status: mixed Entry/PendingEntry codecs and idle custom writes are complete at `f6967e387`; make RuntimeShell the sole attached tree-write and close owner
-- Done bar: `RuntimeShell.session` delegates ordered reads and attached writes, retained raw Session appends/close reject `active`, private runtime transitions remain inaccessible through the public Session/SessionTree surface, and close has no deadlock or ownership gap
+- Work item: 4.2c — Durable `inbox.writes` hydration, cancellation, and cleanup
+- Status: runtime attachment ownership and the ordered SessionTree façade are complete at `41e607471`; admit non-empty durable write inbox state without adding write placement yet
+- Done bar: restore dereferences every write through exact `pending.entry` lookups, preserves message/custom and absent/null payload semantics, rejects duplicate or cross-owner identity collisions, lets cancellation atomically remove only the selected write, preserves writes through abort, and removes residual operation-owned write registers only in terminal cleanup
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Add runtime attachment ownership and the SessionTree façade.
-2. Enable durable `inbox.writes`, hydration, cancellation, and cleanup.
-3. Add write admission, atomic placement, projector/planner actions, and crash evidence.
-4. Add `waitForIdle` and `runWhenIdle`.
-5. Complete whole-Phase-4 acceptance and independent done-bar review.
+1. Enable durable `inbox.writes`, hydration, cancellation, and cleanup.
+2. Add write admission and atomic placement.
+3. Add projector/context and planner actions with stale/fault/close coverage.
+4. Add representative SQLite deferred-write crash evidence.
+5. Add `waitForIdle` and `runWhenIdle`, then complete whole-Phase-4 acceptance.
 
 ## Phase order
 

@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. D-050 increment 4.2a is complete; runtime attachment ownership and SessionTree façade are next.
+No active blockers. D-050 increment 4.2b is complete; durable `inbox.writes` hydration, cancellation, and cleanup are next.
 
 ## B-016 — Choose the custom-entry projector timing contract
 
