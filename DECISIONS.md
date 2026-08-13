@@ -1104,3 +1104,40 @@ This testing export is additive only under `@nguyenphutrong/pi-session-storage/t
 The corrected independent design review reports PASS with no §6 escalation.
 
 Commit `bc071197b` implements D-038. Exact entry and usage reads use bounded chunks, preserve caller order, and revalidate the canonical session after all chunks so a second connection deleting at lease expiry cannot produce a partial result. The shared ordinary-read vectors pass on Memory and SQLite without changing full conformance. SQLite passes 103/103 tests, Storage passes 38/38, both package builds, `npm run check`, and `git diff --check` pass. The final independent review reports PASS after deterministic two-connection deletion regressions and exact production-SQL query-plan evidence closed earlier findings.
+
+## D-039 — Project and read only validated segmented branch closures
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-032–D-038; `packages/agent/docs/harness-v3.md` §§1.2, 1.4–1.7, 2.5–2.6, 9.1, 9.3
+
+### Options
+
+1. Materialize and validate each complete segmented closure, require every physical candidate to agree, then evaluate branch-query semantics over that canonical structure vector.
+2. Stream physical segment rows directly into filtered output while resolving bases and pagination.
+3. Flatten every divergence into one physical root-to-parent segment.
+
+### Choice
+
+Option 1. It gives one local proof for candidate eligibility, segment-chain soundness, compaction ownership, and payload reconciliation. Option 2 interleaves structural validation with pagination and makes corruption detection order-dependent. Option 3 copies an unbounded prefix and violates §2.6.
+
+### Rationale
+
+Every segment id is `segment:{newEntryId}`. A root creates one null-base metadata row and one branch row. An exact current-tip append inserts one row and conditionally advances the matching metadata tip. A non-tip append resolves every physical parent candidate through `ix_be_entry`. Zero candidates are persisted corruption because transaction preflight already proved the parent entry exists.
+
+Each candidate materializes with initial upper bound equal to the parent's sequence. A segment owns `(baseSeq, upper]`; following its base sets `upper = baseSeq`, so the base segment alone emits the junction row at that inclusive upper bound. Bounds strictly decrease. Repeated branches, cycles, missing metadata or range rows, invalid joined envelopes, inactive physical membership, a bad tip/base/junction, gaps, or duplicates are persisted corruption. The canonical root-to-parent vector has strictly increasing but not necessarily consecutive sequences, a null root parent, exact adjacent parent links, and the requested parent as its final row. Every physical candidate must produce the same `(id, parentId, seq, timestamp, type, customType)` vector. Only then is the candidate with `(branch_meta.tip_seq DESC, branch_id ASC)` selected.
+
+The newest compaction is the highest-sequence compaction in that selected complete vector, including base chains. Materialization records which selected-chain interval emitted each row. If compaction C exists, the new segment points to that exact owner branch with `baseSeq = C.seq` and copies only `(C.seq, parent.seq]`; when the parent is C, it copies zero rows. Without C, the base pair is null and the exact root-through-parent vector is copied. Bounded branch-index ranges supply copies; production never inventories entries or follows parent pointers. The projector runs immediately after each entry insert, so a later entry in the same transaction observes all earlier projections. Any later failure rolls back entries, projection, stats, sequence, lease renewal, and atomic creation together.
+
+Branch reads synchronously validate and detach the query before FIFO admission, resolve and agree every physical start candidate, and produce one canonical root-to-start structure vector plus non-overlapping owner intervals. They then apply exactly: requested ordering, first inclusive id/type stop, type/custom-type filtering, directional exclusive cursor, and limit. Structure reads return only detached structural fields.
+
+Payload reads first establish the complete canonical structure closure. Exact production `CROSS JOIN` interval queries drive from `branch_entries` through covering `ix_be_seq`, or `ix_be_type` when applicable, and point-join `entries` by its composite primary key. Every selected identity must have exactly one matching payload row, no foreign or duplicate row is accepted, and output is reconstructed in canonical structure order rather than SQL return order. An empty selected result runs no payload SQL. Query-plan tests use the production SQL constants and reject an entries scan or temporary ordering b-tree. SQL never merges segment ordering globally; code combines bounded intervals.
+
+The transaction engine and atomic creation path receive the same private prepare-only projector. Entry rejection and placeholder callbacks disappear only when both paths project correctly. The private handle then gains `scanBranch` and `scanBranchStructure` through the existing file FIFO, fault latch, and close ordering. The actual complete handle—not a cast, fake Storage, or seed-only fixture—must pass the unchanged shared full conformance suite alongside Memory.
+
+Caller UUID, shape, order, cursor, and filter defects remain reusable `invalid_query`; a missing or forward submitted parent remains reusable `invalid_transaction`; caller duplicate durable ids retain reusable unmarked `corruption`. Missing committed projection, malformed metadata or rows, cycles, candidate disagreement, structural or payload mismatch, and impossible tip/base/junction state are privately marked persisted corruption and seal only the affected handle. Unexpected adapter/SQL errors retain identity and seal. Already-admitted terminal identity, late `closed`, fenced release, and rollback semantics remain D-037/D-038.
+
+Focused gates cover roots and tips, divergence with and without compaction, compactions in older bases, exact junction ownership, parent-equals-compaction zero-copy, candidate agreement, same-transaction root/child/sibling projection, rollback and sequence reuse, nested-chain soundness, complete query semantics in both orders, payload/structure parity, corruption, reopen, FIFO/close/fault precedence, exact plans, atomic create/commit, and unchanged full Memory/SQLite Storage conformance.
+
+Explicit repair, Harness integration, FTS/search, forks, retired ranges and retention, JSONL, and subprocess crash matrices remain later ordered work. The corrected independent design review reports PASS with no §6 escalation.
