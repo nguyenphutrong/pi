@@ -1003,8 +1003,10 @@ describe("Phase 1 runtime shell", () => {
 			inbox: { steer: [], followUp: [], writes: [] },
 			latestAssistantEntryId: null,
 		});
-		expect(accepted.entries.get(assistantId)?.message).toEqual(assistant());
-		expect(accepted.entries.get(toolResultId)?.message).toEqual(toolResult());
+		const acceptedAssistant = accepted.entries.get(assistantId);
+		const acceptedToolResult = accepted.entries.get(toolResultId);
+		expect(acceptedAssistant?.type === "message" ? acceptedAssistant.message : undefined).toEqual(assistant());
+		expect(acceptedToolResult?.type === "message" ? acceptedToolResult.message : undefined).toEqual(toolResult());
 		expect(await shell.peekAction()).toMatchObject({ kind: "start_assistant_step", operationId });
 		await shell.close();
 	});

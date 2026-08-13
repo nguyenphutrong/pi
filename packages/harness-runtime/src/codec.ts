@@ -1,8 +1,8 @@
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import { assertEntry, assertJsonValue, type Entry, type JsonValue } from "@nguyenphutrong/pi-session-storage";
-import { type MessageEntry, SessionError } from "./types.ts";
+import { type CustomEntry, type Entry as PublicEntry, SessionError } from "./types.ts";
 
-type Code = "invalid_message" | "corruption";
+type Code = "invalid_message" | "invalid_query" | "corruption";
 
 function fail(code: Code, message: string): never {
 	throw new SessionError(code, message);
@@ -184,28 +184,76 @@ export function encodeMessage(message: Message): JsonValue {
 	return encoded;
 }
 
-export interface PendingMessageEntry {
-	readonly type: "message";
-	readonly payload: Message;
+export type PendingEntry =
+	| { readonly type: "message"; readonly payload: Message }
+	| { readonly type: "custom"; readonly customType: string; readonly payload?: JsonValue };
+
+function customType(value: unknown, code: Code): asserts value is string {
+	string(value, code, "customType");
+	if (value.length === 0 || value.includes("\u0000")) fail(code, "customType must be non-empty and contain no NUL");
 }
 
-export function encodePendingMessageEntry(message: Message): JsonValue {
-	return { type: "message", payload: encodeMessage(message) };
+function detachedJson(value: unknown, code: Code, label: string): asserts value is JsonValue {
+	try {
+		assertJsonValue(value);
+	} catch (error) {
+		throw new SessionError(code, `${label} must be detached JSON-safe data`, error);
+	}
 }
 
-export function decodePendingMessageEntry(value: unknown): PendingMessageEntry {
+export function encodePendingEntry(entry: PendingEntry): JsonValue {
+	const pending = object(entry, "invalid_query", "pending entry");
+	if (pending.type === "message") {
+		fields(pending, ["type", "payload"], [], "invalid_query", "pending entry");
+		validateMessage(pending.payload, "invalid_message");
+		return { type: "message", payload: encodeMessage(pending.payload) };
+	}
+	if (pending.type !== "custom") fail("invalid_query", "Pending entry has an unsupported type");
+	fields(pending, ["type", "customType"], ["payload"], "invalid_query", "pending entry");
+	customType(pending.customType, "invalid_query");
+	if (!Object.hasOwn(pending, "payload")) return { type: "custom", customType: pending.customType };
+	detachedJson(pending.payload, "invalid_query", "Custom entry payload");
+	return { type: "custom", customType: pending.customType, payload: structuredClone(pending.payload) };
+}
+
+export function decodePendingEntry(value: unknown): PendingEntry {
 	const pending = object(value, "corruption", "pending entry");
-	fields(pending, ["type", "payload"], [], "corruption", "pending entry");
-	if (pending.type !== "message") fail("corruption", "Pending entry type must be message");
-	validateMessage(pending.payload, "corruption");
-	return Object.freeze({ type: "message", payload: structuredClone(pending.payload) });
+	if (pending.type === "message") {
+		fields(pending, ["type", "payload"], [], "corruption", "pending entry");
+		validateMessage(pending.payload, "corruption");
+		return Object.freeze({ type: "message", payload: structuredClone(pending.payload) });
+	}
+	if (pending.type !== "custom") fail("corruption", "Pending entry has an unsupported type");
+	fields(pending, ["type", "customType"], ["payload"], "corruption", "pending entry");
+	customType(pending.customType, "corruption");
+	if (!Object.hasOwn(pending, "payload")) return Object.freeze({ type: "custom", customType: pending.customType });
+	detachedJson(pending.payload, "corruption", "Custom pending payload");
+	return Object.freeze({
+		type: "custom",
+		customType: pending.customType,
+		payload: structuredClone(pending.payload),
+	});
 }
 
-export function decodeMessageEntry(candidate: Entry): MessageEntry {
+export function decodeEntry(candidate: Entry): PublicEntry {
 	try {
 		assertEntry(candidate);
 	} catch (error) {
 		throw new SessionError("corruption", "Malformed storage entry envelope", error);
+	}
+	if (candidate.type === "custom") {
+		customType(candidate.customType, "corruption");
+		if (Object.hasOwn(candidate, "payload")) detachedJson(candidate.payload, "corruption", "Custom entry payload");
+		const entry: CustomEntry = Object.freeze({
+			id: candidate.id,
+			parentId: candidate.parentId,
+			seq: candidate.seq,
+			timestamp: candidate.timestamp,
+			type: "custom",
+			customType: candidate.customType,
+			...(Object.hasOwn(candidate, "payload") ? { data: structuredClone(candidate.payload) } : {}),
+		});
+		return entry;
 	}
 	if (candidate.type !== "message" || candidate.payload === undefined)
 		fail("corruption", `Unsupported persisted entry type: ${candidate.type}`);

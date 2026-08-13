@@ -1,5 +1,5 @@
 import type { Message } from "@earendil-works/pi-ai";
-import { MemoryStorage } from "@nguyenphutrong/pi-session-storage";
+import { type JsonValue, MemoryStorage } from "@nguyenphutrong/pi-session-storage";
 import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import { type BranchBounds, CURRENT_STORAGE_VERSION, type EntryQuery, MemorySessionRepo } from "../src/index.ts";
@@ -68,6 +68,121 @@ describe("StoredSession", () => {
 		await session.close();
 	});
 
+	it("appends exact custom storage envelopes in entry then leaf order and round-trips absent, null, and nested data", async () => {
+		const instrumented = instrumentStorage(await initializedStorage());
+		const session = new StoredSession(metadata(), instrumented, () => undefined);
+		const absent = await session.appendCustomEntry("absent");
+		const explicitNull = await session.appendCustomEntry("null", null);
+		const nested = await session.appendCustomEntry("nested", { array: [1, { ok: true }] });
+		expect(instrumented.committedTransactions.map(({ writes }) => writes)).toEqual([
+			[
+				{ kind: "entry", entry: { id: absent, parentId: null, type: "custom", customType: "absent" } },
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: absent },
+			],
+			[
+				{
+					kind: "entry",
+					entry: { id: explicitNull, parentId: absent, type: "custom", customType: "null", payload: null },
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: explicitNull },
+			],
+			[
+				{
+					kind: "entry",
+					entry: {
+						id: nested,
+						parentId: explicitNull,
+						type: "custom",
+						customType: "nested",
+						payload: { array: [1, { ok: true }] },
+					},
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: nested },
+			],
+		]);
+		const entries = await session.getEntries([absent, explicitNull, nested]);
+		expect(Object.hasOwn(entries.get(absent)!, "data")).toBe(false);
+		expect(Object.hasOwn(entries.get(explicitNull)!, "data")).toBe(true);
+		expect(entries.get(nested)).toMatchObject({ data: { array: [1, { ok: true }] } });
+		await session.close();
+	});
+
+	it("captures custom data at invocation and detaches returned mutations from storage", async () => {
+		const session = await new MemorySessionRepo().create();
+		const data = { nested: { value: "original" } };
+		const append = session.appendCustomEntry("mutable", data);
+		data.nested.value = "caller mutation";
+		const entryId = await append;
+		const returned = await session.getEntry(entryId);
+		if (returned?.type !== "custom") throw new Error("custom entry missing");
+		(returned.data as { nested: { value: string } }).nested.value = "returned mutation";
+		expect(await session.getEntry(entryId)).toMatchObject({ data: { nested: { value: "original" } } });
+		await session.close();
+	});
+
+	it("reads mixed entries with default, filters, branch stops, cursors, order, and limit", async () => {
+		const session = await new MemorySessionRepo().create();
+		const ids = [
+			await session.appendMessage(user("one")),
+			await session.appendCustomEntry("note", { n: 1 }),
+			await session.appendMessage(user("two")),
+			await session.appendCustomEntry("other"),
+			await session.appendCustomEntry("note", null),
+		];
+		const oldest = await session.findEntries({ order: "oldestFirst" });
+		expect(oldest.map(({ id: entryId }) => entryId)).toEqual(ids);
+		expect((await session.findEntries()).map(({ id: entryId }) => entryId)).toEqual([...ids].reverse());
+		expect((await session.findEntries({ type: "message" })).map(({ id: entryId }) => entryId)).toEqual([
+			ids[2],
+			ids[0],
+		]);
+		expect(
+			(await session.findEntries({ type: "custom", customType: "note" })).map(({ id: entryId }) => entryId),
+		).toEqual([ids[4], ids[1]]);
+		expect(
+			(await session.findEntries({ order: "oldestFirst", cursor: { seq: oldest[1].seq }, limit: 2 })).map(
+				({ id: entryId }) => entryId,
+			),
+		).toEqual(ids.slice(2, 4));
+		expect((await session.findEntriesOnBranch({ stopAtType: "custom" })).map(({ id: entryId }) => entryId)).toEqual([
+			ids[4],
+		]);
+		expect(
+			(await session.findEntriesOnBranch({ order: "oldestFirst", stopAtType: "custom" })).map(
+				({ id: entryId }) => entryId,
+			),
+		).toEqual(ids.slice(0, 2));
+		expect(await session.projectBuiltinContext()).toEqual([user("one"), user("two")]);
+		await session.close();
+	});
+
+	it("rejects invalid custom writes and filter combinations without writes", async () => {
+		const instrumented = instrumentStorage(await initializedStorage());
+		const session = new StoredSession(metadata(), instrumented, () => undefined);
+		const cyclic: Record<string, JsonValue> = {};
+		cyclic.self = cyclic;
+		for (const [label, action, code] of [
+			["empty type", () => session.appendCustomEntry(""), "invalid_query"],
+			["NUL type", () => session.appendCustomEntry("bad\0type"), "invalid_query"],
+			[
+				"non JSON",
+				() => session.appendCustomEntry("bad", { value: undefined } as unknown as JsonValue),
+				"invalid_query",
+			],
+			["cyclic", () => session.appendCustomEntry("bad", cyclic), "invalid_query"],
+			["customType alone", () => session.findEntries(asQuery({ customType: "note" })), "invalid_query"],
+			[
+				"customType with message",
+				() => session.findEntries(asQuery({ type: "message", customType: "note" })),
+				"invalid_query",
+			],
+			["empty filter", () => session.findEntries(asQuery({ type: "custom", customType: "" })), "invalid_query"],
+		] as const)
+			await expect(action(), label).rejects.toMatchObject({ code });
+		expect(instrumented.committedTransactions).toEqual([]);
+		await session.close();
+	});
+
 	it("close drains an append admitted before sealing", async () => {
 		const storage = await initializedStorage();
 		const session = new StoredSession(metadata(), storage, () => undefined);
@@ -113,9 +228,14 @@ describe("StoredSession", () => {
 		await session.appendMessage(messages[2]);
 		(messages[0].content as { type: "text"; text: string }[])[0].text = "mutated";
 		const returned = await session.getEntry(firstId);
-		if (returned?.message.role === "user" && typeof returned.message.content !== "string")
+		if (
+			returned?.type === "message" &&
+			returned.message.role === "user" &&
+			typeof returned.message.content !== "string"
+		)
 			returned.message.content[0] = { type: "text", text: "returned mutation" };
-		expect((await session.getEntry(firstId))?.message).toEqual({
+		const reread = await session.getEntry(firstId);
+		expect(reread?.type === "message" ? reread.message : undefined).toEqual({
 			role: "user",
 			content: [
 				{ type: "text", text: "hello" },

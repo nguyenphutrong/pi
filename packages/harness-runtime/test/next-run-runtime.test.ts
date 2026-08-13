@@ -109,7 +109,8 @@ describe("RuntimeShell next-run queue", () => {
 		});
 		const consumed = await fixture.session.refreshRuntimeAttachment();
 		expect(consumed.mainLeaf.value).toBe(steer.entryId);
-		expect(consumed.entries.get(steer.entryId)?.message).toEqual(steerPayload);
+		const consumedEntry = consumed.entries.get(steer.entryId);
+		expect(consumedEntry?.type === "message" ? consumedEntry.message : undefined).toEqual(steerPayload);
 		expect(consumed.runState?.value.inbox).toEqual({ steer: [], followUp: [follow.entryId], writes: [] });
 		await fixture.shell.close();
 	});

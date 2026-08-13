@@ -9,10 +9,15 @@ import type { LaneConfiguration } from "../src/durable.ts";
 import type { ActionInfo } from "../src/planner.ts";
 import { SqliteSessionRepo } from "../src/repo.ts";
 import { createRuntimeShell, type RuntimeShell, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
-import type { MessageEntry, Session, SessionMetadata } from "../src/types.ts";
+import type { Entry, MessageEntry, Session, SessionMetadata } from "../src/types.ts";
 import { user, ZERO_USAGE } from "./fixtures.ts";
 
 const directories: string[] = [];
+
+function messageEntries(entries: Entry[]): MessageEntry[] {
+	if (!entries.every((entry) => entry.type === "message")) throw new Error("Expected only message entries");
+	return entries;
+}
 
 afterEach(async () => {
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -263,7 +268,7 @@ async function assertTerminal(
 	expected: { providerCalls: number; providerToolResultCalls: number; toolCalls: number; interrupted: boolean },
 	cut: number,
 ): Promise<MessageEntry[]> {
-	const branch = await session.findEntriesOnBranch({ order: "oldestFirst" });
+	const branch = messageEntries(await session.findEntriesOnBranch({ order: "oldestFirst" }));
 	expect(branch).toHaveLength(4);
 	expect(branch.map(({ message }) => message.role)).toEqual(["user", "assistant", "toolResult", "assistant"]);
 	expect(new Set(branch.map(({ id }) => id)).size).toBe(4);

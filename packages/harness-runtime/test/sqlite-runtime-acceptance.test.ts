@@ -9,10 +9,15 @@ import type { ActionInfo } from "../src/planner.ts";
 import { SqliteSessionRepo } from "../src/repo.ts";
 import { attachRuntime } from "../src/runtime-port.ts";
 import { createRuntimeShell, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
-import type { Session, SessionMetadata } from "../src/types.ts";
+import type { Entry, MessageEntry, Session, SessionMetadata } from "../src/types.ts";
 import { user, ZERO_USAGE } from "./fixtures.ts";
 
 const directories: string[] = [];
+
+function messageEntries(entries: Entry[]): MessageEntry[] {
+	if (!entries.every((entry) => entry.type === "message")) throw new Error("Expected only message entries");
+	return entries;
+}
 
 afterEach(async () => {
 	await Promise.all(directories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })));
@@ -244,7 +249,7 @@ async function runScenario(withTool: boolean): Promise<void> {
 		expect(actions.map(({ kind }) => kind)).toEqual(withTool ? toolTrace : noToolTrace);
 		expect(actions.every((action) => action.operationId === operationId)).toBe(true);
 		terminalLeaf = (await session.getLeafId())!;
-		const branch = await session.findEntriesOnBranch({ order: "oldestFirst" });
+		const branch = messageEntries(await session.findEntriesOnBranch({ order: "oldestFirst" }));
 		const firstStep = actions[1] as Extract<ActionInfo, { kind: "prepare_assistant_effect" }>;
 		expect(actions[0]).toEqual({ kind: "start_assistant_step", operationId, triggerEntryId: promptEntryId });
 		expect(firstStep).toEqual({

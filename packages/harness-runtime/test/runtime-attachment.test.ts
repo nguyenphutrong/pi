@@ -637,6 +637,33 @@ describe("bounded Phase 1 closure validation", () => {
 		expect(entryLookups[0]).not.toContain(injected);
 	});
 
+	it("accepts a custom idle source before prompt attachment while retaining message-only prompt validation", async () => {
+		const fixture = operationFixture();
+		const customSource = fixture.writes.map(
+			(write): Write =>
+				write.kind === "entry" && write.entry.id === fixture.source
+					? { ...write, entry: { id: fixture.source, parentId: null, type: "custom", customType: "source" } }
+					: write,
+		);
+		const storage = await storageWith(customSource);
+		const runtimeSession = session(storage);
+		await expect(attachRuntime(runtimeSession, seed())).resolves.toMatchObject({
+			entries: expect.anything(),
+		});
+		await runtimeSession.close();
+
+		const malformedPrompt = customSource.map(
+			(write): Write =>
+				write.kind === "entry" && write.entry.id === fixture.prompt
+					? {
+							...write,
+							entry: { id: fixture.prompt, parentId: fixture.source, type: "custom", customType: "prompt" },
+						}
+					: write,
+		);
+		await expect(validateMainLane(await storageWith(malformedPrompt))).rejects.toMatchObject({ code: "corruption" });
+	});
+
 	it.each([
 		"older unrelated trigger",
 		"stale intent prompt",

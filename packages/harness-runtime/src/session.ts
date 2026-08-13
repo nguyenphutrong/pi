@@ -17,13 +17,7 @@ import {
 	type Write,
 } from "@nguyenphutrong/pi-session-storage";
 import { classifyAssistantSettlement } from "./assistant-settlement.ts";
-import {
-	decodeMessageEntry,
-	decodePendingMessageEntry,
-	encodeMessage,
-	encodePendingMessageEntry,
-	type PendingMessageEntry,
-} from "./codec.ts";
+import { decodeEntry, decodePendingEntry, encodeMessage, encodePendingEntry, type PendingEntry } from "./codec.ts";
 import {
 	type CurrentRegister,
 	decodeConfigurationRegister,
@@ -44,6 +38,7 @@ import {
 } from "./durable.ts";
 import {
 	type BranchBounds,
+	type Entry,
 	type EntryQuery,
 	type MessageEntry,
 	type Session,
@@ -82,15 +77,20 @@ function isExactDataObject(value: unknown, allowedFields: ReadonlySet<string>): 
 	return true;
 }
 
-const GLOBAL_QUERY_FIELDS = new Set(["type", "order", "limit", "cursor"]);
+const GLOBAL_QUERY_FIELDS = new Set(["type", "customType", "order", "limit", "cursor"]);
 const BRANCH_QUERY_FIELDS = new Set([...GLOBAL_QUERY_FIELDS, "start", "stopAtType", "stopAtId"]);
 const CURSOR_FIELDS = new Set(["seq"]);
 
 function validateQuery(query: unknown, branch: boolean): asserts query is EntryQuery & Partial<BranchBounds> {
 	if (!isExactDataObject(query, branch ? BRANCH_QUERY_FIELDS : GLOBAL_QUERY_FIELDS))
 		throw new SessionError("invalid_query", "Query must be a plain object with only supported fields");
-	if (query.type !== undefined && query.type !== "message")
-		throw new SessionError("invalid_query", 'type must be "message"');
+	if (query.type !== undefined && query.type !== "message" && query.type !== "custom")
+		throw new SessionError("invalid_query", 'type must be "message" or "custom"');
+	if (query.customType !== undefined) {
+		if (query.type !== "custom") throw new SessionError("invalid_query", 'customType requires type "custom"');
+		if (typeof query.customType !== "string" || query.customType.length === 0 || query.customType.includes("\u0000"))
+			throw new SessionError("invalid_query", "customType must be non-empty and contain no NUL");
+	}
 	if (query.order !== undefined && query.order !== "newestFirst" && query.order !== "oldestFirst")
 		throw new SessionError("invalid_query", "order must be newestFirst or oldestFirst");
 	if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || (query.limit as number) <= 0))
@@ -107,8 +107,8 @@ function validateQuery(query: unknown, branch: boolean): asserts query is EntryQ
 	if (!branch) return;
 	if (query.start !== undefined && (typeof query.start !== "string" || !isUuidV7(query.start)))
 		throw new SessionError("invalid_query", "start must be a UUIDv7");
-	if (query.stopAtType !== undefined && query.stopAtType !== "message")
-		throw new SessionError("invalid_query", 'stopAtType must be "message"');
+	if (query.stopAtType !== undefined && query.stopAtType !== "message" && query.stopAtType !== "custom")
+		throw new SessionError("invalid_query", 'stopAtType must be "message" or "custom"');
 	if (query.stopAtId !== undefined && (typeof query.stopAtId !== "string" || !isUuidV7(query.stopAtId)))
 		throw new SessionError("invalid_query", "stopAtId must be a UUIDv7");
 }
@@ -132,8 +132,8 @@ function decodeIdleMainStateRegister(candidate: unknown): void {
 }
 
 interface CurrentStateHydration {
-	readonly entries: ReadonlyMap<string, MessageEntry>;
-	readonly pendingEntries: ReadonlyMap<string, PendingMessageEntry>;
+	readonly entries: ReadonlyMap<string, Entry>;
+	readonly pendingEntries: ReadonlyMap<string, PendingEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
 	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
@@ -181,6 +181,16 @@ class ImmutableMap<K, V> implements ReadonlyMap<K, V> {
 	get [Symbol.toStringTag](): string {
 		return "Map";
 	}
+}
+
+function requirePendingMessage(entry: PendingEntry | undefined, name: string): Message {
+	if (entry?.type !== "message") throw new SessionError("corruption", `${name} must reference a pending message`);
+	return entry.payload;
+}
+
+function requireStoredMessage(entry: Entry | undefined, name: string): MessageEntry {
+	if (entry?.type !== "message") throw new SessionError("corruption", `${name} must reference a message entry`);
+	return entry;
 }
 
 interface CurrentLogicalIds {
@@ -297,14 +307,14 @@ async function hydrateCurrentState(
 					),
 				)
 			: [];
-	const entries = new Map<string, MessageEntry>();
+	const entries = new Map<string, Entry>();
 	for (const [id, candidate] of storedEntries) {
-		const entry = decodeMessageEntry(candidate);
+		const entry = decodeEntry(candidate);
 		if (entry.id !== id || !entryIds.has(id))
 			throw new SessionError("corruption", "Current-state entry lookup returned the wrong identity");
 		entries.set(id, entry);
 	}
-	const pendingEntries = new Map<string, PendingMessageEntry>();
+	const pendingEntries = new Map<string, PendingEntry>();
 	for (let index = 0; index < pendingIds.length; index++) {
 		const id = pendingIds[index];
 		const register = pendingRegisters[index];
@@ -317,7 +327,10 @@ async function hydrateCurrentState(
 		if (register.namespace !== "pending.entry" || register.key !== id)
 			throw new SessionError("corruption", "Pending entry register has the wrong identity");
 		if (storedEntries.has(id)) throw new SessionError("corruption", "Pending entry is also materialized");
-		pendingEntries.set(id, decodePendingMessageEntry(register.value));
+		const pending = decodePendingEntry(register.value);
+		if (pending.type !== "message")
+			throw new SessionError("corruption", "Message-only queue references a custom pending entry");
+		pendingEntries.set(id, pending);
 	}
 	const usageRows = new Map<string, UsageRow>();
 	for (const [id, candidate] of storedUsageRows) {
@@ -332,9 +345,14 @@ async function hydrateCurrentState(
 	}
 	const toolArguments = new Map<string, Readonly<Record<string, JsonValue>>>();
 
-	const requireEntry = (id: string, name: string): MessageEntry => {
+	const requireEntry = (id: string, name: string): Entry => {
 		const entry = entries.get(id);
-		if (!entry) throw new SessionError("corruption", `${name} references a missing message entry`);
+		if (!entry) throw new SessionError("corruption", `${name} references a missing entry`);
+		return entry;
+	};
+	const requireMessageEntry = (id: string, name: string): MessageEntry => {
+		const entry = requireEntry(id, name);
+		if (entry.type !== "message") throw new SessionError("corruption", `${name} must reference a message entry`);
 		return entry;
 	};
 	if (mainLeaf.value !== null) requireEntry(mainLeaf.value, "Main leaf");
@@ -346,27 +364,27 @@ async function hydrateCurrentState(
 		let expectedParent = operation.sourceLeafId;
 		if (expectedParent !== null) {
 			const source = requireEntry(expectedParent, "Operation source leaf");
-			const firstPrompt = requireEntry(operation.intent.promptEntryIds[0], "Run prompt");
+			const firstPrompt = requireMessageEntry(operation.intent.promptEntryIds[0], "Run prompt");
 			if (source.seq >= firstPrompt.seq)
 				throw new SessionError("corruption", "Operation source leaf must precede the run prompt");
 		}
 		for (let index = 0; index < operation.intent.promptEntryIds.length; index++) {
 			const id = operation.intent.promptEntryIds[index];
-			const prompt = requireEntry(id, "Run prompt");
+			const prompt = requireMessageEntry(id, "Run prompt");
 			if (index > 0 && prompt.parentId !== expectedParent)
 				throw new SessionError("corruption", "Run prompt entries do not extend the operation source in order");
 			expectedParent = id;
 		}
 		const newestPromptId = operation.intent.promptEntryIds.at(-1)!;
-		const newestPrompt = requireEntry(newestPromptId, "Newest run prompt");
-		const trigger = requireEntry(triggerEntryId, "Current trigger");
+		const newestPrompt = requireMessageEntry(newestPromptId, "Newest run prompt");
+		const trigger = requireMessageEntry(triggerEntryId, "Current trigger");
 		if (operation.intent.promptEntryIds.includes(triggerEntryId)) {
 			if (triggerEntryId !== newestPromptId)
 				throw new SessionError("corruption", "Current trigger references a stale run prompt");
 		} else if (trigger.seq <= newestPrompt.seq)
 			throw new SessionError("corruption", "Current trigger must be newer than the run prompt");
 		if (state.latestAssistantEntryId !== null) {
-			const latest = requireEntry(state.latestAssistantEntryId, "Latest assistant");
+			const latest = requireMessageEntry(state.latestAssistantEntryId, "Latest assistant");
 			if (latest.message.role !== "assistant")
 				throw new SessionError("corruption", "Latest assistant entry must contain an assistant message");
 			if (latest.seq <= newestPrompt.seq)
@@ -413,7 +431,7 @@ async function hydrateCurrentState(
 				throw new SessionError("corruption", "Failure drain has an invalid assistant closure");
 		} else if (state.phase.kind === "tools") {
 			const batch = state.phase.batch;
-			const assistant = requireEntry(batch.assistantEntryId, "Tool batch assistant");
+			const assistant = requireMessageEntry(batch.assistantEntryId, "Tool batch assistant");
 			const sourceCalls =
 				assistant.message.role === "assistant"
 					? assistant.message.content.filter((content) => content.type === "toolCall")
@@ -461,7 +479,7 @@ async function hydrateCurrentState(
 				} else if (call.status === "completed") {
 					if (
 						unfinishedSeen ||
-						!result ||
+						result?.type !== "message" ||
 						result.parentId !== expectedToolParent ||
 						result.message.role !== "toolResult" ||
 						result.message.toolCallId !== source.id ||
@@ -503,7 +521,10 @@ async function hydrateCurrentState(
 		const usage = usageRows.get(usageId);
 		if ((response === undefined) !== (usage === undefined))
 			throw new SessionError("corruption", "Generation response and usage reservations must materialize together");
-		if (response && (response.message.role !== "assistant" || response.parentId !== triggerEntryId))
+		if (
+			response &&
+			(response.type !== "message" || response.message.role !== "assistant" || response.parentId !== triggerEntryId)
+		)
 			throw new SessionError("corruption", "Materialized response reservation has an invalid assistant closure");
 		if (usage && (usage.id !== usageId || usage.adjustment || usage.entryId !== responseEntryId))
 			throw new SessionError("corruption", "Materialized usage reservation does not match its response");
@@ -551,8 +572,8 @@ export interface RuntimeAttachment {
 	readonly mainLeaf: CurrentRegister<string | null>;
 	readonly runOperation?: CurrentRegister<RunOperation>;
 	readonly runState?: CurrentRegister<RunState>;
-	readonly entries: ReadonlyMap<string, MessageEntry>;
-	readonly pendingEntries: ReadonlyMap<string, PendingMessageEntry>;
+	readonly entries: ReadonlyMap<string, Entry>;
+	readonly pendingEntries: ReadonlyMap<string, PendingEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
 	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
@@ -1046,7 +1067,7 @@ export class StoredSession implements Session {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		let payload: JsonValue;
 		try {
-			payload = encodePendingMessageEntry(message);
+			payload = encodePendingEntry({ type: "message", payload: message });
 		} catch (error) {
 			return Promise.reject(error);
 		}
@@ -1092,7 +1113,7 @@ export class StoredSession implements Session {
 				],
 			});
 			const pendingEntries = new Map(attachment.pendingEntries);
-			pendingEntries.set(entryId, decodePendingMessageEntry(payload));
+			pendingEntries.set(entryId, decodePendingEntry(payload));
 			return Object.freeze({
 				entryId,
 				attachment: Object.freeze({
@@ -1115,7 +1136,7 @@ export class StoredSession implements Session {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		let payload: JsonValue;
 		try {
-			payload = encodePendingMessageEntry(message);
+			payload = encodePendingEntry({ type: "message", payload: message });
 		} catch (error) {
 			return Promise.reject(error);
 		}
@@ -1165,7 +1186,7 @@ export class StoredSession implements Session {
 				],
 			});
 			const pendingEntries = new Map(attachment.pendingEntries);
-			pendingEntries.set(entryId, decodePendingMessageEntry(payload));
+			pendingEntries.set(entryId, decodePendingEntry(payload));
 			return Object.freeze({
 				entryId,
 				attachment: Object.freeze({
@@ -1204,7 +1225,12 @@ export class StoredSession implements Session {
 				if (!pending) throw new SessionError("corruption", "Consumed queue payload is missing");
 				const write = {
 					kind: "entry" as const,
-					entry: { id, parentId, type: "message" as const, payload: encodeMessage(pending.payload) },
+					entry: {
+						id,
+						parentId,
+						type: "message" as const,
+						payload: encodeMessage(requirePendingMessage(pending, "Consumed queue")),
+					},
 				};
 				parentId = id;
 				return write;
@@ -1249,7 +1275,7 @@ export class StoredSession implements Session {
 						seq: committed.seqs[index],
 						timestamp: committed.timestamp,
 						type: "message" as const,
-						message: structuredClone(attachment.pendingEntries.get(id)!.payload),
+						message: structuredClone(requirePendingMessage(attachment.pendingEntries.get(id), "Consumed queue")),
 					}),
 				);
 				pendingEntries.delete(id);
@@ -1368,10 +1394,10 @@ export class StoredSession implements Session {
 					status: "already_requested" as const,
 					operationId,
 					drainedSteer: attachment.runState.value.control.drainedSteer.map((id) =>
-						structuredClone(attachment.pendingEntries.get(id)!.payload),
+						structuredClone(requirePendingMessage(attachment.pendingEntries.get(id), "Drained steer")),
 					),
 					drainedFollowUp: attachment.runState.value.control.drainedFollowUp.map((id) =>
-						structuredClone(attachment.pendingEntries.get(id)!.payload),
+						structuredClone(requirePendingMessage(attachment.pendingEntries.get(id), "Drained follow-up")),
 					),
 					attachment,
 				});
@@ -1401,8 +1427,12 @@ export class StoredSession implements Session {
 			return Object.freeze({
 				status: "committed" as const,
 				operationId,
-				drainedSteer: drainedSteer.map((id) => structuredClone(attachment.pendingEntries.get(id)!.payload)),
-				drainedFollowUp: drainedFollowUp.map((id) => structuredClone(attachment.pendingEntries.get(id)!.payload)),
+				drainedSteer: drainedSteer.map((id) =>
+					structuredClone(requirePendingMessage(attachment.pendingEntries.get(id), "Drained steer")),
+				),
+				drainedFollowUp: drainedFollowUp.map((id) =>
+					structuredClone(requirePendingMessage(attachment.pendingEntries.get(id), "Drained follow-up")),
+				),
 				attachment: nextAttachment,
 			});
 		});
@@ -2091,6 +2121,7 @@ export class StoredSession implements Session {
 				if (!response || !usage)
 					throw new SessionError("corruption", "Assistant settlement reservations materialized partially");
 				if (
+					response.type !== "message" ||
 					response.parentId !== transition.triggerEntryId ||
 					!isDeepStrictEqual(response.message, settledMessage) ||
 					usage.entryId !== transition.responseEntryId ||
@@ -2303,7 +2334,7 @@ export class StoredSession implements Session {
 
 			const assistant = hydrated.entries.get(batch.assistantEntryId);
 			const sourceCalls =
-				assistant?.message.role === "assistant"
+				assistant?.type === "message" && assistant.message.role === "assistant"
 					? assistant.message.content.filter((content) => content.type === "toolCall")
 					: [];
 			const source = sourceCalls[transition.sourceIndex];
@@ -2573,7 +2604,7 @@ export class StoredSession implements Session {
 				throw new SessionError("corruption", "Tool clearance reservations are already materialized");
 			const assistant = hydrated.entries.get(batch.assistantEntryId);
 			const sourceCalls =
-				assistant?.message.role === "assistant"
+				assistant?.type === "message" && assistant.message.role === "assistant"
 					? assistant.message.content.filter((content) => content.type === "toolCall")
 					: [];
 			const source = sourceCalls[transition.sourceIndex];
@@ -2830,7 +2861,10 @@ export class StoredSession implements Session {
 				runState.value.latestAssistantEntryId === null
 					? undefined
 					: hydrated.entries.get(runState.value.latestAssistantEntryId);
-			if (runState.value.latestAssistantEntryId !== null && latestEntry?.message.role !== "assistant")
+			if (
+				runState.value.latestAssistantEntryId !== null &&
+				(latestEntry?.type !== "message" || latestEntry.message.role !== "assistant")
+			)
 				throw new SessionError("corruption", "Latest assistant entry is missing or invalid");
 			if (!finalEntry) throw new SessionError("corruption", "Final entry is missing or invalid");
 			const includeFinalAssistant =
@@ -2839,7 +2873,10 @@ export class StoredSession implements Session {
 				phase.continuation.includeFinalAssistant;
 			if (
 				!cancelled &&
-				(includeFinalAssistant ? finalEntry.message.role !== "assistant" : finalEntry.message.role !== "toolResult")
+				(finalEntry.type !== "message" ||
+					(includeFinalAssistant
+						? finalEntry.message.role !== "assistant"
+						: finalEntry.message.role !== "toolResult"))
 			)
 				throw new SessionError("corruption", "Final entry is missing or invalid");
 
@@ -2883,7 +2920,7 @@ export class StoredSession implements Session {
 					operationId: transition.operationId,
 					kind: "aborted",
 					leafId: mainLeaf.value,
-					...(latestEntry?.message.role === "assistant"
+					...(latestEntry?.type === "message" && latestEntry.message.role === "assistant"
 						? { finalEntryId: latestEntry.id, finalMessage: structuredClone(latestEntry.message) }
 						: {}),
 				});
@@ -2918,7 +2955,9 @@ export class StoredSession implements Session {
 						kind: "completed",
 						leafId: mainLeaf.value,
 						finalEntryId: mainLeaf.value,
-						finalMessage: structuredClone(finalEntry!.message) as AssistantMessage,
+						finalMessage: structuredClone(
+							requireStoredMessage(finalEntry, "Final assistant").message,
+						) as AssistantMessage,
 					});
 				} else {
 					durableResult = encodeLaneLastResult({
@@ -3102,7 +3141,7 @@ export class StoredSession implements Session {
 					id,
 					parentId: index === 0 ? mainLeaf.value : capturedIds[index - 1],
 					type: "message" as const,
-					payload: encodeMessage(hydrated.pendingEntries.get(id)!.payload),
+					payload: encodeMessage(requirePendingMessage(hydrated.pendingEntries.get(id), "Captured next-run")),
 				},
 			}));
 			const writes = transition.messages.map((message, index) => ({
@@ -3162,7 +3201,7 @@ export class StoredSession implements Session {
 						seq: committed.seqs[index],
 						timestamp: committed.timestamp,
 						type: "message" as const,
-						message: structuredClone(hydrated.pendingEntries.get(id)!.payload),
+						message: structuredClone(requirePendingMessage(hydrated.pendingEntries.get(id), "Captured next-run")),
 					}),
 				);
 			}
@@ -3194,7 +3233,7 @@ export class StoredSession implements Session {
 					runOperation: Object.freeze({ seq: committed.seqs[offset + 1], value: structuredClone(runOperation) }),
 					runState: Object.freeze({ seq: committed.seqs[offset + 2], value: structuredClone(runState) }),
 					entries,
-					pendingEntries: new ImmutableMap<string, PendingMessageEntry>(),
+					pendingEntries: new ImmutableMap<string, PendingEntry>(),
 					usageRows: hydrated.usageRows,
 					toolArguments: hydrated.toolArguments,
 				}),
@@ -3218,17 +3257,17 @@ export class StoredSession implements Session {
 		}
 	}
 
-	async getEntry(id: string): Promise<MessageEntry | undefined> {
+	async getEntry(id: string): Promise<Entry | undefined> {
 		this.#assertOpen();
 		return (await this.getEntries([id])).get(id);
 	}
 
-	async getEntries(ids: string[]): Promise<ReadonlyMap<string, MessageEntry>> {
+	async getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
 		this.#assertOpen();
 		try {
 			const stored = await this.#storage.getEntries(ids);
-			const result = new Map<string, MessageEntry>();
-			for (const [id, entry] of stored) result.set(id, decodeMessageEntry(entry));
+			const result = new Map<string, Entry>();
+			for (const [id, entry] of stored) result.set(id, decodeEntry(entry));
 			return result;
 		} catch (error) {
 			throw storageFailure(error);
@@ -3244,10 +3283,12 @@ export class StoredSession implements Session {
 		}
 	}
 
-	async findEntries(query: EntryQuery = {}): Promise<MessageEntry[]> {
+	async findEntries(query: EntryQuery = {}): Promise<Entry[]> {
 		this.#assertOpen();
 		validateQuery(query, false);
-		const scan: EntryScan = { type: "message", order: query.order === "oldestFirst" ? "asc" : "desc" };
+		const scan: EntryScan = { order: query.order === "oldestFirst" ? "asc" : "desc" };
+		if (query.type !== undefined) scan.type = query.type;
+		if (query.customType !== undefined) scan.customType = query.customType;
 		if (query.limit !== undefined) scan.limit = query.limit;
 		if (query.cursor !== undefined) {
 			if (query.order === "oldestFirst") {
@@ -3257,19 +3298,19 @@ export class StoredSession implements Session {
 			else return [];
 		}
 		try {
-			return (await this.#storage.scanEntries(scan)).map(decodeMessageEntry);
+			return (await this.#storage.scanEntries(scan)).map(decodeEntry);
 		} catch (error) {
 			throw storageFailure(error);
 		}
 	}
 
-	async findEntry(query: EntryQuery = {}): Promise<MessageEntry | undefined> {
+	async findEntry(query: EntryQuery = {}): Promise<Entry | undefined> {
 		this.#assertOpen();
 		validateQuery(query, false);
 		return (await this.findEntries({ ...query, limit: 1 }))[0];
 	}
 
-	async findEntriesOnBranch(query: EntryQuery & BranchBounds = {}): Promise<MessageEntry[]> {
+	async findEntriesOnBranch(query: EntryQuery & BranchBounds = {}): Promise<Entry[]> {
 		this.#assertOpen();
 		validateQuery(query, true);
 		const start = query.start ?? (await this.getLeafId());
@@ -3278,20 +3319,21 @@ export class StoredSession implements Session {
 			return (
 				await this.#storage.scanBranch({
 					start,
-					type: "message",
 					order: query.order ?? "newestFirst",
+					...(query.type === undefined ? {} : { type: query.type }),
+					...(query.customType === undefined ? {} : { customType: query.customType }),
 					...(query.stopAtType === undefined ? {} : { stopAtType: query.stopAtType }),
 					...(query.stopAtId === undefined ? {} : { stopAtId: query.stopAtId }),
 					...(query.limit === undefined ? {} : { limit: query.limit }),
 					...(query.cursor === undefined ? {} : { cursor: query.cursor }),
 				})
-			).map(decodeMessageEntry);
+			).map(decodeEntry);
 		} catch (error) {
 			throw storageFailure(error);
 		}
 	}
 
-	async findEntryOnBranch(query: EntryQuery & BranchBounds = {}): Promise<MessageEntry | undefined> {
+	async findEntryOnBranch(query: EntryQuery & BranchBounds = {}): Promise<Entry | undefined> {
 		this.#assertOpen();
 		validateQuery(query, true);
 		return (await this.findEntriesOnBranch({ ...query, limit: 1 }))[0];
@@ -3332,13 +3374,60 @@ export class StoredSession implements Session {
 			});
 	}
 
+	appendCustomEntry(customType: string, data?: JsonValue): Promise<string> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		let pending: Extract<PendingEntry, { type: "custom" }>;
+		let id: string;
+		try {
+			pending = encodePendingEntry(
+				data === undefined ? { type: "custom", customType } : { type: "custom", customType, payload: data },
+			) as Extract<PendingEntry, { type: "custom" }>;
+			id = this.idGenerator.next();
+		} catch (error) {
+			return Promise.reject(storageFailure(error));
+		}
+		const operation = this.#mutationLine.then(async () => {
+			const [leaf, state] = await Promise.all([
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+			]);
+			const leafId = decodeMainLeafRegister(leaf).value;
+			decodeIdleMainStateRegister(state);
+			await this.#storage.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: {
+							id,
+							parentId: leafId,
+							type: "custom",
+							customType: pending.customType,
+							...(Object.hasOwn(pending, "payload") ? { payload: structuredClone(pending.payload) } : {}),
+						},
+					},
+					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: id },
+				],
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation
+			.then(() => id)
+			.catch((error) => {
+				throw storageFailure(error);
+			});
+	}
+
 	async projectBuiltinContext(): Promise<Message[]> {
 		this.#assertOpen();
 		const entries = await this.findEntriesOnBranch({ order: "oldestFirst" });
-		return entries.flatMap(({ message }) =>
-			message.role === "assistant" && ["error", "aborted", "deferred"].includes(message.stopReason)
+		return entries.flatMap((entry) =>
+			entry.type === "custom" ||
+			(entry.message.role === "assistant" && ["error", "aborted", "deferred"].includes(entry.message.stopReason))
 				? []
-				: [structuredClone(message)],
+				: [structuredClone(entry.message)],
 		);
 	}
 

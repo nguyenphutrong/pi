@@ -352,7 +352,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const info = action.info;
 				const assistant = this.#current.entries.get(info.assistantEntryId);
 				const source =
-					assistant?.message.role === "assistant"
+					assistant?.type === "message" && assistant.message.role === "assistant"
 						? assistant.message.content.filter((content) => content.type === "toolCall")[info.sourceIndex]
 						: undefined;
 				if (!source) throw this.#faultShell(undefined, undefined, "Cancelled tool source is missing");
@@ -438,7 +438,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}
 				const assistant = this.#current.entries.get(info.assistantEntryId);
 				const sourceCalls =
-					assistant?.message.role === "assistant"
+					assistant?.type === "message" && assistant.message.role === "assistant"
 						? assistant.message.content.filter((content) => content.type === "toolCall")
 						: [];
 				const source = sourceCalls[info.sourceIndex];
@@ -523,7 +523,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					throw new RuntimeShellError("stale", "Tool effect is no longer recoverable");
 				const assistant = this.#current.entries.get(info.assistantEntryId);
 				const source =
-					assistant?.message.role === "assistant"
+					assistant?.type === "message" && assistant.message.role === "assistant"
 						? assistant.message.content.filter((content) => content.type === "toolCall")[info.sourceIndex]
 						: undefined;
 				const argsKey = `${info.operationId}:${info.turnId}:${info.sourceIndex}`;
@@ -579,7 +579,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 						throw new RuntimeShellError("stale", "Tool effect is no longer recoverable");
 					const currentAssistant = refreshed.entries.get(info.assistantEntryId);
 					const currentSource =
-						currentAssistant?.message.role === "assistant"
+						currentAssistant?.type === "message" && currentAssistant.message.role === "assistant"
 							? currentAssistant.message.content.filter((content) => content.type === "toolCall")[
 									info.sourceIndex
 								]

@@ -1,5 +1,5 @@
 import type { Message } from "@earendil-works/pi-ai";
-import type { EntryCursor, IdGenerator, SessionStats } from "@nguyenphutrong/pi-session-storage";
+import type { EntryCursor, IdGenerator, JsonValue, SessionStats } from "@nguyenphutrong/pi-session-storage";
 
 export const CURRENT_STORAGE_VERSION = 1;
 
@@ -10,17 +10,31 @@ export interface SessionMetadata {
 	readonly parentSessionId?: string;
 }
 
-export interface MessageEntry {
+export interface EntryBase {
 	readonly id: string;
 	readonly parentId: string | null;
 	readonly seq: number;
 	readonly timestamp: number;
+}
+
+export interface MessageEntry extends EntryBase {
 	readonly type: "message";
 	readonly message: Message;
 }
 
+export interface CustomEntry extends EntryBase {
+	readonly type: "custom";
+	readonly customType: string;
+	readonly data?: JsonValue;
+}
+
+export type Entry = MessageEntry | CustomEntry;
+export type ProjectableCustomEntry = Omit<CustomEntry, "seq" | "timestamp">;
+export type EntryProjector = (entry: ProjectableCustomEntry) => Message[] | undefined | Promise<Message[] | undefined>;
+
 export interface EntryQuery {
-	type?: "message";
+	type?: Entry["type"];
+	customType?: string;
 	order?: "newestFirst" | "oldestFirst";
 	limit?: number;
 	cursor?: EntryCursor;
@@ -28,20 +42,21 @@ export interface EntryQuery {
 
 export interface BranchBounds {
 	start?: string;
-	stopAtType?: "message";
+	stopAtType?: Entry["type"];
 	stopAtId?: string;
 }
 
 export interface SessionTree {
 	getLeafId(): Promise<string | null>;
-	getEntry(id: string): Promise<MessageEntry | undefined>;
-	getEntries(ids: string[]): Promise<ReadonlyMap<string, MessageEntry>>;
+	getEntry(id: string): Promise<Entry | undefined>;
+	getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>>;
 	getStats(): Promise<SessionStats>;
-	findEntries(query?: EntryQuery): Promise<MessageEntry[]>;
-	findEntry(query?: EntryQuery): Promise<MessageEntry | undefined>;
-	findEntriesOnBranch(query?: EntryQuery & BranchBounds): Promise<MessageEntry[]>;
-	findEntryOnBranch(query?: EntryQuery & BranchBounds): Promise<MessageEntry | undefined>;
+	findEntries(query?: EntryQuery): Promise<Entry[]>;
+	findEntry(query?: EntryQuery): Promise<Entry | undefined>;
+	findEntriesOnBranch(query?: EntryQuery & BranchBounds): Promise<Entry[]>;
+	findEntryOnBranch(query?: EntryQuery & BranchBounds): Promise<Entry | undefined>;
 	appendMessage(message: Message): Promise<string>;
+	appendCustomEntry(customType: string, data?: JsonValue): Promise<string>;
 }
 
 export interface Session extends SessionTree {

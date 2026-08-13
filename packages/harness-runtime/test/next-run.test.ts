@@ -231,7 +231,9 @@ describe("lane-owned next-run queue", () => {
 		expect(() => Map.prototype.clear.call(pending)).toThrow();
 		expect(pending.get(queued.entryId!)?.payload).toEqual(user("immutable"));
 
-		const returned = pending.get(queued.entryId!)!.payload;
+		const queuedEntry = pending.get(queued.entryId!);
+		if (queuedEntry?.type !== "message") throw new Error("Expected pending message");
+		const returned = queuedEntry.payload;
 		if (returned.role !== "user" || typeof returned.content === "string") throw new Error("Expected user content");
 		returned.content[0] = { type: "text", text: "mutated" };
 		const refreshed = await session.refreshRuntimeAttachment();
@@ -336,7 +338,8 @@ describe("lane-owned next-run queue", () => {
 			const late = first === "prompt" ? await session.nextRun(user("queued")) : queued!;
 			const current = await session.refreshRuntimeAttachment();
 			if (first === "next-run") {
-				expect(accepted.attachment.entries.get(late.entryId!)?.message).toEqual(user("queued"));
+				const captured = accepted.attachment.entries.get(late.entryId!);
+				expect(captured?.type === "message" ? captured.message : undefined).toEqual(user("queued"));
 				expect(current.laneState.value.pendingNextRun).toEqual([]);
 				expect(current.pendingEntries.size).toBe(0);
 			} else {
