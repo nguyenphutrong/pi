@@ -709,7 +709,7 @@ Commit `929407e39` implements the complete boundary. Tool-bearing `stop`, `toolU
 
 - Date: 2026-08-13
 - Phase: 2
-- Status: approved by `79797263b` after independent review
+- Status: implemented by `be47c4560` after independent final review
 - References: D-024–D-026; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.8, 4.1–4.7, 5.7, 9.1–9.3
 
 ### Options
@@ -747,3 +747,5 @@ Option 2 adds durable program-counter states around stateless deterministic work
 Execute, update, finalize, `after_tool`, real-result settlement and usage, replay/interrupted recovery, abort, parallelism, full hooks/events, registry setters, and genuine-length explanatory result specialization remain explicit later work unless a currently reachable action requires them.
 
 The fresh independent design gate reports PASS after the terminated-tools finish contract, completed-result closure, and explicit reopen assertions were made exact.
+
+Commit `be47c4560` implements the complete clearance boundary. The retained registry now snapshots nested TypeBox schema data, symbols, descriptors, and prototypes rather than retaining caller-mutable nested objects. Harness runtime passes 313/313, `npm run check` and `git diff --check` pass, and the fresh independent final review reports PASS with no blocking findings. Real tool execution remains absent by design and is the next work item.

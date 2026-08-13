@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. B-011 is resolved and generation unknown-effect recovery is implemented by `e6e6b1cd0`.
+No active blocker. D-027 durable sequential-tool clearance is implemented by `be47c4560`; D-028 sequential dispatch, finalization, and real-result settlement is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

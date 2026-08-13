@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.5 — Durable sequential tool clearance and settlement
-- Status: D-027 committed by `79797263b` after independent review; retained batch leases and clearance transactions are next
+- Work item: 2.5b — Sequential tool dispatch, finalization, and durable real-result settlement
+- Status: D-027 clearance implemented by `be47c4560` after full verification and independent final review; real tool effects are next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement retained batch leases plus conditional clearance transactions.
-2. Add Tier A/B/C clearance tests.
-3. Independently review the complete clearance slice and rework any blockers.
-4. Implement sequential execute/finalize and atomic real settlement.
-5. Add replay/interrupted recovery, abort, crash matrix, and the Phase 2 gate.
+1. Re-read the tool effect and settlement sections and design the smallest D-028 boundary.
+2. Implement sequential execute/update/finalize through the retained prepared plan.
+3. Atomically settle a real durable tool result and advance the batch/checkpoint.
+4. Add Tier A/B/C dispatch, finalization, settlement, close, and stale-authority coverage.
+5. Independently review D-028, then add replay/interrupted recovery, abort, and the Phase 2 crash matrix.
 
 ## Phase order
 
