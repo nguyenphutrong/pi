@@ -1504,3 +1504,30 @@ Increment 4.2a implements the mixed message/custom tree and pending codecs, idle
 Increment 4.2b makes RuntimeShell the sole owner of attached tree writes and close. Successful attachment returns an internal closure capability; retained raw Session message/custom appends and close reject `active` while attachment is pending or complete, before validation, id mint, sealing, or storage work. `RuntimeShell.session` is a frozen SessionTree-only façade whose reads and idle writes capture detached inputs synchronously, serialize on the shell admission line, and obey fault/close precedence. Idle owner appends return the committed id together with the exact postcommit attachment constructed from the authoritative precommit state and `CommitResult`, so durable acceptance has no fallible postcommit refresh interval. Active-run façade writes remain write-free `busy` until the next increment activates `inbox.writes`.
 
 The first independent review rejected mutable read arguments during blocked admission and the possibility that an already-committed append could reject when a follow-up refresh failed. Both were corrected without changing the public Session or Storage contracts. Focused ownership/façade tests pass 290/290, complete Harness passes 590/590, root check and diff check pass, and the fresh independent review reports PASS. Increment 4.2c is durable non-empty write-inbox hydration, cancellation, and cleanup; admission and placement remain later increments.
+
+## D-051 — Activate pending writes without making them placeable
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: accepted after fresh independent design review
+- References: D-047–D-050; `packages/agent/docs/harness-v3.md` §§1.4, 3.3–3.5, 3.11–3.13, 4.4, 4.6, 9.1–9.3
+
+### Options
+
+1. Treat writes as a third message queue throughout the existing queue machinery.
+2. Activate `inbox.writes` as a distinct typed pending-entry owner while reusing the existing durable id-list and mutation line.
+3. Add codec and hydration now but defer cancellation and terminal ownership until placement exists.
+
+### Choice
+
+Option 2. `inbox.writes` becomes a UUIDv7 `string[]`; each id owns exactly one `pending.entry` containing either a message or custom `PendingEntry`. Lane next-run, steer, follow-up, and abort-drained queues remain message-only. Restore dereferences all pending ids with exact point lookups, checks pending ids against both entries and usage rows, preserves custom absent payload versus explicit JSON `null`, and rejects duplicate ownership or collision with every directly named operation, phase, effect, result, and usage identity. It performs no scan, branch walk, projector call, or context reconstruction.
+
+`cancelQueued` selects active operation ownership in steer, follow-up, then write order before lane-owned next-run. Cancelling a write commits exactly the total `op.state` with that one id removed followed by deletion of its pending register; drained ids remain non-cancellable. Abort drains only steer/follow-up and preserves the complete write list and payload registers, including on repeated abort.
+
+### Terminal boundary
+
+Valid completed, failed, and aborted terminal paths still require an empty write inbox, and the planner remains unchanged in this increment. The terminal operation-owned inventory nevertheless includes writes beside active and drained operation queues, while never including lane-owned next-run content. This is a defensive complete ownership definition, not permission to discard accepted writes. No public, internal, or test-only finish bypass is added merely to exercise an invalid state; direct write-placement and cancelled-reconciliation evidence belongs to the next increments.
+
+### Verification boundary
+
+Tier A covers UUID/list codecs, mixed pending restore, absent/null preservation, message-only queue rejection, exact pending-versus-entry/usage/logical collisions, and bounded reopen. Tier B covers exact write cancellation, abort retention and idempotence, finish rejection with residual writes, and next-run preservation. Tier C covers cancel versus abort order and independent write cancellation order. No admission API, placement, projector, planner action, Storage/schema, SQLite process test, or pi-ai change is part of 4.2c.

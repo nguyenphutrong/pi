@@ -4,7 +4,7 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.2c — Durable `inbox.writes` hydration, cancellation, and cleanup
-- Status: runtime attachment ownership and the ordered SessionTree façade are complete at `41e607471`; admit non-empty durable write inbox state without adding write placement yet
+- Status: D-051 passed independent design review; implement the distinct typed pending-write owner without adding admission or placement
 - Done bar: restore dereferences every write through exact `pending.entry` lookups, preserves message/custom and absent/null payload semantics, rejects duplicate or cross-owner identity collisions, lets cancellation atomically remove only the selected write, preserves writes through abort, and removes residual operation-owned write registers only in terminal cleanup
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
