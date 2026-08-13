@@ -1446,8 +1446,8 @@ Focused queue/process recovery passes 40/40, the complete Harness runtime passes
 
 - Date: 2026-08-13
 - Phase: 4
-- Status: blocked by B-016 pending a human contract decision
-- References: D-047–D-049; `packages/agent/docs/harness-v3.md` §§1.1, 1.4, 2.2, 3.11–3.12, 5.2
+- Status: accepted after corrected independent design review
+- References: D-047–D-049; B-016; `packages/agent/docs/harness-v3.md` §§1.1, 1.4, 2.1–2.5, 3.3–3.5, 3.11–3.13, 4.1, 4.4, 4.6–4.7, 5.1–5.5, 9.1–9.3
 
 ### Problem
 
@@ -1457,8 +1457,44 @@ The specified `EntryProjector` receives a complete `CustomEntry`, including stor
 
 ### Options
 
-1. Change the projector input to precommit custom-entry content, `Omit<CustomEntry, "seq" | "timestamp">`. The same deterministic input is available before placement and later during context projection. This is the recommended smallest durable design, but it changes the specified public callback capability.
+1. Change the projector input to precommit custom-entry content, `Omit<CustomEntry, "seq" | "timestamp">`. The same deterministic input is available before placement and later during context projection.
 2. Preserve complete `CustomEntry` and extend Storage with an atomic precommit transaction builder/reservation that assigns exact sequence and timestamp before invoking the asynchronous projector. This preserves projector capability but changes every backend and holds writer ownership across application code.
 3. Define any custom type with a registered projector as projecting, regardless of whether the callback later returns `undefined`. This needs no contract change but violates the specified unprojected behavior and can trigger a provider request with no new projected context; not recommended.
 
-A separate durable projection intermediate does not solve the input-timing problem and also breaks atomic placement semantics. Independent focused analysis found no contract-preserving fifth path. Phase 4.2 must not implement a preview cast, second state commit, or new durable intermediate before B-016 is resolved.
+### Choice
+
+The human selected option 1. The authoritative callback input is now `ProjectableCustomEntry = Omit<CustomEntry, "seq" | "timestamp">`. It contains the reserved id, prospective parent, type, custom type, and exact absent-versus-null data. Runtime reconstructs the same view from a committed entry by omitting only the two storage-assigned fields. A separate durable projection intermediate, preview cast, second state commit, or Storage precommit capability is forbidden.
+
+### Public and codec contract
+
+The private package expands its current implemented tree subset to `Entry = MessageEntry | CustomEntry`; compaction and branch-summary variants remain in their ordered phases. `SessionTree` gains `appendCustomEntry(customType, data?)`, mixed-entry reads, and `type/customType` query filters. `RuntimeShell.session` is a façade: reads serialize with earlier shell admissions and delegate to the attached Session; writes enter RuntimeShell lifecycle/admission and never expose the private transition port.
+
+Pending content is exactly `{type:"message",payload:Message}` or `{type:"custom",customType,payload?}`. A custom value with no data omits `payload`; JSON `null` remains an explicit own property. Placement maps pending `payload` presence to committed `data` presence without inventing a second durable field name. Unknown fields, invalid messages, empty/NUL custom types, and non-detached JSON are rejected. Next-run, steer, and follow-up remain message-only.
+
+Successful runtime attachment makes the retained raw Session read-only for tree mutation and lifecycle: direct raw appends and raw close reject `active`; RuntimeShell holds a private closure-based port for attached writes and close. This prevents a retained pre-attachment reference from bypassing shell attachment publication. No token, override flag, or new public Storage capability is exposed.
+
+### Projection and action contract
+
+RuntimeShell captures an immutable projector map at construction. For provider context it reads committed branch entries and invokes custom projectors in branch order on reconstructed precommit views; no registered projector, `undefined`, or `[]` contributes no messages. Non-empty outputs are validated/detached Messages and preserve returned order. Projector replacement is not introduced.
+
+Planner adds `apply_deferred_writes {operationId,entryIds}`. A running checkpoint without `skipInboxOnce` applies all writes captured at plan time before steer. `failure_drain` applies writes before steer/follow-up. Cancelled reconciliation first settles already-intended effects, then applies every write before aborted finish. Later admissions remain pending for a later action. Existing `skipInboxOnce` skips writes and steer for one generation pass.
+
+Projectors run sequentially in write order inside the RuntimeShell admission executing that action, but outside the StoredSession mutation line and before any placement commit. The prospective parent chain comes from the action's leaf snapshot. StoredSession then rechecks exact operation-state seq, leaf seq/value, selected FIFO ids, pending payloads, and ownership inside its mutation line. Stale authority commits nothing; RuntimeShell publishes the fresh attachment, discards output, and a later drive may deterministically reproject. Projector throw/rejection or malformed output faults the shell without a write. Close seals later admissions and waits for an already-admitted projector/placement job. Abort remains independently admitted through the lane mutation line, so either abort or placement may win; an abort that commits during projection makes placement stale.
+
+A batch is projecting if it contains a message write or any custom projector returns at least one valid message. Entries always form one FIFO parent chain and the final entry is the new leaf. Under running control, a projecting batch atomically enters `checkpoint{need_assistant(false), triggerEntryId:finalEntryId, skipInboxOnce:true}` and resets overflow recovery; an all-unprojected custom batch preserves the complete prior checkpoint or failure state. Under cancelled control every batch preserves phase/continuation regardless of projection. Projected messages are context only and create no extra entries.
+
+### Durable transactions and recovery
+
+Idle façade writes are born placed in `TX[entry, lane.leaf]`. Active-run admission is `TX[pending.entry set, op.state with inbox.writes += id]` and resolves with the reserved id. Placement is one `TX[entries FIFO, pending deletes FIFO, lane.leaf, total op.state]`. Cancellation is `TX[total owner state without id, pending delete]`. Abort leaves `inbox.writes` and their registers untouched. Valid terminal paths require writes drained; operation-owned residual cleanup nevertheless includes writes, while never deleting lane-owned next-run content.
+
+Hydration includes write ids in the existing exact pending-register and entry point lookups, generalizes the attachment to typed pending entries, and rejects duplicate ownership, non-message payloads in message-only queues, malformed custom payloads, entry/register overlap, and collision with every directly named operation/effect/result/usage identity. It does not scan registers, walk ancestry, call a projector, or read `lane.lastResult`. Snapshots later expose FIFO pending writes from the hydrated map; watch/event delivery remains Phase 5.
+
+Current durable code has no structural operation. This slice implements only idle versus active-run admission and adds no speculative structural waiter/reservation. The future compaction/navigation slice can add wait-and-re-evaluate at the RuntimeShell façade without changing pending codecs or placement transactions.
+
+### Verification and increments
+
+Implement in reviewable increments: (1) mixed Entry/PendingEntry codecs and query types; (2) runtime attachment ownership and SessionTree façade; (3) non-empty `inbox.writes` hydration/collision/cancel/cleanup; (4) admission and atomic placement; (5) planner, projector/context, stale/fault/close behavior; (6) minimal SQLite crash evidence.
+
+Tier A covers absent data versus null, codec/query corruption, non-empty writes restore, ownership collisions, mixed projected/unprojected reduction, and exact state preservation. Tier B asserts exact idle/admission/placement/cancel/abort/terminal writer order and register/entry exclusivity. Tier C covers both cancel-versus-placement and abort-versus-placement orders, stale projection, FIFO concurrent admission, faulting projector, and close before/after admission. Focused SQLite evidence needs one projecting and one unprojected custom write at pre-placement and post-placement process-death prefixes, exact pending/entry/state/leaf/lease effects, and fresh no-duplicate reopen; D-045 and D-049 remain the broader transaction and queue crash authorities.
+
+Fresh independent review confirms the earlier pending-field and invocation-contract findings are closed: durable custom pending content uses authoritative `payload?`, and §2.5 reconstructs the selected projector view by omitting exactly `seq` and `timestamp` while preserving absent data versus explicit JSON `null`. The façade/retained-Session ownership, projector/abort/close races, planner order, cleanup, bounded hydration, structural deferral, and evidence split are internally consistent. No further §6 blocker remains.

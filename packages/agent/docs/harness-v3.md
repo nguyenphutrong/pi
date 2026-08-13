@@ -706,7 +706,11 @@ Semantics: take the path from `start` toward the root, order it (default `newest
 1. `scanBranch({ start: leaf, order: "newestFirst", stopAtType: "compaction" })`.
 2. Reverse to oldest-first. If a compaction terminated the scan, the context is: its `summary`, then its `retainedTail`, then every entry after it. **Nothing earlier is read.**
 3. Drop assistant responses whose stop reason is `error`, `aborted`, or `deferred`. Retain genuine output-limit `length`.
-4. Run custom entries through `entryProjectors`. An unprojected custom entry never enters context.
+4. Run custom entries through `entryProjectors`. Every invocation receives the
+   stable `ProjectableCustomEntry` view (§5.2), reconstructed from a committed
+   custom entry by omitting exactly its storage-assigned `seq` and `timestamp`;
+   optional `data` presence, including explicit JSON `null`, is preserved. An
+   unprojected custom entry never enters context.
 5. Run `transform_context`, then `toProviderMessages`.
 
 There is no rule for omitting an overflow response, and no link anywhere pointing at one. An overflow response is committed with stop reason `error` (§3.7) and is therefore dropped by rule 3 like any other error, and by any downstream `transformMessages` that filters the same way.
@@ -2084,7 +2088,11 @@ interface AgentHarnessOptions<TContext extends object | undefined = object | und
 }
 
 type Resources = AgentHarnessResources<Skill, PromptTemplate>;
-type EntryProjector = (entry: CustomEntry) =>
+/** The stable precommit view of a custom entry. Storage assigns seq and
+    timestamp only after the placement transaction commits, so projection may
+    not depend on them (§3.11). */
+type ProjectableCustomEntry = Omit<CustomEntry, "seq" | "timestamp">;
+type EntryProjector = (entry: ProjectableCustomEntry) =>
   AgentMessage[] | undefined | Promise<AgentMessage[] | undefined>;
 ```
 

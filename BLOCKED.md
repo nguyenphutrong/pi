@@ -2,7 +2,7 @@
 
 ## Current status
 
-Phase 4.2 is blocked by B-016. Phase 4.1 remains complete at `219526a1a`.
+No active blockers. B-016 is resolved and corrected D-050 passed independent design review.
 
 ## B-016 — Choose the custom-entry projector timing contract
 
@@ -10,7 +10,8 @@ Phase 4.2 is blocked by B-016. Phase 4.1 remains complete at `219526a1a`.
 - Phase: 4
 - Work item: 4.2 — deferred tree writes design
 - Trigger: a major, hard-to-reverse public callback or Storage contract decision; the current spec requires mutually unavailable precommit and postcommit information
-- Status: awaiting human decision; no deferred-write code has been written
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; the authoritative spec and independently approved D-050 use a precommit projector view without `seq` or `timestamp`
 
 ### Context
 
@@ -24,7 +25,7 @@ The placement transaction must atomically choose between projection-dependent st
 
 ### Resume point
 
-After selection, update D-050 with the exact selected callback/storage contract, complete the remaining deferred-write transaction/action/race design, obtain fresh independent design review, then implement. Do not write production code before that review passes.
+Review passed. Resume at D-050 increment 1: mixed Entry/PendingEntry codecs and focused tests.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 
