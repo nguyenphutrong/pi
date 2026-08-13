@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3a — Private SQLite package, node adapter, and exact canonical schema
-- Status: D-033 exact SQLite core design passed corrected independent review; no SQLite rewrite code has landed
+- Status: D-033 exact SQLite core design committed as `07ebb2800` after corrected independent review; no SQLite rewrite code has landed
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
