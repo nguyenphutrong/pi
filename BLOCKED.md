@@ -2,7 +2,29 @@
 
 ## Current status
 
-No active blocker. D-038 was implemented in `bc071197b` after independent final review PASS; segmented branch projection and scans are next.
+Active blocker B-014. Phase 3.3e projection implementation remains uncommitted after repeated review rejection for the same segment-identity invariant.
+
+## B-014 — Apply segment creation identity on the exact-tip path
+
+- Date: 2026-08-13
+- Phase: 3
+- Work item: 3.3e — segmented entry projection, divergence, and guarded branch scans
+- Trigger: two independent review-agent rejections for the same incomplete `segment:{creationEntryId}` validation boundary
+- Status: awaiting human selection; no flagged production or test code has been committed
+
+### Context
+
+D-039 requires every private branch id to be `segment:{newEntryId}`, with that creation entry physically present in the segment. The first review found that candidate/base branches accepted arbitrary ids. The rework added exact `segment:{UUIDv7}` and suffix-membership validation while materializing divergence candidates. The second review found the same invariant is still absent from the exact-tip fast path: `EXACT_TIP_SQL` checks only a non-empty, non-NUL string and matching canonical parent sequence. A malformed or non-owned branch id can therefore append and advance successfully without entering candidate materialization.
+
+The current uncommitted implementation otherwise passes SQLite 120/120, package build, `npm run check`, and `git diff --check`. Canonical entry/membership sequence comparison, divergence ownership, compaction bounds, rollback, query plans, and handle isolation are green. Per the guardrail, it cannot be committed while review remains failing.
+
+### Decision
+
+1. **Recommended:** extract one private segment-identity assertion that validates `segment:{UUIDv7}` and point-checks that the suffix entry is physically present in that segment. Use it from both exact-tip and materialized-candidate paths, add exact-tip malformed/missing-owner regressions, then run a fresh review. This is the smallest complete correction and keeps the fast path bounded.
+2. Materialize and validate the exact-tip segment's complete closure before every append. This also closes the gap but adds unnecessary full-chain work to the hot append path.
+3. Accept format-only validation on exact-tip and defer suffix ownership to reads/repair. This permits a known-invalid cache transition and violates D-039; not recommended.
+
+Reply with `1`, `2`, or `3`.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 

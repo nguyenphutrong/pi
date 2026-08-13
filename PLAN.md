@@ -4,13 +4,13 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3e — Segmented entry projection, divergence, and guarded branch scans
-- Status: D-039 passed corrected independent design review; projection core and entry-capable transactions are next
+- Status: blocked at B-014 after two review rejections for incomplete segment-identity validation; implementation remains uncommitted
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement and review D-039's projection core and entry-capable transaction paths.
+1. Resolve B-014, complete exact-tip segment ownership validation, and obtain a fresh independent PASS.
 2. Implement and review guarded branch scans with exact query-plan and segment-chain soundness coverage.
 3. Run unchanged full Storage conformance for Memory and SQLite without weakening the suite.
 4. Add explicit repair and `SqliteSessionRepo` Harness integration.
