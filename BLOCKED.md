@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-037 passed corrected independent design review in `3775d11f8`; the per-file FIFO, repository, and fenced handle lifecycle implementation is next.
+No active blocker. D-037 is implemented by `a470d2bb5` after 71/71 package tests and final independent review PASS. Ordinary bounded reads and shared backend conformance are next.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 

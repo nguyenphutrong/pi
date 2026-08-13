@@ -3,17 +3,17 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.3c — Per-file FIFO, repository, and fenced handle lifecycle
-- Status: corrected D-037 passed independent design review; repository/lifecycle implementation and focused tests are next
+- Work item: 3.3d — Ordinary bounded reads and shared backend conformance
+- Status: 3.3c repository/lifecycle implementation passed final independent review in `a470d2bb5`; ordinary read/conformance design is next
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement and test the private per-file FIFO, repository catalog operations, writer-lease acquisition/renewal/release, handle gate, heartbeat, close, and fault precedence.
-2. Run the complete SQLite package, root check, and independent final review for 3.3c.
-3. Add ordinary bounded reads and pass shared backend conformance outside branch scans.
-4. Implement segmented projection/scans, plan guards, and explicit repair; then add `SqliteSessionRepo` to Harness runtime.
+1. Design ordinary exact-entry, register, usage, stats, and sequence reads plus the shared conformance integration boundary without exposing incomplete branch scans.
+2. Implement and test ordinary reads and pass the branch-independent shared backend vectors.
+3. Implement segmented entry projection, divergence, and guarded branch scans.
+4. Add explicit repair and `SqliteSessionRepo` Harness integration.
 5. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
 
 ## Phase order
