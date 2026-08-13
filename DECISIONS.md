@@ -1011,3 +1011,26 @@ Focused tests use real in-memory SQLite plus counting wrappers to prove one tran
 Phase 3 assumes SQLite's retired-range inventory is empty. This engine therefore treats missing committed references by the ordinary transaction rules and does not claim support for imported truncated sessions. Retired-range storage, boundary-aware writes/scans, and inherited fork ranges remain the later retention scaffold; no hidden retention semantics enter the nine-table Phase 3 schema.
 
 The corrected independent design review reports PASS with no §6 escalation.
+
+## D-036 — Enforce the SQLite callback capability at runtime
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: confirmed by human after B-013 escalation
+- References: D-035; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 8 slice 14, 9.3
+
+### Options
+
+1. Preserve `context.db.prepare`, but pass a new frozen runtime object whose only own capability is a forwarding `prepare` function.
+2. Replace `context.db` with a direct `context.prepare` function.
+3. Keep only TypeScript `Pick<SqliteDatabase, "prepare">` while passing the original database object at runtime.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+A TypeScript projection is erased and did not prevent a callback from recovering `transaction`, `close`, or `exec` from the original database object. A fresh frozen prepare-only object enforces D-035 at runtime while preserving the already-approved private callback shape. Both transaction-prologue and per-entry projection callbacks receive the same restricted capability inside the engine-owned transaction. Tests assert that it is not the original database, has only `prepare`, cannot expose transaction or lifecycle methods, and still supports the required transactional reads and writes.
+
+Commit `cdd033a62` implements D-035 and D-036. The complete SQLite package passes 46/46 tests, its package build, `npm run check`, and `git diff --check`; final independent review reports PASS.

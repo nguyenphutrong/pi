@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.3b — Shared ordered SQLite transaction engine
-- Status: blocked on B-013 after two independent implementation reviews rejected the same runtime callback-capability leak
+- Work item: 3.3c — Per-file FIFO, repository, and fenced handle lifecycle
+- Status: 3.3b committed as `cdd033a62` after final independent review PASS; 3.3c design is next
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement and test the shared ordered transaction engine: exact caller order, sequence allocation, references, stats, rollback, and caller-error reuse.
-2. Implement the repository and fenced handle lifecycle over the per-file FIFO.
+1. Design the private per-file FIFO, repository catalog operations, writer-lease acquisition/renewal/release, handle gate, heartbeat, close, and fault precedence.
+2. Implement and test that repository and fenced handle lifecycle over the ordered engine.
 3. Add ordinary bounded reads and pass shared backend conformance outside branch scans.
 4. Implement segmented projection/scans, plan guards, and explicit repair; then add `SqliteSessionRepo` to Harness runtime.
 5. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
