@@ -2,7 +2,31 @@
 
 ## Current status
 
-No active blocker. Phase 3.3f-D completed in `5ae9a5a9a` after fresh independent final review PASS; commit-boundary and subprocess crash matrices remain queued.
+Active blocker: B-015 requires a human choice after repeated review rejection of the Phase 3.4a exact test-oracle boundary.
+
+## B-015 — Choose the exact SQLite commit-boundary oracle bar
+
+- Date: 2026-08-13
+- Phase: 3
+- Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
+- Trigger: two independent implementation reviews rejected the same work item for incomplete exact durable/effect evidence; usage-ledger exactness remains the repeated underlying reason
+- Status: active; the uncommitted test passes 34/34 and root check passes, but guardrails prohibit committing it
+
+### Context
+
+The test-only matrix covers all 17 prefixes of the Phase 2 sequential-tool trace for both `safe` and `never` over real SQLite files. It uses fresh repository, Session, and RuntimeShell ownership after every controlled close; verifies exact action identities, replay counts, real versus interrupted tool results, terminal tree and cleanup; snapshots all nine SQLite tables; and proves a third fresh terminal shell performs no effects or writes.
+
+The first implementation review rejected weak action identities, an incomplete nine-table snapshot, incomplete usage fields, and incomplete terminal cleanup. Those were corrected. The second fresh review confirms those findings are closed but still rejects the oracle because assistant-retry contexts are checked only at the first and last call, and usage rows are checked for type/order/association rather than the exact UUIDv7 identity contract and exact settlement sequence relationship. This repeats the usage-ledger exact-evidence boundary, so §6 requires escalation rather than another unilateral test expansion.
+
+### Decision needed
+
+1. **Recommended:** finish the literal oracle. Assert every provider context for normal and uncertain cuts; require each usage id to be UUIDv7; and require each usage sequence to equal its assistant entry sequence plus two, matching the settled response transaction's exact `entry → lane.leaf → usage → op.state` order. Rerun focused/full verification and a fresh independent review.
+2. Narrow D-043 to semantic ledger equivalence: exact response association, payload, adjustment/details, uniqueness/disjointness, and increasing order are sufficient; add only the missing complete provider-context assertions, then review against the narrowed decision.
+3. Accept the current 34/34 matrix despite the repeated review failure. This violates the guardrail and is not recommended.
+
+### Resume point
+
+Do not commit `packages/harness-runtime/test/sqlite-runtime-commit-boundary.test.ts`. After selection, record the choice in `DECISIONS.md`, apply only the selected test-oracle change, rerun the focused matrix, complete Harness and SQLite suites, `npm run check`, `git diff --check`, and obtain a fresh independent PASS before committing.
 
 ## B-014 — Apply segment creation identity on the exact-tip path
 

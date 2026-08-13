@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
-- Status: D-043 accepted after independent design review; implement 34 controlled-close/fresh-repository scenarios across all Phase 2 sequential-tool action boundaries
+- Status: blocked by B-015 after repeated review rejection of the exact test-oracle boundary; uncommitted matrix passes 34/34 but cannot be committed pending the human choice
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
