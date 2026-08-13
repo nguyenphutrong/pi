@@ -30,6 +30,10 @@ export interface PreparedTransaction {
 	readonly writes: readonly PreparedWrite[];
 }
 
+export function hasPreparedEntries(transaction: PreparedTransaction): boolean {
+	return transaction.writes.some((write) => write.kind === "entry");
+}
+
 /** Validates, detaches, and serializes a transaction before it reaches a queue or SQLite. */
 export function prepareTransaction(transaction: Transaction): PreparedTransaction {
 	assertTransaction(transaction);
