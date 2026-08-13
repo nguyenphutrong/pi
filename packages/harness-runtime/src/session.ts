@@ -2797,7 +2797,12 @@ export class StoredSession implements Session {
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#sealed = true;
-		this.#closePromise = this.#mutationLine.then(() => this.#storage.close()).finally(this.#release);
+		this.#closePromise = this.#mutationLine
+			.then(() => this.#storage.close())
+			.catch((error) => {
+				throw storageFailure(error);
+			})
+			.finally(this.#release);
 		return this.#closePromise;
 	}
 }

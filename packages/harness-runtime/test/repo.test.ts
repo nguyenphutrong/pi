@@ -158,7 +158,7 @@ describe("MemorySessionRepo", () => {
 			"storage_version_newer",
 		);
 		expect(await errorCode(repo.open({ ...session.metadata, storageVersion: CURRENT_STORAGE_VERSION - 1 }))).toBe(
-			"invalid_metadata",
+			"storage_version_older",
 		);
 		expect(await errorCode(repo.open({ ...session.metadata, createdAt: session.metadata.createdAt + 1 }))).toBe(
 			"metadata_mismatch",
