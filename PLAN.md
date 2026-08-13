@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.3f-B — Additive private SQLite repository integration seam
-- Status: explicit repair completed by `8143f9d39`; full projection replacement, exact fenced rollback, and 214 SQLite tests pass independent review
+- Work item: 3.3f-C — Private `SqliteSessionRepo` Harness integration
+- Status: additive SQLite repository seam completed by `452fe721c`; complete structural handles, root export boundaries, 214 SQLite tests, package build, and root check pass independent review
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Export only the private complete-handle repository seam and lock its runtime/declaration boundary.
-2. Implement private `SqliteSessionRepo` and lifecycle tests.
+1. Implement private `SqliteSessionRepo` with atomic initial-main creation and lifecycle/error mapping tests.
+2. Reorder the private package build dependency so SQLite builds before Harness.
 3. Add real RuntimeShell SQLite acceptance.
 4. Add storage, creation, and RuntimeShell subprocess crash matrices.
 5. Run whole-Phase-3 review and Recovery/QA.
