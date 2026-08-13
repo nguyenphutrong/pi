@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3b — Shared ordered SQLite transaction engine
-- Status: corrected D-035 passed independent design review; ordered engine implementation and focused tests are next
+- Status: blocked on B-013 after two independent implementation reviews rejected the same runtime callback-capability leak
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

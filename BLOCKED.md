@@ -2,7 +2,29 @@
 
 ## Current status
 
-No active blocker. B-012 option 1 was implemented in `2cf987b40` and passed independent final review; the ordered SQLite transaction engine is next.
+Blocked on B-013. The ordered SQLite engine passes 46/46 package tests, its build, root check, and diff check, but two independent implementation reviews rejected the same runtime callback-capability leak. No flagged implementation is committed.
+
+## B-013 — Choose the runtime-safe SQLite callback capability
+
+- Date: 2026-08-13
+- Phase: 3
+- Work item: 3.3b — shared ordered SQLite transaction engine
+- Trigger: two independent review-agent rejections for the same runtime capability-isolation reason
+- Status: unresolved; uncommitted implementation must not be committed until a selected correction passes fresh independent review
+
+### Context
+
+D-035 requires transaction callbacks to receive only statement preparation, so they cannot open a nested transaction, close the connection, or bypass the ordered engine. The first implementation passed the full `SqliteDatabase`; its rework narrowed the TypeScript type to `Pick<SqliteDatabase, "prepare">` but still placed the original database object in the runtime context. A callback can therefore cast or dynamically inspect `context.db` and recover `transaction`, `close`, and `exec`. The second independent review correctly rejected this as the same underlying issue.
+
+The current uncommitted engine otherwise passes 29/29 focused tests and 46/46 package tests. Package build, `npm run check`, and `git diff --check` pass. The review confirms that prepared usage is detached and shares one serialized source with stats, the file-backed engine test proves `BEGIN IMMEDIATE` reserves the writer lock before callback reads, D-035 ordering/error/rollback requirements are met, and no new API is publicly exported.
+
+### Decision needed
+
+1. **Recommended:** keep the current private callback shape, but pass a new frozen runtime object containing only `prepare: (sql) => db.prepare(sql)`. Add runtime assertions that `transaction`, `close`, and `exec` are absent, then rerun the complete verification and fresh independent review. This is the smallest correction and preserves D-035.
+2. Replace `context.db` with a direct `context.prepare(sql)` capability. This also closes the leak but changes the approved private callback shape more broadly without adding safety over option 1.
+3. Accept compile-time-only capability narrowing. This leaves the reviewed runtime escape hatch and violates D-035; not recommended.
+
+Reply with `1`, `2`, or `3`.
 
 ## B-012 — Confirm the exact canonical SQLite DDL validation approach
 
