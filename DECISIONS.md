@@ -918,3 +918,38 @@ Verification is split by guarantee. The unchanged shared backend suite proves Me
 The package stays private because publishing a new fork-owned replacement API is harder to reverse than making it public later, matching D-021's established rule. The obsolete public package is removed from local-release inventory; no registry, publication, deployment, or external data action occurs. The corrected independent design review reports PASS. Phase 3 may complete its stated durability done bar without claiming completion of all Part 8 slice-14 product features; PLAN retains FTS/search and forks as named future work.
 
 Commit `7a0447f3b` completes the first behavior-preserving increment: the backend-neutral implementation and every internal runtime-port gate are now named `StoredSession`, while `MemorySessionRepo` remains memory-specific. No alias, public root export, method body, durable behavior, or test expectation changed. Four focused files pass 279/279 tests, `npm run check` and `git diff --check` pass, and independent review reports PASS.
+
+## D-033 — Build SQLite from one ordered engine and a segmented private branch projection
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-004–D-005, D-032; `packages/agent/docs/harness-v3.md` §§1.1–1.7, 2.5–2.8, 4.7–4.8, 8 slice 14, 9.1–9.3
+
+### Options
+
+1. Land a temporary parent-walking Storage first, then replace its branch implementation.
+2. Build disconnected SQL primitives first and test only private helpers until a later large integration.
+3. Rewrite the private package in buildable layers around one internal ordered engine, without exposing a known-wrong runtime branch path at any layer.
+
+### Choice
+
+Option 3. The layers are: private adapter/schema; ordered engine; repository and fenced handles; ordinary reads and shared conformance; segmented projection/scans/repair; Harness integration and crash gates. The package is not considered usable until full shared conformance and backend-specific acceptance pass.
+
+### Rationale
+
+The schema contains exactly nine tables: `sessions`, `session_sequences`, `entries`, `registers`, `usage_ledger`, `session_stats`, `writer_leases`, `branch_meta`, and `branch_entries`. Composite foreign keys scope every reference by session; session-owned rows cascade only on session deletion; branch repair deletes rows before metadata. Integer fields enforce their positive or non-negative domain and the JavaScript safe-integer ceiling. Entry type/custom-type/payload presence, valid JSON, usage adjustment, register key, and nullable base-pair constraints are structural only. SQLite reuses `session-storage` validators and never interprets provider messages, compaction semantics, lane namespaces, or register values; those remain Harness-owned under D-004/D-005. SQL `NULL` means an absent custom payload while the text `"null"` preserves JSON null.
+
+Entries and usage rows retain separate write-once tables. Symmetric `BEFORE INSERT` triggers reject cross-table id collisions, while each primary key rejects same-table duplicates. The ordered engine still preflights ids and references in caller order, so an entry parent or usage `entryId` may name only a previously committed entry or an entry written earlier in the same transaction. Triggers are defense, not history or a third payload store. Deterministic caller failures—including duplicate-id `corruption`—roll back without sealing the Storage handle, as required by shared conformance. Lease loss seals with existing `closed`; unexpected adapter/SQL faults seal with the original fault; persisted corruption discovered by reads or repair latches and seals.
+
+One internal synchronous engine serves both `Storage.commit()` and repository `initialTransaction`. Inside exactly one `BEGIN IMMEDIATE` it verifies and renews the exact unexpired owner/fence, reads one sequence range, takes one timestamp, applies every caller write in order, updates branch projection immediately after each entry, maintains stats after each entry/usage row, advances `next_seq`, and returns the ordinary `CommitResult`. Repository creation inserts catalog, sequence, zero stats, lease, and the Harness initial lane transaction in that same atomic transaction. No bootstrap format or second commit exists.
+
+One FIFO serializes the shared database file. A per-handle gate gives admitted reads, commits, heartbeats, and close their file-queue positions synchronously. Close seals later admission, drains earlier work, then attempts one exact fenced release; stale release is a no-op. A prior terminal fault wins over release failure, otherwise release failure rejects the shared close promise. Transient heartbeat SQL failure is contained and retried, but zero-row renewal proves lease loss and seals. Caller transaction errors do not poison the lower-level Storage even though an admitted commit failure still faults the upper Harness.
+
+Every new branch segment uses private id `segment:{newEntryId}`, which is collision-free even when siblings copy the same post-compaction prefix. Root entries start root segments; appending to an exact tip extends it. Divergence first resolves physical candidates through `ix_be_entry`, then proves the selected complete segment/base chain logically covers the parent and agrees with every other valid candidate. Selection is deterministic by newest tip sequence then branch id. The projection searches the complete chain for the newest compaction C at or below the parent. With C, the specific segment covering C becomes the new base at C's sequence and only C-exclusive through parent-inclusive rows copy; with no C, the root-through-parent range copies with no base; parent equal to C copies zero rows. Normal append, compaction search, and scan use only bounded branch ranges, never an entries inventory or parent loop.
+
+Branch scans materialize and validate the complete root-to-start closure before applying query semantics. They then orient, stop inclusively at the first id/type match, filter, apply the exclusive directional cursor, and limit—matching Memory for both orders. Each physical range drives from `branch_entries` through the required `CROSS JOIN entries`; plans must use covering `ix_be_seq`/`ix_be_type` and the entries primary key, with no entries scan or temporary ordering b-tree. Structure scans use the same plan without payload.
+
+Explicit repair is the sole parent-walking path. Under a valid lease and one transaction it inventories entries in ascending sequence, validates detached structural envelopes and that each parent has a lower entry sequence, deletes branch rows then metadata, and replays every entry through the ordinary projection using the same segment identity and compaction rules. It validates every rebuilt chain before commit and rolls back to the prior complete cache on failure. Repair never infers deleted register history: gaps are legal because superseded/deleted registers leave no rows. It requires only safe unique current sequences below `next_seq`; no log or history fold is introduced.
+
+Focused gates cover exact schema/triggers, `BEGIN IMMEDIATE`, ordered references, shared ids, stats and sequence rollback, caller-error reuse, branch candidate agreement, nested compaction/base chains, zero-copy divergence, Memory-equivalent query ordering, query plans, deterministic repair, leases/heartbeat/close/fault precedence, reopen, and process crash. The final corrected independent design review reports PASS with no §6 escalation.

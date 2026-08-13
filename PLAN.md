@@ -3,16 +3,16 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.2b — SQLite schema, ordered write engine, lease lifecycle, and segmented branch design
-- Status: backend-neutral `StoredSession` refactor committed as `7a0447f3b` after focused tests, root check, and independent review PASS
+- Work item: 3.3a — Private SQLite package, node adapter, and exact canonical schema
+- Status: D-033 exact SQLite core design passed corrected independent review; no SQLite rewrite code has landed
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Fix the exact SQLite write, schema, branch-segment, repository, and lifecycle implementation units against D-032.
-2. Rewrite the legacy SQLite package as private `@nguyenphutrong/pi-session-sqlite` and pass shared/backend-specific conformance.
-3. Add the private `SqliteSessionRepo` adapter in Harness runtime and run the real RuntimeShell over SQLite.
+1. Replace the legacy package surface with private `@nguyenphutrong/pi-session-sqlite`, retaining only the node adapter, SQL boundary, and exact nine-table schema.
+2. Implement the shared ordered engine, repository/lease lifecycle, and non-branch Storage reads against backend conformance.
+3. Implement segmented projection/scans, plan guards, and explicit repair; then add `SqliteSessionRepo` to Harness runtime.
 4. Add distinct storage-transaction, session-creation, and RuntimeShell subprocess crash matrices.
 5. Run independent whole-Phase-3 review and Recovery/QA gates.
 

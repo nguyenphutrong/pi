@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. `StoredSession` landed as `7a0447f3b`; exact SQLite core design is next.
+No active blocker. D-033 passed corrected independent review; private SQLite adapter/schema implementation is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 
