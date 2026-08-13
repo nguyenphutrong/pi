@@ -1034,3 +1034,38 @@ Option 1.
 A TypeScript projection is erased and did not prevent a callback from recovering `transaction`, `close`, or `exec` from the original database object. A fresh frozen prepare-only object enforces D-035 at runtime while preserving the already-approved private callback shape. Both transaction-prologue and per-entry projection callbacks receive the same restricted capability inside the engine-owned transaction. Tests assert that it is not the original database, has only `prepare`, cannot expose transaction or lifecycle methods, and still supports the required transactional reads and writes.
 
 Commit `cdd033a62` implements D-035 and D-036. The complete SQLite package passes 46/46 tests, its package build, `npm run check`, and `git diff --check`; final independent review reports PASS.
+
+## D-037 — Serialize SQLite lifecycle through one file-wide FIFO
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-032–D-036; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.8, 8 slice 14, 9.3
+
+### Options
+
+1. Give the repository and each handle separate queues.
+2. Share one queue but let repository and lifecycle callers open generic transaction bodies.
+3. Give one repository-owned FIFO all file work and expose only concrete lifecycle operations from the private transaction engine.
+
+### Choice
+
+Option 3.
+
+### Rationale
+
+The repository constructor synchronously reserves the FIFO's first position for asynchronous database open plus canonical schema initialization or validation before the object escapes. Every repository operation, handle operation, heartbeat, fenced release, and final connection close receives a position on that same tail synchronously; no handle owns another queue. External admission is sealed separately from a native-private cleanup capability, so repository close can reject new work while still enqueueing releases and final close. Queue rejection never breaks later positions.
+
+After schema initialization, `transaction-engine.ts` remains the only file that calls `SqliteDatabase.transaction()`. Its generic immediate runner and in-current-transaction prepared-write helper stay module-private. Callers receive only concrete create, acquire, renew, release, delete, and ordered-commit operations; D-035's prepare-only prologue and projection callbacks remain inside the engine boundary. Atomic create inserts the catalog row, sequence, zero stats, fence-one lease, and optional prepared initial transaction in one `BEGIN IMMEDIATE`. Phase 3.3c rejects entry-containing transactions before admission until the segmented projector exists; it adds no no-op projector, fake write, partial `Storage`, or second bootstrap commit.
+
+One injected clock value is validated and used for a lifecycle transaction's creation timestamp, lease window, and initial writes. Owner ids are opaque non-empty non-NUL strings, UUIDv7 by default and injectable for tests. Lease acquisition reads under `BEGIN IMMEDIATE`: expiry greater than now is busy; expiry equal to now is replaceable; replacement increments a safe fence in JavaScript; an expired `Number.MAX_SAFE_INTEGER` fence returns deterministic exhaustion without changing the row. Expiry arithmetic saturates safely at the maximum, while a maximum clock value is rejected because no positive lease window exists. Every normal commit and heartbeat renews the exact unexpired owner/fence; release deletes only that exact pair and treats a stale zero-row result as success.
+
+Each `create` or `open` installs a per-session producer reservation before queue admission. On success the queued job registers its active handle before removing the reservation; on failure it removes the reservation in `finally`. Delete, parallel create/open, and ownership checks therefore never observe a gap. Delete rejects before admission while a local reservation, active handle, or closing handle exists, never closes that handle, returns `deleted:false` for a missing session, refuses an unexpired external writer, and acquires an expired lease with a checked next fence before cascading the session in the same transaction.
+
+The first repository close synchronously seals external admission, closes all current handles, and prevents new producers. An admitted producer that has not begun its FIFO turn observes the seal and rejects before catalog or lease SQL; a producer that already ran registered its handle synchronously and is included in close. Close drains the FIFO and loops until producer reservations and active handles are empty, then enqueues connection close. This does not weaken the Storage rule that admitted commits drain: only not-yet-started repository handle producers are cancelled. Repeated repository and handle closes return the same promise.
+
+Deterministic caller transaction failures—including duplicate-id `StorageError("corruption")`—roll back without poisoning. The engine marks persisted canonical corruption privately; that marker, an unexpected public commit/read SQL fault, or zero-row lease renewal seals only the affected handle. Work from that handle admitted earlier receives the original latched error, while later admission receives a fresh `closed`; other handles continue. Heartbeat SQL faults are contained and retried unless a zero-row renewal proves lease loss. Handle close always attempts exact fenced release; a prior terminal fault wins over release failure, otherwise release failure is returned, and registry cleanup always runs. Repository close completes all cleanup and prioritizes initialization error, then the first handle-close failure in release-enqueue order, then connection-close failure.
+
+The low-level metadata contract is exactly id, creation time, current storage version, and optional parent session id; the SQL metadata column remains null in this phase. Private repository errors classify validation, duplicate/missing metadata, local ownership, busy writer, fence exhaustion, version mismatch, and repository closure without widening `StorageError` or a public API. Ordinary reads, shared conformance, entry projection, branch scans, repair, Harness integration, and crash matrices remain the next ordered units. The repository and incomplete handle are not exported from the package root.
+
+Focused tests must prove initialization-first ordering, cross-handle/repository FIFO order, producer reservation races, producer cancellation before SQL, atomic creation, lease and fence boundaries, delete in both orderings, commit/heartbeat fencing, fault provenance and precedence, transient heartbeat retry, idempotent close, release-before-connection-close, initialization failure cleanup, and absence of public exports. The corrected independent design review reports PASS with no §6 escalation.
