@@ -1379,3 +1379,28 @@ Current-state hydration validates the unique union of directly referenced pendin
 Queue writes remain private `StoredSession` transitions serialized on its mutation line; the planner sees typed consume actions, not Storage writes. No Storage, SQLite schema, `pi-ai`, agent-loop, legacy record/reducer, or public-package change is required. Tier A covers every new state and reopen, Tier B exact writer order, Tier C both permitted race histories, and representative SQLite process-death cuts cross-cut admission, placement/deletion, abort drain, and terminal cleanup. Independent corrected design review reports PASS with no §6 escalation.
 
 Commit `2cc6a0e12` implements D-047 increment 4.1a. Lane-owned pending messages use exact `pending.entry` values and an immutable attachment map; `nextRun`, lane-owned cancellation, FIFO prompt capture, caller-only intent ids, `skipInboxOnce`, assistant-ready replacement, and terminal preservation are one complete state-machine slice. Prompt and terminal no longer use lane-state sequence as authority for fields they do not own: they reload current ownership and exact operation state, then merge the latest `pendingNextRun`. Generated operation/caller ids cannot collide with captured reservations, admitted queue failures fault the shell, and active inbox/drained/write states remain invalid. Tier A/B/C Memory tests, RuntimeShell admission/fault/close tests, narrow SQLite reopen/capture tests, Harness 499/499, root check, and diff check pass. Fresh independent final review reports PASS; representative queue `SIGKILL` evidence remains the approved phase-level gate after 4.1b.
+
+Commit `2700b7a58` implements D-047 increment 4.1b. Active steer/follow-up and drained queue ids now hydrate from exact `pending.entry` registers; one shared pure selector authorizes both planner and writer drains in FIFO all/one-at-a-time modes. Queue admission, active cancellation, skip-once generation, finish-only follow-up, failure rescue, first/repeated abort payload retention, and operation-only terminal cleanup serialize on the private `StoredSession` mutation line. Runtime settings capture queue modes atomically with prompt acceptance. Current-state validation rejects duplicate or missing payloads and collisions with response, usage, and planned/effect-pending tool-result reservations without history reads. Memory writer/race/reopen coverage and controlled SQLite reopen pass Harness 557/557, root check, and diff check; fresh independent final review reports PASS. Representative queue `SIGKILL` cuts remain the next phase-level gate and are not claimed complete.
+
+## D-048 — Validate only representable run lineage during bounded hydration
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: accepted after fresh independent implementation review
+- References: D-047; `packages/agent/docs/harness-v3.md` §§3.1, 3.3–3.6, 3.11–3.12, 4.4, 5.1
+
+### Options
+
+1. Require the first caller prompt to directly parent `sourceLeafId`.
+2. Fetch or walk every trigger parent until restore proves complete branch lineage.
+3. Validate the complete projection expressible from entries directly named by current state: source sequence before the first caller prompt, direct chaining between later caller prompts, strict prompt/trigger/latest-assistant sequence ordering, and phase-specific role, leaf, reservation, and tool-result closure.
+
+### Choice
+
+Option 3. A non-null source must have a lower storage sequence than the first caller prompt. Later caller prompts must directly parent their predecessor. Restore performs no additional lookup or parent walk.
+
+### Rationale
+
+`sourceLeafId` is the pre-operation leaf, while `intent.promptEntryIds` deliberately excludes captured `nextRun` entries and hook injections. Those valid placed entries may sit between the source and first caller prompt, so option 1 rejects legal runs. Option 2 violates the exact bounded-hydration contract and reintroduces history-derived recovery. The current named entries can still prove source-before-prompt ordering, the caller-only prompt chain, stale trigger rejection, latest-assistant ordering, exact assistant settlement parents while intent is open, and complete tool-result chains. Corruption hidden solely behind unnamed injected ancestry is intentionally outside current-state recovery validation.
+
+The implementation adds write-free source-order rejection and a no-scan regression proving an unnamed placed entry may legally bridge source to first prompt. Fresh independent review confirms the earlier trigger-closure and logical-reservation-collision findings are closed. This is a bounded validation correction inside D-047, not a durable contract, public API, or §6 architecture change.
