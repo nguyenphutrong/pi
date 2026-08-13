@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
 import {
 	assertJsonValue,
 	assertRegister,
@@ -10,6 +10,7 @@ import {
 	type IdGenerator,
 	isUuidV7,
 	type JsonValue,
+	type Register,
 	type Storage,
 	StorageError,
 	type UsageRow,
@@ -180,12 +181,10 @@ async function hydrateCurrentState(
 		runOperation && toolBatch
 			? await Promise.all(
 					toolBatch.calls.map((call) =>
-						call.status === "effect_pending"
-							? storage.getRegister(
-									"op.tool_args",
-									`${runOperation.value.operationId}:${toolBatch.turnId}:${call.sourceIndex}`,
-								)
-							: undefined,
+						storage.getRegister(
+							"op.tool_args",
+							`${runOperation.value.operationId}:${toolBatch.turnId}:${call.sourceIndex}`,
+						),
 					),
 				)
 			: [];
@@ -294,7 +293,7 @@ async function hydrateCurrentState(
 				const resultUsage = usageRows.get(call.resultEntryId);
 				if (call.status === "planned") {
 					unfinishedSeen = true;
-					if (result || resultUsage)
+					if (result || resultUsage || toolArgumentRegisters[call.sourceIndex])
 						throw new SessionError("corruption", "Planned tool result reservation is already materialized");
 				} else if (call.status === "effect_pending") {
 					unfinishedSeen = true;
@@ -333,13 +332,21 @@ async function hydrateCurrentState(
 			}
 			if (mainLeaf.value !== expectedToolParent)
 				throw new SessionError("corruption", "Tool batch lane leaf does not close its completed result prefix");
-		} else if (state.phase.kind === "checkpoint" && state.phase.continuation.kind === "may_finish") {
+		} else if (
+			(state.phase.kind === "checkpoint" || state.phase.kind === "assistant") &&
+			state.latestAssistantEntryId !== null
+		) {
+			if (mainLeaf.value !== triggerEntryId)
+				throw new SessionError("corruption", "Assistant trigger must close the current lane leaf");
 			if (
-				mainLeaf.value !== triggerEntryId ||
-				trigger.message.role !== "assistant" ||
-				trigger.parentId !== expectedParent
-			)
-				throw new SessionError("corruption", "Finished Phase 1 generation has an invalid assistant closure");
+				state.phase.kind === "checkpoint" &&
+				state.phase.continuation.kind === "may_finish" &&
+				state.phase.continuation.includeFinalAssistant
+			) {
+				if (trigger.message.role !== "assistant" || trigger.parentId !== expectedParent)
+					throw new SessionError("corruption", "Finished generation has an invalid assistant closure");
+			} else if (state.latestAssistantEntryId === triggerEntryId || trigger.message.role !== "toolResult")
+				throw new SessionError("corruption", "Post-tool trigger must contain a tool result after its assistant");
 		} else if (mainLeaf.value !== triggerEntryId || triggerEntryId !== expectedParent) {
 			throw new SessionError(
 				"corruption",
@@ -467,13 +474,14 @@ export type RecoveryTransitionResult = {
 	readonly attachment: RuntimeAttachment;
 };
 
-export interface FinishedRunResult {
+export type FinishedRunResult = {
 	readonly operationId: string;
 	readonly kind: "completed";
 	readonly leafId: string;
-	readonly finalEntryId: string;
-	readonly finalMessage: AssistantMessage;
-}
+} & (
+	| { readonly finalEntryId: string; readonly finalMessage: AssistantMessage }
+	| { readonly finalEntryId?: never; readonly finalMessage?: never }
+);
 
 export interface FailedRunResult {
 	readonly operationId: string;
@@ -518,6 +526,104 @@ export interface SettleAssistantEffectTransition {
 	readonly intendedOutputLimit: number;
 	readonly contextWindow: number;
 	readonly message: AssistantMessage;
+}
+
+export type ClearToolCallOutcome =
+	| {
+			readonly kind: "prepared";
+			readonly toolCall: ToolCall;
+			readonly args: { readonly [key: string]: JsonValue };
+			readonly replay: "never" | "safe";
+	  }
+	| {
+			readonly kind: "immediate";
+			readonly toolCall: ToolCall;
+			readonly result: {
+				readonly content: ToolResultMessage["content"];
+				readonly details: JsonValue;
+				readonly addedToolNames?: string[];
+			};
+			readonly isError: true;
+			readonly terminate: boolean;
+	  };
+
+export interface ClearToolCallTransition {
+	readonly operationId: string;
+	readonly assistantEntryId: string;
+	readonly turnId: string;
+	readonly sourceIndex: number;
+	readonly resultEntryId: string;
+	readonly expectedOperationStateSeq: number;
+	readonly expectedLaneStateSeq: number;
+	readonly expectedLeafSeq: number;
+	readonly expectedLeafId: string | null;
+	readonly outcome: ClearToolCallOutcome;
+}
+
+export type ClearToolCallResult = {
+	readonly status: "committed" | "obsolete";
+	readonly attachment: RuntimeAttachment;
+};
+
+const PREPARED_CLEARANCE_FIELDS = new Set(["kind", "toolCall", "args", "replay"]);
+const IMMEDIATE_CLEARANCE_FIELDS = new Set(["kind", "toolCall", "result", "isError", "terminate"]);
+const TOOL_CALL_FIELDS = new Set(["type", "id", "name", "arguments", "thoughtSignature", "namespace"]);
+const IMMEDIATE_RESULT_FIELDS = new Set(["content", "details", "addedToolNames"]);
+
+function validateClearToolCallOutcome(outcome: unknown): asserts outcome is ClearToolCallOutcome {
+	try {
+		assertJsonValue(outcome);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Tool clearance outcome must be detached JSON data", error);
+	}
+	if (
+		!isExactDataObject(
+			outcome,
+			isExactDataObject(outcome, PREPARED_CLEARANCE_FIELDS) && outcome.kind === "prepared"
+				? PREPARED_CLEARANCE_FIELDS
+				: IMMEDIATE_CLEARANCE_FIELDS,
+		)
+	)
+		throw new SessionError("invalid_query", "Tool clearance outcome has unsupported fields");
+	if (!isExactDataObject(outcome.toolCall, TOOL_CALL_FIELDS))
+		throw new SessionError("invalid_query", "Tool clearance source must be a plain tool call");
+	const toolCall = outcome.toolCall;
+	if (
+		toolCall.type !== "toolCall" ||
+		typeof toolCall.id !== "string" ||
+		typeof toolCall.name !== "string" ||
+		toolCall.arguments === null ||
+		typeof toolCall.arguments !== "object" ||
+		Array.isArray(toolCall.arguments) ||
+		!isExactDataObject(toolCall.arguments, new Set(Object.keys(toolCall.arguments))) ||
+		(toolCall.thoughtSignature !== undefined && typeof toolCall.thoughtSignature !== "string") ||
+		(toolCall.namespace !== undefined && typeof toolCall.namespace !== "string")
+	)
+		throw new SessionError("invalid_query", "Tool clearance source is invalid");
+	if (outcome.kind === "prepared") {
+		if (
+			!Object.hasOwn(outcome, "args") ||
+			outcome.args === null ||
+			typeof outcome.args !== "object" ||
+			Array.isArray(outcome.args) ||
+			!isExactDataObject(outcome.args, new Set(Object.keys(outcome.args))) ||
+			(outcome.replay !== "never" && outcome.replay !== "safe")
+		)
+			throw new SessionError("invalid_query", "Prepared tool clearance data is invalid");
+		return;
+	}
+	if (
+		outcome.kind !== "immediate" ||
+		outcome.isError !== true ||
+		typeof outcome.terminate !== "boolean" ||
+		!isExactDataObject(outcome.result, IMMEDIATE_RESULT_FIELDS) ||
+		!Array.isArray(outcome.result.content) ||
+		!Object.hasOwn(outcome.result, "details") ||
+		(outcome.result.addedToolNames !== undefined &&
+			(!Array.isArray(outcome.result.addedToolNames) ||
+				!outcome.result.addedToolNames.every((name) => typeof name === "string")))
+	)
+		throw new SessionError("invalid_query", "Immediate tool clearance data is invalid");
 }
 
 export type SettleAssistantEffectResult =
@@ -1346,6 +1452,253 @@ export class MemorySession implements Session {
 		});
 	}
 
+	clearToolCall(transition: ClearToolCallTransition): Promise<ClearToolCallResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		try {
+			validateClearToolCallOutcome(transition.outcome);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [meta, state] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!meta || !state) throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(meta, currentOperationId);
+				runState = decodeRunStateRegister(state, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			const phase = runState?.value.phase;
+			const batch = phase?.kind === "tools" ? phase.batch : undefined;
+			const call = batch?.calls[transition.sourceIndex];
+			const firstUnfinished = batch?.calls.findIndex((candidate) => candidate.status !== "completed");
+			const argsKey = `${transition.operationId}:${transition.turnId}:${transition.sourceIndex}`;
+			const [argsRegister, resultEntries, resultUsage] = await Promise.all([
+				this.#storage.getRegister("op.tool_args", argsKey),
+				this.#storage.getEntries([transition.resultEntryId]),
+				this.#storage.getUsageRows([transition.resultEntryId]),
+			]);
+			const current =
+				laneState.seq === transition.expectedLaneStateSeq &&
+				mainLeaf.seq === transition.expectedLeafSeq &&
+				mainLeaf.value === transition.expectedLeafId &&
+				currentOperationId === transition.operationId &&
+				runState?.seq === transition.expectedOperationStateSeq &&
+				batch?.assistantEntryId === transition.assistantEntryId &&
+				batch.turnId === transition.turnId &&
+				firstUnfinished === transition.sourceIndex &&
+				call?.status === "planned" &&
+				call.sourceIndex === transition.sourceIndex &&
+				call.resultEntryId === transition.resultEntryId;
+			if (!current) return Object.freeze({ status: "obsolete" as const, attachment });
+			if (!runOperation || !runState || !batch || call?.status !== "planned")
+				throw new SessionError("corruption", "Validated tool clearance changed inside the mutation line");
+			if (argsRegister || resultEntries.size > 0 || resultUsage.size > 0)
+				throw new SessionError("corruption", "Tool clearance reservations are already materialized");
+			const assistant = hydrated.entries.get(batch.assistantEntryId);
+			const sourceCalls =
+				assistant?.message.role === "assistant"
+					? assistant.message.content.filter((content) => content.type === "toolCall")
+					: [];
+			const source = sourceCalls[transition.sourceIndex];
+			if (!source || !isDeepStrictEqual(source, transition.outcome.toolCall))
+				throw new SessionError("corruption", "Tool clearance source identity does not match the assistant entry");
+
+			if (transition.outcome.kind === "prepared") {
+				const prepared = transition.outcome;
+				const nextState: RunState = {
+					...runState.value,
+					phase: {
+						kind: "tools",
+						batch: {
+							...batch,
+							calls: batch.calls.map((candidate, index) =>
+								index === transition.sourceIndex
+									? { ...candidate, status: "effect_pending" as const, replay: prepared.replay }
+									: candidate,
+							),
+						},
+					},
+				};
+				const committed = await this.#storage.commit({
+					writes: [
+						{
+							kind: "register",
+							op: "set",
+							namespace: "op.tool_args",
+							key: argsKey,
+							value: structuredClone(transition.outcome.args) as JsonValue,
+						},
+						{
+							kind: "register",
+							op: "set",
+							namespace: "op.state",
+							key: transition.operationId,
+							value: encodeRunState(nextState, transition.operationId),
+						},
+					],
+				});
+				return Object.freeze({
+					status: "committed" as const,
+					attachment: Object.freeze({
+						...attachment,
+						runState: Object.freeze({ seq: committed.seqs[1], value: structuredClone(nextState) }),
+					}),
+				});
+			}
+
+			const immediate = transition.outcome;
+			const message: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: immediate.toolCall.id,
+				toolName: immediate.toolCall.name,
+				content: structuredClone(immediate.result.content),
+				details: structuredClone(immediate.result.details),
+				...(immediate.result.addedToolNames?.length
+					? { addedToolNames: structuredClone(immediate.result.addedToolNames) }
+					: {}),
+				isError: true,
+				timestamp: Date.now(),
+			};
+			const encodedMessage = encodeMessage(message);
+			const completedCalls = batch.calls.map((candidate, index) =>
+				index === transition.sourceIndex
+					? { ...candidate, status: "completed" as const, terminate: immediate.terminate }
+					: candidate,
+			);
+			const final = transition.sourceIndex === batch.calls.length - 1;
+			const nextState: RunState = {
+				...runState.value,
+				phase: final
+					? {
+							kind: "checkpoint",
+							continuation: completedCalls.every(
+								(candidate) => candidate.status === "completed" && candidate.terminate,
+							)
+								? { kind: "may_finish", includeFinalAssistant: false }
+								: { kind: "need_assistant", overflowRecoveryUsed: false },
+							triggerEntryId: transition.resultEntryId,
+						}
+					: { kind: "tools", batch: { ...batch, calls: completedCalls } },
+			};
+			const priorParent =
+				transition.sourceIndex === 0
+					? transition.assistantEntryId
+					: batch.calls[transition.sourceIndex - 1]?.status === "completed"
+						? batch.calls[transition.sourceIndex - 1].resultEntryId
+						: undefined;
+			if (priorParent === undefined || mainLeaf.value !== priorParent)
+				throw new SessionError("corruption", "Tool result parent does not close the completed prefix");
+			let cleanup: Register[] = [];
+			if (final) {
+				const listed = await this.#storage.listRegisters("op.tool_args");
+				for (const register of listed) {
+					try {
+						assertRegister(register);
+					} catch (error) {
+						throw new SessionError("corruption", "Malformed tool argument cleanup register", error);
+					}
+					if (register.namespace !== "op.tool_args")
+						throw new SessionError("corruption", "Tool argument cleanup register has the wrong namespace");
+				}
+				const cleanupPrefix = `${transition.operationId}:${transition.turnId}:`;
+				cleanup = listed.filter(({ key }) => key.startsWith(cleanupPrefix));
+				const seen = new Set<number>();
+				for (const register of cleanup) {
+					const suffix = register.key.slice(cleanupPrefix.length);
+					const sourceIndex = Number(suffix);
+					if (
+						!Number.isSafeInteger(sourceIndex) ||
+						sourceIndex < 0 ||
+						sourceIndex >= batch.calls.length ||
+						String(sourceIndex) !== suffix ||
+						seen.has(sourceIndex)
+					)
+						throw new SessionError("corruption", "Tool argument cleanup key has an invalid source index");
+					seen.add(sourceIndex);
+				}
+				cleanup.sort((left, right) => left.key.localeCompare(right.key));
+			}
+			const writes: Write[] = [
+				{
+					kind: "entry",
+					entry: {
+						id: transition.resultEntryId,
+						parentId: priorParent,
+						type: "message",
+						payload: encodedMessage,
+					},
+				},
+				{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: transition.resultEntryId },
+				...cleanup.map(({ key }) => ({
+					kind: "register" as const,
+					op: "delete" as const,
+					namespace: "op.tool_args" as const,
+					key,
+				})),
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: transition.operationId,
+					value: encodeRunState(nextState, transition.operationId),
+				},
+			];
+			const committed = await this.#storage.commit({ writes });
+			const entries = new Map(hydrated.entries);
+			entries.set(
+				transition.resultEntryId,
+				Object.freeze({
+					id: transition.resultEntryId,
+					parentId: priorParent,
+					seq: committed.seqs[0],
+					timestamp: committed.timestamp,
+					type: "message" as const,
+					message: structuredClone(message),
+				}),
+			);
+			return Object.freeze({
+				status: "committed" as const,
+				attachment: Object.freeze({
+					...attachment,
+					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.resultEntryId }),
+					runState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextState) }),
+					entries,
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
 	finishRun(transition: FinishRunTransition): Promise<FinishRunResult> {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		const operation = this.#mutationLine.then(async () => {
@@ -1397,21 +1750,30 @@ export class MemorySession implements Session {
 				runOperation.value.lane !== MAIN ||
 				runState.value.control.status !== "running" ||
 				(!completed && !failed) ||
-				(phase.kind === "checkpoint" &&
-					phase.continuation.kind === "may_finish" &&
-					phase.continuation.includeFinalAssistant !== true) ||
 				runState.value.inbox.steer.length !== 0 ||
 				runState.value.inbox.followUp.length !== 0 ||
 				runState.value.inbox.writes.length !== 0 ||
 				mainLeaf.value === null ||
 				(completed && mainLeaf.value !== phase.triggerEntryId) ||
 				(failed && mainLeaf.value !== phase.provenance.entryId) ||
-				mainLeaf.value !== runState.value.latestAssistantEntryId
+				(completed &&
+					phase.kind === "checkpoint" &&
+					phase.continuation.kind === "may_finish" &&
+					phase.continuation.includeFinalAssistant &&
+					mainLeaf.value !== runState.value.latestAssistantEntryId) ||
+				runState.value.latestAssistantEntryId === null
 			)
-				throw new SessionError("corruption", "Run is not at a valid Phase 1 finish boundary");
+				throw new SessionError("corruption", "Run is not at a valid finish boundary");
 			const finalEntry = hydrated.entries.get(mainLeaf.value);
-			if (!finalEntry || finalEntry.message.role !== "assistant")
-				throw new SessionError("corruption", "Final assistant entry is missing or invalid");
+			const includeFinalAssistant =
+				phase.kind !== "checkpoint" ||
+				phase.continuation.kind !== "may_finish" ||
+				phase.continuation.includeFinalAssistant;
+			if (
+				!finalEntry ||
+				(includeFinalAssistant ? finalEntry.message.role !== "assistant" : finalEntry.message.role !== "toolResult")
+			)
+				throw new SessionError("corruption", "Final entry is missing or invalid");
 
 			const [toolArgs, preparations] = await Promise.all([
 				this.#storage.listRegisters("op.tool_args"),
@@ -1456,21 +1818,36 @@ export class MemorySession implements Session {
 					error: structuredClone(phase.error),
 				});
 			} else {
-				durableResult = encodeLaneLastResult({
-					operationId: transition.operationId,
-					kind: "run",
-					outcome: "completed",
-					leafId: mainLeaf.value,
-					finalAssistantEntryId: mainLeaf.value,
-					runCompletion: "assistant",
-				});
-				result = Object.freeze({
-					operationId: transition.operationId,
-					kind: "completed",
-					leafId: mainLeaf.value,
-					finalEntryId: mainLeaf.value,
-					finalMessage: structuredClone(finalEntry.message),
-				});
+				if (includeFinalAssistant) {
+					durableResult = encodeLaneLastResult({
+						operationId: transition.operationId,
+						kind: "run",
+						outcome: "completed",
+						leafId: mainLeaf.value,
+						finalAssistantEntryId: mainLeaf.value,
+						runCompletion: "assistant",
+					});
+					result = Object.freeze({
+						operationId: transition.operationId,
+						kind: "completed",
+						leafId: mainLeaf.value,
+						finalEntryId: mainLeaf.value,
+						finalMessage: structuredClone(finalEntry.message) as AssistantMessage,
+					});
+				} else {
+					durableResult = encodeLaneLastResult({
+						operationId: transition.operationId,
+						kind: "run",
+						outcome: "completed",
+						leafId: mainLeaf.value,
+						runCompletion: "terminated_tools",
+					});
+					result = Object.freeze({
+						operationId: transition.operationId,
+						kind: "completed",
+						leafId: mainLeaf.value,
+					});
+				}
 			}
 			const nextLaneState: LaneState = { ...laneState.value, currentOperationId: null };
 			const writes: Write[] = [

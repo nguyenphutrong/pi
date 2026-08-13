@@ -2,6 +2,8 @@ import type { LaneConfiguration } from "./durable.ts";
 import {
 	type AcceptPromptResult,
 	type AcceptPromptTransition,
+	type ClearToolCallResult,
+	type ClearToolCallTransition,
 	type FinishRunResult,
 	type FinishRunTransition,
 	MemorySession,
@@ -80,4 +82,10 @@ export function finishRun(session: Session, transition: FinishRunTransition): Pr
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.finishRun(transition);
+}
+
+export function clearToolCall(session: Session, transition: ClearToolCallTransition): Promise<ClearToolCallResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.clearToolCall(transition);
 }

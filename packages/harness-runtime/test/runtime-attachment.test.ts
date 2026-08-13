@@ -463,6 +463,76 @@ describe("runtime attachment boundary", () => {
 });
 
 describe("bounded Phase 1 closure validation", () => {
+	it.each(["completed-prefix hole", "mismatched completed source"] as const)(
+		"rejects direct tools-state corruption write-free: %s",
+		async (kind) => {
+			const fixture = operationFixture();
+			const firstResult = id();
+			const secondResult = id();
+			const writes = fixture.writes.map((write): Write => {
+				if (write.kind === "entry" && write.entry.id === fixture.prompt)
+					return {
+						...write,
+						entry: {
+							...write.entry,
+							payload: json({
+								...assistant("toolUse"),
+								content: [
+									{ type: "toolCall", id: "call-a", name: "read", arguments: {} },
+									{ type: "toolCall", id: "call-b", name: "write", arguments: {} },
+								],
+							}),
+						},
+					};
+				if (write.kind === "register" && write.op === "set" && write.namespace === "lane.leaf")
+					return { ...write, value: kind === "completed-prefix hole" ? secondResult : firstResult };
+				if (write.kind === "register" && write.op === "set" && write.namespace === "op.state")
+					return {
+						...write,
+						value: json({
+							...(write.value as Record<string, JsonValue>),
+							latestAssistantEntryId: fixture.prompt,
+							phase: {
+								kind: "tools",
+								batch: {
+									assistantEntryId: fixture.prompt,
+									configuration: seed(),
+									turnId: id(),
+									calls:
+										kind === "completed-prefix hole"
+											? [
+													{ status: "planned", sourceIndex: 0, resultEntryId: firstResult },
+													{ status: "completed", sourceIndex: 1, resultEntryId: secondResult },
+												]
+											: [
+													{ status: "completed", sourceIndex: 0, resultEntryId: firstResult },
+													{ status: "planned", sourceIndex: 1, resultEntryId: secondResult },
+												],
+								},
+							},
+						}),
+					};
+				return write;
+			});
+			writes.push({
+				kind: "entry",
+				entry: {
+					id: kind === "completed-prefix hole" ? secondResult : firstResult,
+					parentId: kind === "mismatched completed source" ? fixture.source : fixture.prompt,
+					type: "message",
+					payload: json({
+						...toolResult(),
+						toolCallId: kind === "mismatched completed source" ? "wrong-call" : "call-b",
+						toolName: kind === "mismatched completed source" ? "wrong-tool" : "write",
+					}),
+				},
+			});
+			const instrumented = instrumentStorage(await storageWith(writes));
+			await expect(attachRuntime(session(instrumented), seed())).rejects.toMatchObject({ code: "corruption" });
+			expect(instrumented.committedTransactions).toEqual([]);
+		},
+	);
+
 	it.each([
 		["assistant", assistant()],
 		["toolResult", toolResult()],

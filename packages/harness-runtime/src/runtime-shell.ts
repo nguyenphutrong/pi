@@ -6,13 +6,25 @@ import type {
 	Models,
 	ModelsSimpleStreamOptions,
 	RetryPolicy,
+	Static,
+	TSchema,
 } from "@earendil-works/pi-ai";
+import {
+	type AgentTool,
+	type AgentToolResult,
+	type AgentToolUpdateCallback,
+	type BeforeToolCallCallback,
+	type PreparedToolCall,
+	prepareToolCall,
+} from "@nguyenphutrong/pi-agent-loop";
+import type { JsonValue } from "@nguyenphutrong/pi-session-storage";
 import { encodeMessage } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction } from "./planner.ts";
 import {
 	acceptPrompt,
 	attachRuntime,
+	clearToolCall,
 	finishRun,
 	prepareAssistantEffect,
 	recoverAssistantEffect,
@@ -21,7 +33,7 @@ import {
 	startAssistantStep,
 } from "./runtime-port.ts";
 import { RuntimeSettingsOwner } from "./runtime-settings.ts";
-import type { RuntimeAttachment } from "./session.ts";
+import type { ClearToolCallOutcome, RuntimeAttachment } from "./session.ts";
 import type { Session } from "./types.ts";
 
 export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed" | "fault";
@@ -36,10 +48,31 @@ export class RuntimeShellError extends Error {
 	}
 }
 
-export interface RuntimeShellOptions {
+export interface RuntimeToolDefinition<
+	TContext extends object | undefined,
+	TParameters extends TSchema = TSchema,
+	TDetails = unknown,
+> extends Omit<AgentTool<TParameters, TDetails>, "execute"> {
+	execute(
+		toolCallId: string,
+		params: Static<TParameters>,
+		signal: AbortSignal | undefined,
+		onUpdate: AgentToolUpdateCallback<TDetails> | undefined,
+		context: TContext,
+	): Promise<AgentToolResult<TDetails>>;
+}
+
+export type RuntimeToolContextSource<TContext extends object | undefined> =
+	| TContext
+	| (() => TContext | Promise<TContext>);
+
+export interface RuntimeShellOptions<TContext extends object | undefined = object | undefined> {
 	readonly streamOptions?: StreamOptions;
 	readonly retryPolicy?: RetryPolicy;
 	readonly models?: Models;
+	readonly tools?: readonly RuntimeToolDefinition<TContext>[];
+	readonly toolContext?: RuntimeToolContextSource<TContext>;
+	readonly beforeToolCall?: BeforeToolCallCallback;
 }
 
 interface AssistantEffectPlan {
@@ -73,10 +106,64 @@ type AssistantEffectState =
 	  }
 	| { readonly status: "settled"; readonly plan: AssistantEffectPlan; readonly message: AssistantMessage };
 
-export class RuntimeShell {
+function bindRuntimeTool<TContext extends object | undefined, TParameters extends TSchema, TDetails>(
+	definition: RuntimeToolDefinition<TContext, TParameters, TDetails>,
+	context: TContext,
+): AgentTool<TParameters, TDetails> {
+	return Object.freeze({
+		...definition,
+		execute: (
+			toolCallId: string,
+			params: Static<TParameters>,
+			signal?: AbortSignal,
+			onUpdate?: AgentToolUpdateCallback<TDetails>,
+		) => definition.execute(toolCallId, params, signal, onUpdate, context),
+	});
+}
+
+function cloneFrozen<T>(value: T, clones = new WeakMap<object, object>()): T {
+	if (value === null || typeof value !== "object") return value;
+	const existing = clones.get(value);
+	if (existing) return existing as T;
+	const clone: object = Array.isArray(value)
+		? new Array(value.length)
+		: (Object.create(Object.getPrototypeOf(value)) as object);
+	clones.set(value, clone);
+	for (const key of Reflect.ownKeys(value)) {
+		if (Array.isArray(value) && key === "length") continue;
+		const descriptor = Object.getOwnPropertyDescriptor(value, key);
+		if (!descriptor) continue;
+		Object.defineProperty(
+			clone,
+			key,
+			"value" in descriptor ? { ...descriptor, value: cloneFrozen(descriptor.value, clones) } : descriptor,
+		);
+	}
+	return Object.freeze(clone) as T;
+}
+
+function captureToolDefinitions<TContext extends object | undefined>(
+	definitions: readonly RuntimeToolDefinition<TContext>[],
+): ReadonlyMap<string, RuntimeToolDefinition<TContext>> {
+	const captured = new Map<string, RuntimeToolDefinition<TContext>>();
+	for (const definition of definitions) {
+		if (captured.has(definition.name))
+			throw new RuntimeShellError("unavailable", `Duplicate runtime tool definition: ${definition.name}`);
+		const copy = cloneFrozen(definition);
+		captured.set(copy.name, copy);
+	}
+	return captured;
+}
+
+export class RuntimeShell<TContext extends object | undefined = object | undefined> {
 	readonly #session: Session;
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
+	readonly #toolDefinitions: ReadonlyMap<string, RuntimeToolDefinition<TContext>>;
+	readonly #toolContext: RuntimeToolContextSource<TContext> | undefined;
+	readonly #beforeToolCall: BeforeToolCallCallback | undefined;
+	readonly #toolBatches = new Map<string, ReadonlyMap<string, AgentTool>>();
+	readonly #preparedTools = new Map<string, PreparedToolCall>();
 	readonly #assistantEffects = new Map<string, AssistantEffectState>();
 	readonly #retryElapsed = new Set<string>();
 	#current: RuntimeAttachment;
@@ -87,11 +174,19 @@ export class RuntimeShell {
 	readonly #shutdownNotice: Promise<void>;
 	readonly #notifyShutdown: () => void;
 
-	constructor(session: Session, settings: RuntimeSettingsOwner, attachment: RuntimeAttachment, models?: Models) {
+	constructor(
+		session: Session,
+		settings: RuntimeSettingsOwner,
+		attachment: RuntimeAttachment,
+		options: RuntimeShellOptions<TContext>,
+	) {
 		this.#session = session;
 		this.#settings = settings;
 		this.#current = attachment;
-		this.#models = models;
+		this.#models = options.models;
+		this.#toolDefinitions = captureToolDefinitions(options.tools ?? []);
+		this.#toolContext = options.toolContext;
+		this.#beforeToolCall = options.beforeToolCall;
 		let notifyShutdown!: () => void;
 		this.#shutdownNotice = new Promise((resolve) => {
 			notifyShutdown = resolve;
@@ -118,6 +213,8 @@ export class RuntimeShell {
 		this.#notifyShutdown();
 		this.#abortRunningEffects();
 		if (effectKey !== undefined) this.#assistantEffects.delete(effectKey);
+		this.#toolBatches.clear();
+		this.#preparedTools.clear();
 		return this.#fault;
 	}
 
@@ -157,6 +254,92 @@ export class RuntimeShell {
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "prepare_tool_call") {
+				const info = action.info;
+				const phase = this.#current.runState?.value.phase;
+				if (phase?.kind !== "tools" || phase.batch.assistantEntryId !== info.assistantEntryId)
+					throw new RuntimeShellError("stale", "Tool batch is no longer current");
+				let leases = this.#toolBatches.get(info.assistantEntryId);
+				if (!leases) {
+					const activeDefinitions = phase.batch.configuration.activeToolNames.map((name) =>
+						this.#toolDefinitions.get(name),
+					);
+					if (activeDefinitions.some((definition) => definition === undefined))
+						throw new RuntimeShellError("unavailable", "Captured active tool definition is unavailable");
+					let context: TContext;
+					try {
+						context =
+							typeof this.#toolContext === "function"
+								? await this.#toolContext()
+								: (this.#toolContext as TContext);
+					} catch (cause) {
+						throw this.#faultShell(undefined, cause, "Tool context callback violated its runtime contract");
+					}
+					leases = new Map(
+						activeDefinitions.map((definition) => {
+							if (!definition) throw new Error("Missing active tool definition after validation");
+							return [definition.name, bindRuntimeTool(definition, context)];
+						}),
+					);
+					this.#toolBatches.set(info.assistantEntryId, leases);
+				}
+				const assistant = this.#current.entries.get(info.assistantEntryId);
+				const sourceCalls =
+					assistant?.message.role === "assistant"
+						? assistant.message.content.filter((content) => content.type === "toolCall")
+						: [];
+				const source = sourceCalls[info.sourceIndex];
+				if (!source)
+					throw this.#faultShell(undefined, undefined, "Tool source call is missing from its assistant entry");
+				const outcome = await prepareToolCall(source, [...leases.values()], this.#beforeToolCall);
+				let detachedOutcome: ClearToolCallOutcome;
+				try {
+					detachedOutcome =
+						outcome.kind === "prepared"
+							? {
+									kind: "prepared" as const,
+									toolCall: structuredClone(outcome.toolCall),
+									args: structuredClone(outcome.args) as Record<string, JsonValue>,
+									replay: outcome.replay,
+								}
+							: {
+									kind: "immediate" as const,
+									toolCall: structuredClone(outcome.toolCall),
+									result: {
+										content: structuredClone(outcome.result.content),
+										details: structuredClone(outcome.result.details) as JsonValue,
+										...(outcome.result.addedToolNames === undefined
+											? {}
+											: { addedToolNames: structuredClone(outcome.result.addedToolNames) }),
+									},
+									isError: true as const,
+									terminate: outcome.terminate,
+								};
+				} catch (cause) {
+					throw this.#faultShell(undefined, cause, "Tool clearance violated its runtime contract");
+				}
+				const result = await clearToolCall(this.#session, {
+					operationId: info.operationId,
+					assistantEntryId: info.assistantEntryId,
+					turnId: phase.batch.turnId,
+					sourceIndex: info.sourceIndex,
+					resultEntryId: info.resultEntryId,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLaneStateSeq: action.expected.laneStateSeq,
+					expectedLeafSeq: this.#current.mainLeaf.seq,
+					expectedLeafId: this.#current.mainLeaf.value,
+					outcome: detachedOutcome,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#current = result.attachment;
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Tool clearance is no longer authoritative");
+				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+				if (outcome.kind === "prepared")
+					this.#preparedTools.set(`${info.assistantEntryId}:${info.sourceIndex}`, outcome);
+				return info;
+			}
 			if (action.info.kind === "wait_assistant_retry") {
 				const info = action.info;
 				let remaining = Math.max(0, info.notBefore - Date.now());
@@ -457,7 +640,8 @@ export class RuntimeShell {
 						this.#models?.lease(
 							expected.laneConfiguration.value.model.provider,
 							expected.laneConfiguration.value.model.modelId,
-						) !== undefined;
+						) !== undefined &&
+						expected.laneConfiguration.value.activeToolNames.every((name) => this.#toolDefinitions.has(name));
 				} catch {
 					identityAvailable = false;
 				}
@@ -488,6 +672,8 @@ export class RuntimeShell {
 		this.#closePromise = this.#admissionLine.then(() => {
 			this.#abortRunningEffects();
 			this.#assistantEffects.clear();
+			this.#toolBatches.clear();
+			this.#preparedTools.clear();
 			this.#retryElapsed.clear();
 			return this.#session.close();
 		});
@@ -495,11 +681,12 @@ export class RuntimeShell {
 	}
 }
 
-export async function createRuntimeShell(
+export async function createRuntimeShell<TContext extends object | undefined = object | undefined>(
 	session: Session,
 	seed: LaneConfiguration,
-	options: RuntimeShellOptions = {},
-): Promise<RuntimeShell> {
+	options: RuntimeShellOptions<TContext> = {},
+): Promise<RuntimeShell<TContext>> {
+	const tools = [...captureToolDefinitions(options.tools ?? []).values()];
 	const settings = new RuntimeSettingsOwner(options.streamOptions, options.retryPolicy);
-	return new RuntimeShell(session, settings, await attachRuntime(session, seed), options.models);
+	return new RuntimeShell(session, settings, await attachRuntime(session, seed), { ...options, tools });
 }

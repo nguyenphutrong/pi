@@ -30,10 +30,10 @@ export type LaneLastResult = {
 	operationId: string;
 	kind: "run";
 	leafId: string;
-	finalAssistantEntryId: string;
 } & (
-	| { outcome: "completed"; runCompletion: "assistant" }
-	| { outcome: "failed"; error: OperationError; runCompletion?: never }
+	| { outcome: "completed"; runCompletion: "assistant"; finalAssistantEntryId: string }
+	| { outcome: "completed"; runCompletion: "terminated_tools"; finalAssistantEntryId?: never }
+	| { outcome: "failed"; error: OperationError; finalAssistantEntryId: string; runCompletion?: never }
 );
 
 export interface RunOperation {
@@ -275,7 +275,9 @@ export function decodeLaneLastResult(value: unknown): LaneLastResult {
 		candidate.outcome === "completed"
 			? object(
 					candidate,
-					["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
+					candidate.runCompletion === "terminated_tools"
+						? ["operationId", "kind", "outcome", "leafId", "runCompletion"]
+						: ["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
 					"lane last result",
 				)
 			: object(
@@ -285,14 +287,18 @@ export function decodeLaneLastResult(value: unknown): LaneLastResult {
 				);
 	uuid(result.operationId, "lane last result operationId");
 	uuid(result.leafId, "lane last result leafId");
-	uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
 	if (result.kind !== "run") fail("Unsupported lane last result kind");
 	if (result.outcome === "completed") {
-		if (result.runCompletion !== "assistant") fail("Unsupported completed lane last result");
-	} else if (result.outcome === "failed") decodeOperationError(result.error, "lane last result error");
-	else fail("Unsupported lane last result outcome");
-	if (result.leafId !== result.finalAssistantEntryId)
-		fail("Completed Phase 1 lane last result leaf must equal its final assistant");
+		if (result.runCompletion !== "assistant" && result.runCompletion !== "terminated_tools")
+			fail("Unsupported completed lane last result");
+		if (result.runCompletion === "assistant")
+			uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
+	} else if (result.outcome === "failed") {
+		uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
+		decodeOperationError(result.error, "lane last result error");
+	} else fail("Unsupported lane last result outcome");
+	if (result.runCompletion !== "terminated_tools" && result.leafId !== result.finalAssistantEntryId)
+		fail("Assistant lane last result leaf must equal its final assistant");
 	return result as unknown as LaneLastResult;
 }
 
@@ -484,12 +490,21 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 			if (continuation.kind === "need_assistant") {
 				if (object(continuation, ["kind", "overflowRecoveryUsed"], "need_assistant").overflowRecoveryUsed !== false)
 					fail("Phase 1 need_assistant overflowRecoveryUsed must be false");
-				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
+				if (state.latestAssistantEntryId === checkpoint.triggerEntryId)
+					fail("Tool checkpoint trigger must differ from its producing assistant");
 			} else if (continuation.kind === "may_finish") {
-				if (object(continuation, ["kind", "includeFinalAssistant"], "may_finish").includeFinalAssistant !== true)
-					fail("Phase 1 may_finish includeFinalAssistant must be true");
-				if (state.latestAssistantEntryId !== checkpoint.triggerEntryId)
+				const includeFinalAssistant = object(
+					continuation,
+					["kind", "includeFinalAssistant"],
+					"may_finish",
+				).includeFinalAssistant;
+				if (typeof includeFinalAssistant !== "boolean") fail("may_finish includeFinalAssistant must be boolean");
+				if (includeFinalAssistant && state.latestAssistantEntryId !== checkpoint.triggerEntryId)
 					fail("may_finish latest assistant must equal its trigger");
+				if (!includeFinalAssistant && state.latestAssistantEntryId === null)
+					fail("Tool-terminated checkpoint must retain its producing assistant");
+				if (!includeFinalAssistant && state.latestAssistantEntryId === checkpoint.triggerEntryId)
+					fail("Tool-terminated trigger must differ from its producing assistant");
 			} else fail("Unsupported checkpoint continuation");
 		} else if (phase.kind === "assistant") {
 			const assistant = object(phase, ["kind", "generation"], "assistant phase");
@@ -499,7 +514,8 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				const context = generationContext(ready.context);
 				safe(ready.nextAttempt, "nextAttempt", 1);
 				if (ready.nextAttempt > context.retryPolicy.maxAttempts) fail("nextAttempt exceeds maxAttempts");
-				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
+				if (state.latestAssistantEntryId === context.triggerEntryId)
+					fail("Assistant generation trigger must differ from the previous assistant");
 			} else if (generation.status === "retry_wait") {
 				const wait = object(
 					generation,
@@ -512,7 +528,8 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				safe(wait.notBefore, "notBefore");
 				if (wait.errorMessage !== "Provider outcome unknown after interruption")
 					fail("Unsupported retry wait errorMessage");
-				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
+				if (state.latestAssistantEntryId === context.triggerEntryId)
+					fail("Assistant generation trigger must differ from the previous assistant");
 			} else if (generation.status === "effect_pending") {
 				const pending = object(
 					generation,
@@ -532,7 +549,8 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 					fail("Generation reservation IDs must be distinct from known correlation IDs");
 				safe(pending.intendedOutputLimit, "intendedOutputLimit");
 				safe(pending.contextWindow, "contextWindow");
-				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
+				if (state.latestAssistantEntryId === context.triggerEntryId)
+					fail("Assistant generation trigger must differ from the previous assistant");
 			} else fail("Unsupported assistant generation state");
 		} else if (phase.kind === "tools") {
 			const tools = object(phase, ["kind", "batch"], "tools phase");
