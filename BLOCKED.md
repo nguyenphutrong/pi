@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. B-014 option 1 was implemented in `4a94c253c` after independent final review PASS.
+No active blocker. Phase 3.3f-D completed in `5ae9a5a9a` after fresh independent final review PASS; commit-boundary and subprocess crash matrices remain queued.
 
 ## B-014 — Apply segment creation identity on the exact-tip path
 
