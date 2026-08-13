@@ -1234,3 +1234,30 @@ The initial manual traces are exact: six actions for a no-tool response and sixt
 Subprocess SQL, creation, and every Phase 2 crash cut remain separate queued work and are still required before the Phase 3 done bar. No Storage, durable-schema, production API, repair, or recovery change is approved by this decision. The corrected independent design review reports PASS with no §6 escalation.
 
 Commit `5ae9a5a9a` implements D-042 as a test-only real SQLite acceptance suite. It drives exact no-tool and sequential-tool action identities through RuntimeShell, verifies complete persisted messages and usage associations, terminal register cleanup and `lane.lastResult`, then proves separate fresh attachment and RuntimeShell lifecycles perform no effects or durable writes. Focused acceptance passes 2/2, Harness passes 400/400, SQLite passes 214/214, `npm run check` and `git diff --check` pass. A fresh independent final review reports PASS; subprocess commit-boundary crash work remains next.
+
+## D-043 — Audit SQLite RuntimeShell prefixes with fresh controlled-close lifecycles
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after independent design review
+- References: D-019, D-024, D-029, D-041, D-042; `packages/agent/docs/harness-v3.md` §§1.4, 1.7, 3.2–3.4, 3.8, 3.13, 4.2, 4.4–4.7, 9.1–9.3
+
+### Options
+
+1. Add the commit-boundary matrix to the existing terminal SQLite acceptance file.
+2. Add a separate real-file suite for every Phase 2 sequential-tool action prefix and both replay policies.
+3. Refactor the approved Memory and SQLite tests behind one backend-neutral driver.
+
+### Choice
+
+Option 2. Run 34 scenarios: cuts zero through sixteen of the exact sequential-tool trace, each with `safe` and `never`. Every cut closes the current shell and repository, then a new repository opens the same session and a fresh RuntimeShell converges from the durable prefix.
+
+### Rationale
+
+A separate suite keeps D-042's terminal composition evidence small and preserves the already-approved Memory crash fixture. Within one cut, provider and tool spies survive shell lifecycles so replay counts remain observable; repository, Session, and RuntimeShell instances never do. Each reopen therefore reacquires the real SQLite owner/lease on a fresh connection without double attachment.
+
+The Phase 2 formulas remain authoritative. Assistant effects are uncertain after cuts 3, 4, 13, and 14. Tool intent is pending after cuts 6 through 9; a `never` tool is interrupted at all four, runs zero times only at cut 6, and otherwise retains its one pre-close execution. A `safe` tool replays after cuts 7 through 9 and therefore runs twice. All other cases run the tool once. Final provider calls total three only at assistant-uncertain cuts, and tool-result-bearing provider contexts total two only at cuts 13 and 14.
+
+The converged state must contain the exact provider responses, the real or policy-required interrupted tool result, exact usage associations, terminal lane result and cleanup, and an idle lane. After all owners close, a read-only complete SQLite snapshot is captured. A third fresh Session/RuntimeShell with independent spies must expose no action, effect, or durable write, and the post-close snapshot must match exactly, including sequence high-water and absent writer lease.
+
+This is a controlled-close commit-prefix audit, not an OS process-crash test. Storage/creation and RuntimeShell subprocess kill matrices remain required before the Phase 3 done bar. No production, Storage, schema, public API, repair, history-fold, or compatibility change is approved. Independent design review reports PASS with no §6 escalation.
