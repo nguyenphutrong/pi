@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-030 durable abort design is committed by `2ae7dbdd9` after corrected independent design review; implementation is next.
+No active blocker. D-030 is implemented by `4fdb212cf`; Phase 2 final acceptance is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

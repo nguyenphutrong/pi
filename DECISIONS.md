@@ -826,7 +826,7 @@ Commit `22d75bde0` implements the complete restored-effect boundary. Internal at
 
 - Date: 2026-08-13
 - Phase: 2
-- Status: approved by corrected independent design review; implementation pending
+- Status: implemented by `4fdb212cf` after corrected independent final review
 - References: D-024–D-029; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.7–3.8, 3.11–3.13, 4.1–4.7, 5.1, 9.1–9.3
 
 ### Options
@@ -852,3 +852,5 @@ Cancellation reconciliation remains source ordered. A planned tool call writes i
 The aborted terminal transaction runs only after every intended assistant/tool output has reconciled, or immediately for a phase with no intended output. It defensively deletes the operation's metadata, state, tool-argument, and preparation registers, writes `lane.lastResult` with `outcome:"aborted"`, the current leaf, and optional newest settled assistant, then clears only `lane.state.currentOperationId`. An aborted run may end on a prompt, tool result, or assistant and never requires a universal assistant closure. Every marker, individual settlement, and terminal boundary is independently reopenable and selects one deterministic next action from current registers.
 
 Options 1 and 2 are rejected. Option 1 cannot atomically reconcile an already-running effect or preserve the specified live-result and post-hook race. Option 2 duplicates the existing program counter, diverges from the canonical control shape, and adds a migration without improving recovery. The selected design changes no Storage contract, namespace set, `pi-ai`, provider adapter, public package contract, or forbidden history surface. Queues, deferred cancellation, parallel tools, automatic drive, events, and structural operations remain later ordered work. The corrected independent design review reports PASS with no §6 escalation.
+
+Commit `4fdb212cf` implements the complete boundary with an orthogonal durable cancellation marker, serialized start gates, assistant and tool reconciliation, and defensive terminal cleanup. Crash-cut recovery converges at every implemented boundary; Harness passes 385/385, `npm run check` and `git diff --check` pass, and the corrected independent final review reports PASS.
