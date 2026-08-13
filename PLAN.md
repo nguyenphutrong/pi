@@ -4,7 +4,7 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.5 — Durable sequential tool clearance and settlement
-- Status: D-027 approved by independent review; retained batch leases and clearance transactions are next
+- Status: D-027 committed by `79797263b` after independent review; retained batch leases and clearance transactions are next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

@@ -709,7 +709,7 @@ Commit `929407e39` implements the complete boundary. Tool-bearing `stop`, `toolU
 
 - Date: 2026-08-13
 - Phase: 2
-- Status: approved for implementation after independent review
+- Status: approved by `79797263b` after independent review
 - References: D-024–D-026; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.8, 4.1–4.7, 5.7, 9.1–9.3
 
 ### Options
