@@ -348,7 +348,13 @@ function expectInvalidStreamOptions(cases: readonly unknown[]): void {
 describe("runtime settings", () => {
 	it("provides detached canonical defaults and normalized policies", () => {
 		const defaults = new RuntimeSettingsOwner().peek();
-		expect(defaults).toEqual({ revision: 0, streamOptions: {}, retryPolicy: { maxAttempts: 1, baseDelayMs: 1000 } });
+		expect(defaults).toEqual({
+			revision: 0,
+			streamOptions: {},
+			retryPolicy: { maxAttempts: 1, baseDelayMs: 1000 },
+			steeringMode: "all",
+			followUpMode: "all",
+		});
 		expect(Number.isSafeInteger(defaults.revision)).toBe(true);
 		expect(new RuntimeSettingsOwner({}, { enabled: true, maxRetries: 2, baseDelayMs: 9 }).peek().retryPolicy).toEqual(
 			{ maxAttempts: 3, baseDelayMs: 9 },
@@ -356,6 +362,21 @@ describe("runtime settings", () => {
 		expect(
 			new RuntimeSettingsOwner({}, { enabled: false, maxRetries: 2, baseDelayMs: 9 }).peek().retryPolicy,
 		).toEqual({ maxAttempts: 1, baseDelayMs: 9 });
+	});
+
+	it("captures exact queue modes and rejects invalid values before publication", () => {
+		expect(new RuntimeSettingsOwner({}, undefined, "one-at-a-time", "one-at-a-time").peek()).toMatchObject({
+			steeringMode: "one-at-a-time",
+			followUpMode: "one-at-a-time",
+		});
+		for (const invalid of ["one", null, 1]) {
+			expect(() => new RuntimeSettingsOwner({}, undefined, invalid as never, "all")).toThrowError(
+				expect.objectContaining({ code: "invalid_query" }),
+			);
+			expect(() => new RuntimeSettingsOwner({}, undefined, "all", invalid as never)).toThrowError(
+				expect.objectContaining({ code: "invalid_query" }),
+			);
+		}
 	});
 
 	it("rejects every non-exact or numerically invalid retry policy", () => {

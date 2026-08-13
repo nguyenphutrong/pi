@@ -186,6 +186,60 @@ function operationFixture(position: Position = "need_assistant", materialized = 
 	return { operationId, source, prompt, trigger, response, usage, writes };
 }
 
+function pendingToolFixture(status: "planned" | "effect_pending") {
+	const fixture = operationFixture();
+	const assistantId = id();
+	const result = id();
+	const turnId = id();
+	const writes = fixture.writes.map((write): Write => {
+		if (write.kind === "register" && write.op === "set" && write.namespace === "lane.leaf")
+			return { ...write, value: assistantId };
+		if (write.kind === "register" && write.op === "set" && write.namespace === "op.state")
+			return {
+				...write,
+				value: json({
+					...(write.value as Record<string, JsonValue>),
+					latestAssistantEntryId: assistantId,
+					phase: {
+						kind: "tools",
+						batch: {
+							assistantEntryId: assistantId,
+							configuration: seed(),
+							turnId,
+							calls: [
+								status === "planned"
+									? { status, sourceIndex: 0, resultEntryId: result }
+									: { status, sourceIndex: 0, resultEntryId: result, replay: "safe" },
+							],
+						},
+					},
+				}),
+			};
+		return write;
+	});
+	writes.push({
+		kind: "entry",
+		entry: {
+			id: assistantId,
+			parentId: fixture.prompt,
+			type: "message",
+			payload: json({
+				...assistant("toolUse"),
+				content: [{ type: "toolCall", id: "call-a", name: "read", arguments: {} }],
+			}),
+		},
+	});
+	if (status === "effect_pending")
+		writes.push({
+			kind: "register",
+			op: "set",
+			namespace: "op.tool_args",
+			key: `${fixture.operationId}:${turnId}:0`,
+			value: {},
+		});
+	return { ...fixture, result, writes };
+}
+
 function replaceEffectPendingReservation(
 	writes: Write[],
 	replacement: { responseEntryId?: string; usageId?: string },
@@ -544,6 +598,171 @@ describe("bounded Phase 1 closure validation", () => {
 		);
 		await expect(validateMainLane(await storageWith(writes))).resolves.toBeUndefined();
 	});
+
+	it("rejects a source entry that does not precede the first caller prompt write-free and without scans", async () => {
+		const fixture = operationFixture();
+		const sourceWrite = fixture.writes.find((write) => write.kind === "entry" && write.entry.id === fixture.source)!;
+		const writes = fixture.writes
+			.filter((write) => write !== sourceWrite)
+			.map(
+				(write): Write =>
+					write.kind === "entry" && write.entry.id === fixture.prompt
+						? { ...write, entry: { ...write.entry, parentId: null } }
+						: write,
+			);
+		writes.splice(1, 0, sourceWrite);
+		const storage = instrumentStorage(await storageWith(writes));
+		const { wrapped } = forbidScansAndRecordLookups(storage);
+		await expect(attachRuntime(session(wrapped), seed())).rejects.toMatchObject({ code: "corruption" });
+		expect(storage.committedTransactions).toEqual([]);
+	});
+
+	it("accepts an unnamed materialized entry between the source and first caller prompt without scans", async () => {
+		const fixture = operationFixture();
+		const injected = id();
+		const writes = fixture.writes.flatMap((write): Write[] => {
+			if (write.kind !== "entry" || write.entry.id !== fixture.prompt) return [write];
+			return [
+				{
+					kind: "entry",
+					entry: { id: injected, parentId: fixture.source, type: "message", payload: json(user("captured")) },
+				},
+				{ ...write, entry: { ...write.entry, parentId: injected } },
+			];
+		});
+		const storage = await storageWith(writes);
+		const { wrapped, entryLookups } = forbidScansAndRecordLookups(storage);
+		await expect(attachRuntime(session(wrapped), seed())).resolves.toBeDefined();
+		expect(entryLookups).toHaveLength(1);
+		expect(entryLookups[0]).not.toContain(injected);
+	});
+
+	it.each([
+		"older unrelated trigger",
+		"stale intent prompt",
+		"latest before prompt",
+		"trigger not newer than latest",
+	] as const)("rejects bounded closure corruption: %s", async (kind) => {
+		const fixture = operationFixture();
+		const extra = id();
+		const writes = fixture.writes.map((write): Write => {
+			if (write.kind === "entry" && write.entry.id === fixture.source && kind === "latest before prompt")
+				return { ...write, entry: { ...write.entry, payload: json(assistant()) } };
+			if (write.kind === "register" && write.op === "set" && write.namespace === "lane.leaf")
+				return {
+					...write,
+					value:
+						kind === "older unrelated trigger"
+							? fixture.source
+							: kind === "stale intent prompt"
+								? fixture.prompt
+								: write.value,
+				};
+			if (
+				write.kind === "register" &&
+				write.op === "set" &&
+				write.namespace === "op.meta" &&
+				kind === "stale intent prompt"
+			)
+				return {
+					...write,
+					value: json({
+						...(write.value as Record<string, JsonValue>),
+						intent: { kind: "run", promptEntryIds: [fixture.prompt, extra] },
+					}),
+				};
+			if (write.kind === "register" && write.op === "set" && write.namespace === "op.state") {
+				const value = structuredClone(write.value) as Record<string, JsonValue>;
+				const phase = value.phase as Record<string, JsonValue>;
+				if (kind === "older unrelated trigger") phase.triggerEntryId = fixture.source;
+				if (kind === "latest before prompt") value.latestAssistantEntryId = fixture.source;
+				if (kind === "trigger not newer than latest") value.latestAssistantEntryId = extra;
+				return { ...write, value };
+			}
+			return write;
+		});
+		if (kind === "stale intent prompt")
+			writes.push({
+				kind: "entry",
+				entry: { id: extra, parentId: fixture.prompt, type: "message", payload: json(user("newest")) },
+			});
+		if (kind === "trigger not newer than latest")
+			writes.push({
+				kind: "entry",
+				entry: { id: extra, parentId: fixture.prompt, type: "message", payload: json(assistant()) },
+			});
+		await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+	});
+
+	it.each(["response", "usage"] as const)(
+		"rejects pending next-run overlap with an effect %s reservation",
+		async (kind) => {
+			const fixture = operationFixture("effect_pending");
+			const reserved = fixture[kind];
+			const writes: Write[] = fixture.writes.map((write) =>
+				write.kind === "register" && write.op === "set" && write.namespace === "lane.state"
+					? { ...write, value: { currentOperationId: fixture.operationId, pendingNextRun: [reserved] } }
+					: write,
+			);
+			writes.push({
+				kind: "register",
+				op: "set",
+				namespace: "pending.entry",
+				key: reserved,
+				value: json({ type: "message", payload: user("collision") }),
+			});
+			await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+		},
+	);
+
+	it.each(["planned", "effect_pending"] as const)(
+		"rejects pending next-run overlap with an unmaterialized %s tool-result reservation",
+		async (status) => {
+			const fixture = pendingToolFixture(status);
+			const writes = fixture.writes.map(
+				(write): Write =>
+					write.kind === "register" && write.op === "set" && write.namespace === "lane.state"
+						? { ...write, value: { currentOperationId: fixture.operationId, pendingNextRun: [fixture.result] } }
+						: write,
+			);
+			writes.push({
+				kind: "register",
+				op: "set",
+				namespace: "pending.entry",
+				key: fixture.result,
+				value: json({ type: "message", payload: user("collision") }),
+			});
+			await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+		},
+	);
+
+	it.each(["planned", "effect_pending"] as const)(
+		"rejects a generated next-run collision with an unmaterialized %s tool-result reservation write-free",
+		async (status) => {
+			const fixture = pendingToolFixture(status);
+			const storage = instrumentStorage(await storageWith(fixture.writes));
+			const runtimeSession = session(storage);
+			await attachRuntime(runtimeSession, seed());
+			runtimeSession.idGenerator.next = () => fixture.result;
+			await expect(runtimeSession.nextRun(user("collision"))).rejects.toMatchObject({ code: "storage" });
+			expect(storage.committedTransactions).toEqual([]);
+			await runtimeSession.close();
+		},
+	);
+
+	it.each(["response", "usage"] as const)(
+		"rejects generated next-run collision with an effect %s reservation",
+		async (kind) => {
+			const fixture = operationFixture("effect_pending");
+			const storage = instrumentStorage(await storageWith(fixture.writes));
+			const runtimeSession = session(storage);
+			await attachRuntime(runtimeSession, seed());
+			runtimeSession.idGenerator.next = () => fixture[kind];
+			await expect(runtimeSession.nextRun(user("collision"))).rejects.toMatchObject({ code: "storage" });
+			expect(storage.committedTransactions).toEqual([]);
+			await runtimeSession.close();
+		},
+	);
 
 	it.each(["lane leaf", "source leaf", "prompt", "current trigger", "latest assistant"])(
 		"rejects a missing required %s reference",

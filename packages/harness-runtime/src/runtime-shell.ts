@@ -31,9 +31,11 @@ import {
 	attachRuntime,
 	cancelQueued,
 	clearToolCall,
+	consumeOperationQueue,
 	finishRun,
 	nextRun,
 	prepareAssistantEffect,
+	queueOperationInput,
 	recoverAssistantEffect,
 	refreshRuntimeAttachment,
 	releaseAssistantRetry,
@@ -81,6 +83,8 @@ export type RuntimeToolContextSource<TContext extends object | undefined> =
 export interface RuntimeShellOptions<TContext extends object | undefined = object | undefined> {
 	readonly streamOptions?: StreamOptions;
 	readonly retryPolicy?: RetryPolicy;
+	readonly steeringMode?: "all" | "one-at-a-time";
+	readonly followUpMode?: "all" | "one-at-a-time";
 	readonly models?: Models;
 	readonly tools?: readonly RuntimeToolDefinition<TContext>[];
 	readonly toolContext?: RuntimeToolContextSource<TContext>;
@@ -331,6 +335,19 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "consume_queue") {
+				const result = await consumeOperationQueue(this.#session, {
+					operationId: action.info.operationId,
+					kind: action.info.queue,
+					entryIds: action.info.entryIds,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#publish(result.attachment);
+				if (!result.committed) throw new RuntimeShellError("stale", "Queue consumption is no longer authoritative");
+				return action.info;
+			}
 			if (action.info.kind === "cancel_planned_tool") {
 				const info = action.info;
 				const assistant = this.#current.entries.get(info.assistantEntryId);
@@ -1031,7 +1048,11 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		}
 	}
 
-	abort(): Promise<{ readonly operationId: string; readonly drainedSteer: []; readonly drainedFollowUp: [] }> {
+	abort(): Promise<{
+		readonly operationId: string;
+		readonly drainedSteer: readonly Message[];
+		readonly drainedFollowUp: readonly Message[];
+	}> {
 		if (this.#fault) return Promise.reject(this.#fault);
 		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
 		return requestAbort(this.#session, (attachment) => {
@@ -1043,8 +1064,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				if (result.status === "no_active") throw new RuntimeShellError("unavailable", "No active operation");
 				return Object.freeze({
 					operationId: result.operationId,
-					drainedSteer: [] as [],
-					drainedFollowUp: [] as [],
+					drainedSteer: cloneFrozen(result.drainedSteer),
+					drainedFollowUp: cloneFrozen(result.drainedFollowUp),
 				});
 			},
 			(cause: unknown) => {
@@ -1067,7 +1088,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		}
 		return this.#admit(() => {
 			const expected = this.#current;
-			return this.#settings.withSnapshot(async () => {
+			return this.#settings.withSnapshot(async (settings) => {
 				let identityAvailable = false;
 				try {
 					identityAvailable =
@@ -1088,6 +1109,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					expectedProvider: expected.laneConfiguration.value.model.provider,
 					expectedModelId: expected.laneConfiguration.value.model.modelId,
 					identityAvailable,
+					steeringMode: settings.steeringMode,
+					followUpMode: settings.followUpMode,
 				});
 				this.#publish(result.attachment);
 				if (result.status === "stale") throw new RuntimeShellError("stale", "Prompt attachment is stale");
@@ -1114,6 +1137,35 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 			});
 			this.#publish(result.attachment);
 			if (!result.entryId) throw new RuntimeShellError("fault", "Next-run admission omitted its entry id");
+			return Object.freeze({ entryId: result.entryId });
+		});
+	}
+
+	steer(input: Message): Promise<{ readonly entryId: string }> {
+		return this.#queueOperationInput("steer", input);
+	}
+
+	followUp(input: Message): Promise<{ readonly entryId: string }> {
+		return this.#queueOperationInput("followUp", input);
+	}
+
+	#queueOperationInput(kind: "steer" | "followUp", input: Message): Promise<{ readonly entryId: string }> {
+		if (this.#fault) return Promise.reject(this.#fault);
+		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
+		let message: Message;
+		try {
+			message = encodeMessage(input) as unknown as Message;
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		return this.#admit(async () => {
+			if (!this.#current.runState || this.#current.runState.value.control.status !== "running")
+				throw new RuntimeShellError("unavailable", "Operation queue requires an active running run");
+			const result = await queueOperationInput(this.#session, kind, message).catch((cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			});
+			this.#publish(result.attachment);
+			if (!result.entryId) throw new RuntimeShellError("fault", "Operation queue admission omitted its entry id");
 			return Object.freeze({ entryId: result.entryId });
 		});
 	}
@@ -1157,6 +1209,11 @@ export async function createRuntimeShell<TContext extends object | undefined = o
 	options: RuntimeShellOptions<TContext> = {},
 ): Promise<RuntimeShell<TContext>> {
 	const tools = [...captureToolDefinitions(options.tools ?? []).values()];
-	const settings = new RuntimeSettingsOwner(options.streamOptions, options.retryPolicy);
+	const settings = new RuntimeSettingsOwner(
+		options.streamOptions,
+		options.retryPolicy,
+		options.steeringMode,
+		options.followUpMode,
+	);
 	return new RuntimeShell(session, settings, await attachRuntime(session, seed), { ...options, tools });
 }

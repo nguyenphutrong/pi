@@ -24,6 +24,8 @@ async function opened() {
 function promptTransition(attachment: Awaited<ReturnType<typeof attachRuntime>>, messages = [user("caller")]) {
 	return {
 		messages,
+		steeringMode: "all" as const,
+		followUpMode: "all" as const,
 		expectedConfigurationSeq: attachment.laneConfiguration.seq,
 		expectedLaneStateSeq: attachment.laneState.seq,
 		expectedPendingNextRun: attachment.laneState.value.pendingNextRun,
@@ -249,6 +251,8 @@ describe("lane-owned next-run queue", () => {
 			await expect(
 				session.acceptPrompt({
 					messages: [user("caller")],
+					steeringMode: "all",
+					followUpMode: "all",
 					expectedConfigurationSeq: attachment.laneConfiguration.seq,
 					expectedLaneStateSeq: attachment.laneState.seq,
 					expectedPendingNextRun: [],
@@ -273,6 +277,8 @@ describe("lane-owned next-run queue", () => {
 		const second = await session.nextRun(user("second"));
 		const accepted = await session.acceptPrompt({
 			messages: [user("caller")],
+			steeringMode: "all",
+			followUpMode: "all",
 			expectedConfigurationSeq: attachment.laneConfiguration.seq,
 			expectedLaneStateSeq: attachment.laneState.seq,
 			expectedPendingNextRun: [],

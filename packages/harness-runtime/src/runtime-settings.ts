@@ -6,6 +6,14 @@ export interface RuntimeSettingsSnapshot {
 	readonly revision: number;
 	readonly streamOptions: StreamOptions;
 	readonly retryPolicy: NormalizedRetryPolicy;
+	readonly steeringMode: "all" | "one-at-a-time";
+	readonly followUpMode: "all" | "one-at-a-time";
+}
+
+function normalizeQueueMode(value: unknown, name: string): "all" | "one-at-a-time" {
+	if (value !== "all" && value !== "one-at-a-time")
+		throw new SessionError("invalid_query", `${name} must be all or one-at-a-time`);
+	return value;
 }
 
 function normalizeRetryPolicy(value: RetryPolicy | undefined): NormalizedRetryPolicy {
@@ -45,11 +53,18 @@ export class RuntimeSettingsOwner {
 	#snapshot: RuntimeSettingsSnapshot;
 	#mutationLine: Promise<void> = Promise.resolve();
 
-	constructor(streamOptions: StreamOptions = {}, retryPolicy?: RetryPolicy) {
+	constructor(
+		streamOptions: StreamOptions = {},
+		retryPolicy?: RetryPolicy,
+		steeringMode: "all" | "one-at-a-time" = "all",
+		followUpMode: "all" | "one-at-a-time" = "all",
+	) {
 		this.#snapshot = Object.freeze({
 			revision: 0,
 			streamOptions: encodeStreamOptions(streamOptions),
 			retryPolicy: normalizeRetryPolicy(retryPolicy),
+			steeringMode: normalizeQueueMode(steeringMode, "Steering mode"),
+			followUpMode: normalizeQueueMode(followUpMode, "Follow-up mode"),
 		});
 	}
 

@@ -49,6 +49,8 @@ describe("SQLite lane-owned next-run queue", () => {
 			const queued = await session.nextRun(user("queued"));
 			const accepted = await session.acceptPrompt({
 				messages: [user("caller")],
+				steeringMode: "all",
+				followUpMode: "all",
 				expectedConfigurationSeq: initial.laneConfiguration.seq,
 				expectedLaneStateSeq: initial.laneState.seq,
 				expectedPendingNextRun: [],

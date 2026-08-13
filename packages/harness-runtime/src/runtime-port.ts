@@ -6,6 +6,7 @@ import {
 	type AssistantEffectStartTransition,
 	type ClearToolCallResult,
 	type ClearToolCallTransition,
+	type ConsumeQueueTransition,
 	type EffectStartResult,
 	type FinishRunResult,
 	type FinishRunTransition,
@@ -97,6 +98,25 @@ export function cancelQueued(session: Session, entryId: string): Promise<QueueMu
 	if (!(session instanceof StoredSession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.cancelQueued(entryId);
+}
+
+export function queueOperationInput(
+	session: Session,
+	kind: Parameters<StoredSession["queueOperationInput"]>[0],
+	message: Parameters<StoredSession["queueOperationInput"]>[1],
+): Promise<QueueMutationResult> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.queueOperationInput(kind, message);
+}
+
+export function consumeOperationQueue(
+	session: Session,
+	transition: ConsumeQueueTransition,
+): Promise<RuntimeTransitionResult> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.consumeOperationQueue(transition);
 }
 
 export function prepareAssistantEffect(

@@ -1,6 +1,8 @@
+import { selectQueueDrain } from "./durable.ts";
 import type { RuntimeAttachment } from "./session.ts";
 
 export type ActionInfo =
+	| { kind: "consume_queue"; operationId: string; queue: "steer" | "followUp"; entryIds: readonly string[] }
 	| { kind: "start_assistant_step"; operationId: string; triggerEntryId: string }
 	| { kind: "prepare_assistant_effect"; operationId: string; stepId: string; nextAttempt: number }
 	| { kind: "dispatch_assistant_effect"; operationId: string; effectKey: string }
@@ -146,12 +148,32 @@ export function planAction(
 		return Object.freeze({ info: Object.freeze(info), expected });
 	}
 	if (phase.kind === "failure_drain") {
+		const drain = selectQueueDrain(state.value);
+		if (drain) {
+			info = {
+				kind: "consume_queue",
+				operationId: operation.value.operationId,
+				queue: drain.kind,
+				entryIds: drain.entryIds,
+			};
+			return Object.freeze({ info: Object.freeze(info), expected });
+		}
 		info = {
 			kind: "finish_failed_run",
 			operationId: operation.value.operationId,
 			responseEntryId: phase.provenance.entryId,
 		};
 	} else if (phase.kind === "checkpoint") {
+		const drain = selectQueueDrain(state.value);
+		if (drain) {
+			info = {
+				kind: "consume_queue",
+				operationId: operation.value.operationId,
+				queue: drain.kind,
+				entryIds: drain.entryIds,
+			};
+			return Object.freeze({ info: Object.freeze(info), expected });
+		}
 		info =
 			phase.continuation.kind === "need_assistant"
 				? {

@@ -216,11 +216,14 @@ describe("Phase 1 durable codecs", () => {
 			{ ...control, requestedAt: -1 },
 			{ ...control, requestedAt: 1.5 },
 			{ ...control, requestedAt: Number.MAX_SAFE_INTEGER + 1 },
-			{ ...control, drainedSteer: [TRIGGER_ID] },
-			{ ...control, drainedFollowUp: [TRIGGER_ID] },
+			{ ...control, drainedSteer: ["not-a-uuid"] },
+			{ ...control, drainedFollowUp: ["not-a-uuid"] },
 			{ ...control, extra: true },
 		])
 			expectCorruption(() => decodeState({ ...common(phases.ready), control: malformed }));
+		expect(
+			decodeState({ ...common(phases.ready), control: { ...control, drainedSteer: [TRIGGER_ID] } }).value.control,
+		).toEqual({ ...control, drainedSteer: [TRIGGER_ID] });
 	});
 
 	it.each([
@@ -314,6 +317,7 @@ describe("Phase 1 durable codecs", () => {
 			common({ ...phases.needAssistant, thresholdCheckedTriggerEntryId: TRIGGER_ID }),
 			common({ ...phases.needAssistant, skipInboxOnce: false }),
 			common({ ...phases.needAssistant, continuation: { kind: "need_assistant", overflowRecoveryUsed: true } }),
+			common({ ...phases.mayFinish, skipInboxOnce: true }),
 			common(
 				{ ...phases.mayFinish, continuation: { kind: "may_finish", includeFinalAssistant: false } },
 				TRIGGER_ID,
@@ -324,9 +328,11 @@ describe("Phase 1 durable codecs", () => {
 			}),
 			common({ kind: "tool", state: "ready" }),
 			{ ...common(phases.ready), control: { status: "paused" } },
-			{ ...common(phases.ready), inbox: { steer: [TRIGGER_ID], followUp: [], writes: [] } },
 		];
 		for (const candidate of invalidStates) expectCorruption(() => decodeState(candidate));
+		expect(
+			decodeState({ ...common(phases.ready), inbox: { steer: [TRIGGER_ID], followUp: [], writes: [] } }).value.inbox,
+		).toEqual({ steer: [TRIGGER_ID], followUp: [], writes: [] });
 		expect(
 			decodeLaneStateRegister(
 				register("lane.state", "main", { currentOperationId: null, pendingNextRun: [OPERATION_ID] }),

@@ -28,7 +28,7 @@ export interface OperationError {
 
 export type Control =
 	| { status: "running" }
-	| { status: "cancel_requested"; requestedAt: number; drainedSteer: []; drainedFollowUp: [] };
+	| { status: "cancel_requested"; requestedAt: number; drainedSteer: string[]; drainedFollowUp: string[] };
 
 export type LaneLastResult = {
 	operationId: string;
@@ -141,8 +141,29 @@ export interface RunState {
 		toolExecution: "sequential" | "parallel";
 	};
 	phase: CheckpointPhase | AssistantPhase | ToolsPhase | FailureDrainPhase;
-	inbox: { steer: []; followUp: []; writes: [] };
+	inbox: { steer: string[]; followUp: string[]; writes: [] };
 	latestAssistantEntryId: string | null;
+}
+
+export interface QueueDrainSelection {
+	readonly kind: "steer" | "followUp";
+	readonly entryIds: readonly string[];
+}
+
+export function selectQueueDrain(state: RunState): QueueDrainSelection | undefined {
+	if (state.control.status !== "running") return undefined;
+	let kind: QueueDrainSelection["kind"] | undefined;
+	if (state.phase.kind === "failure_drain")
+		kind = state.inbox.steer.length > 0 ? "steer" : state.inbox.followUp.length > 0 ? "followUp" : undefined;
+	else if (state.phase.kind === "checkpoint") {
+		if (state.phase.skipInboxOnce) return undefined;
+		if (state.inbox.steer.length > 0) kind = "steer";
+		else if (state.phase.continuation.kind === "may_finish" && state.inbox.followUp.length > 0) kind = "followUp";
+	}
+	if (!kind) return undefined;
+	const ids = state.inbox[kind];
+	const mode = kind === "steer" ? state.settings.steeringMode : state.settings.followUpMode;
+	return Object.freeze({ kind, entryIds: Object.freeze(mode === "all" ? [...ids] : [ids[0]]) });
 }
 
 export interface CurrentRegister<T> {
@@ -470,6 +491,7 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 		);
 		if (state.kind !== "run") fail("Only run state is supported");
 		const controlCandidate = semanticObject(state.control, "run control");
+		let drainedQueueIds: string[] = [];
 		if (controlCandidate.status === "running") object(controlCandidate, ["status"], "run control");
 		else if (controlCandidate.status === "cancel_requested") {
 			const control = object(
@@ -478,8 +500,9 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				"run control",
 			);
 			safe(control.requestedAt, "requestedAt");
-			emptyArray(control.drainedSteer, "drainedSteer");
-			emptyArray(control.drainedFollowUp, "drainedFollowUp");
+			strings(control.drainedSteer, "drainedSteer", true);
+			strings(control.drainedFollowUp, "drainedFollowUp", true);
+			drainedQueueIds = [...control.drainedSteer, ...control.drainedFollowUp];
 		} else fail("Unsupported run control");
 		const settings = object(
 			state.settings,
@@ -501,9 +524,12 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 			fail("Invalid queue mode");
 		if (!["sequential", "parallel"].includes(settings.toolExecution as string)) fail("Invalid tool execution mode");
 		const inbox = object(state.inbox, ["steer", "followUp", "writes"], "inbox");
-		emptyArray(inbox.steer, "inbox.steer");
-		emptyArray(inbox.followUp, "inbox.followUp");
+		strings(inbox.steer, "inbox.steer", true);
+		strings(inbox.followUp, "inbox.followUp", true);
 		emptyArray(inbox.writes, "inbox.writes");
+		const queueIds = [...inbox.steer, ...inbox.followUp, ...drainedQueueIds];
+		if (new Set(queueIds).size !== queueIds.length)
+			fail("Operation queue IDs must be unique across active and drained lists");
 		uuidOrNull(state.latestAssistantEntryId, "latestAssistantEntryId");
 		const phase = semanticObject(state.phase, "run phase");
 		if (phase.kind === "checkpoint") {
@@ -525,6 +551,7 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				if (state.latestAssistantEntryId === checkpoint.triggerEntryId)
 					fail("Tool checkpoint trigger must differ from its producing assistant");
 			} else if (continuation.kind === "may_finish") {
+				if (checkpoint.skipInboxOnce) fail("may_finish checkpoint must not skip its inbox");
 				const includeFinalAssistant = object(
 					continuation,
 					["kind", "includeFinalAssistant"],
