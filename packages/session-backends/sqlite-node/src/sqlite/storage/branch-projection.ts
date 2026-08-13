@@ -1,4 +1,4 @@
-import { assertEntry, type Entry } from "@nguyenphutrong/pi-session-storage";
+import { assertEntry, type Entry, type EntryStructure } from "@nguyenphutrong/pi-session-storage";
 import {
 	assertSegmentIdentity,
 	branchEntryIdentity,
@@ -60,9 +60,7 @@ export function projectSqliteEntry(context: TransactionEngineContext, entry: Ent
 	}
 
 	const parentRow = context.db
-		.prepare(
-			"SELECT id, parent_id, seq, timestamp, type, custom_type, payload FROM entries WHERE session_id = ? AND id = ?",
-		)
+		.prepare("SELECT id, parent_id, seq, timestamp, type, custom_type FROM entries WHERE session_id = ? AND id = ?")
 		.get<{
 			id: string;
 			parent_id: string | null;
@@ -70,30 +68,29 @@ export function projectSqliteEntry(context: TransactionEngineContext, entry: Ent
 			timestamp: number;
 			type: Entry["type"];
 			custom_type: string | null;
-			payload: string | null;
 		}>(context.sessionId, entry.parentId);
 	if (!parentRow) throwPersistedCorruption("Inserted entry parent disappeared during projection");
-	let payload: unknown;
 	try {
-		payload = parentRow.payload === null ? undefined : JSON.parse(parentRow.payload);
+		assertEntry({
+			id: parentRow.id,
+			parentId: parentRow.parent_id,
+			seq: parentRow.seq,
+			timestamp: parentRow.timestamp,
+			type: parentRow.type,
+			...(parentRow.custom_type === null ? {} : { customType: parentRow.custom_type }),
+			...(parentRow.type === "custom" ? {} : { payload: null }),
+		});
 	} catch {
-		throwPersistedCorruption("Parent entry payload contains malformed JSON");
+		throwPersistedCorruption("Invalid parent entry structure");
 	}
-	const parentValue = {
+	const parent: EntryStructure = {
 		id: parentRow.id,
 		parentId: parentRow.parent_id,
 		seq: parentRow.seq,
 		timestamp: parentRow.timestamp,
 		type: parentRow.type,
 		...(parentRow.custom_type === null ? {} : { customType: parentRow.custom_type }),
-		...(parentRow.payload === null ? {} : { payload }),
 	};
-	try {
-		assertEntry(parentValue);
-	} catch {
-		throwPersistedCorruption("Invalid parent entry envelope");
-	}
-	const parent: Entry = parentValue;
 	const exactTip = context.db
 		.prepare(EXACT_TIP_SQL)
 		.get<{ branch_id: unknown; tip_seq: unknown }>(context.sessionId, entry.parentId);

@@ -1,9 +1,9 @@
-import { assertEntry, type Entry, type EntryType, isUuidV7 } from "@nguyenphutrong/pi-session-storage";
+import { assertEntry, type EntryStructure, type EntryType, isUuidV7 } from "@nguyenphutrong/pi-session-storage";
+import type { SqliteDatabase } from "../types.ts";
 import { throwPersistedCorruption } from "./persisted-corruption.ts";
-import type { TransactionEngineContext } from "./transaction-engine.ts";
 
 export const MATERIALIZE_SEGMENT_SQL =
-	"SELECT b.branch_id, b.entry_id, b.entry_seq, b.entry_type, e.seq AS canonical_seq, e.parent_id, e.timestamp, e.type, e.custom_type, e.payload FROM branch_entries b INDEXED BY ix_be_seq CROSS JOIN entries e ON e.session_id = b.session_id AND e.id = b.entry_id WHERE b.session_id = ? AND b.branch_id = ? ORDER BY b.entry_seq, b.entry_id";
+	"SELECT b.branch_id, b.entry_id, b.entry_seq, b.entry_type, e.seq AS canonical_seq, e.parent_id, e.timestamp, e.type, e.custom_type FROM branch_entries b INDEXED BY ix_be_seq CROSS JOIN entries e ON e.session_id = b.session_id AND e.id = b.entry_id WHERE b.session_id = ? AND b.branch_id = ? ORDER BY b.entry_seq, b.entry_id";
 
 export const PARENT_CANDIDATES_SQL =
 	"SELECT branch_id FROM branch_entries INDEXED BY ix_be_entry WHERE session_id = ? AND entry_id = ? ORDER BY branch_id ASC";
@@ -29,11 +29,15 @@ interface BranchEntryRow {
 	timestamp: unknown;
 	type: unknown;
 	custom_type: unknown;
-	payload: unknown;
+}
+
+export interface BranchReadContext {
+	readonly db: Pick<SqliteDatabase, "prepare">;
+	readonly sessionId: string;
 }
 
 export interface OwnedBranchEntry {
-	readonly entry: Entry;
+	readonly entry: EntryStructure;
 	readonly ownerBranchId: string;
 }
 
@@ -47,10 +51,7 @@ function corruption(message: string): never {
 	return throwPersistedCorruption(message);
 }
 
-export function assertSegmentIdentity(
-	context: TransactionEngineContext,
-	branchId: unknown,
-): asserts branchId is string {
+export function assertSegmentIdentity(context: BranchReadContext, branchId: unknown): asserts branchId is string {
 	if (typeof branchId !== "string" || !branchId.startsWith("segment:") || !isUuidV7(branchId.slice(8)))
 		corruption("Invalid branch identity");
 	const creationEntryId = branchId.slice(8);
@@ -61,41 +62,39 @@ export function assertSegmentIdentity(
 		corruption("Branch segment does not contain its creation entry");
 }
 
-function decode(row: BranchEntryRow): Entry {
+function decode(row: BranchEntryRow): EntryStructure {
 	if (
 		!Number.isSafeInteger(row.canonical_seq) ||
 		(row.canonical_seq as number) < 1 ||
 		row.entry_seq !== row.canonical_seq
 	)
 		corruption("Branch membership sequence disagrees with its entry");
-	let payload: unknown;
-	if (row.payload !== null) {
-		if (typeof row.payload !== "string") corruption("Branch entry payload is not JSON text");
-		try {
-			payload = JSON.parse(row.payload);
-		} catch {
-			return corruption("Branch entry payload contains malformed JSON");
-		}
-	}
-	const entry = {
+	const candidate = {
 		id: row.entry_id,
 		parentId: row.parent_id,
 		seq: row.canonical_seq,
 		timestamp: row.timestamp,
 		type: row.type,
 		...(row.custom_type === null ? {} : { customType: row.custom_type }),
-		...(row.payload === null ? {} : { payload }),
+		...(row.type === "custom" ? {} : { payload: null }),
 	};
 	try {
-		assertEntry(entry);
+		assertEntry(candidate);
 	} catch {
-		return corruption("Invalid joined branch entry envelope");
+		return corruption("Invalid joined branch entry structure");
 	}
-	if (row.entry_type !== entry.type) corruption("Branch entry type disagrees with its entry");
-	return entry;
+	if (row.entry_type !== candidate.type) corruption("Branch entry type disagrees with its entry");
+	return {
+		id: candidate.id,
+		parentId: candidate.parentId,
+		seq: candidate.seq,
+		timestamp: candidate.timestamp,
+		type: candidate.type,
+		...(candidate.customType === undefined ? {} : { customType: candidate.customType }),
+	};
 }
 
-function meta(context: TransactionEngineContext, branchId: string): BranchMetaRow {
+function meta(context: BranchReadContext, branchId: string): BranchMetaRow {
 	const row = context.db
 		.prepare(
 			"SELECT branch_id, tip_entry_id, tip_seq, base_branch_id, base_seq FROM branch_meta WHERE session_id = ? AND branch_id = ?",
@@ -105,7 +104,7 @@ function meta(context: TransactionEngineContext, branchId: string): BranchMetaRo
 	return row;
 }
 
-function sameStructure(left: Entry, right: Entry): boolean {
+function sameStructure(left: EntryStructure, right: EntryStructure): boolean {
 	return (
 		left.id === right.id &&
 		left.parentId === right.parentId &&
@@ -116,7 +115,7 @@ function sameStructure(left: Entry, right: Entry): boolean {
 	);
 }
 
-function materialize(context: TransactionEngineContext, branchId: string, parent: Entry): MaterializedBranch {
+function materialize(context: BranchReadContext, branchId: string, parent: EntryStructure): MaterializedBranch {
 	const result: OwnedBranchEntry[] = [];
 	const seenBranches = new Set<string>();
 	const seenEntries = new Set<string>();
@@ -192,7 +191,7 @@ function materialize(context: TransactionEngineContext, branchId: string, parent
 	return { branchId, tipSeq: selectedTipSeq, entries: result };
 }
 
-export function resolveParentBranch(context: TransactionEngineContext, parent: Entry): MaterializedBranch {
+export function resolveParentBranch(context: BranchReadContext, parent: EntryStructure): MaterializedBranch {
 	const candidates = context.db
 		.prepare(PARENT_CANDIDATES_SQL)
 		.all<{ branch_id: unknown }>(context.sessionId, parent.id);
@@ -215,6 +214,6 @@ export function resolveParentBranch(context: TransactionEngineContext, parent: E
 	})[0]!;
 }
 
-export function branchEntryIdentity(entry: Entry): readonly [string, number, EntryType] {
+export function branchEntryIdentity(entry: EntryStructure): readonly [string, number, EntryType] {
 	return [entry.id, entry.seq, entry.type];
 }

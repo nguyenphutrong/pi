@@ -1,10 +1,13 @@
 import {
+	assertBranchScan,
 	assertEntryScan,
 	assertIdList,
 	assertQueryText,
+	type BranchScan,
 	type CommitResult,
 	type Entry,
 	type EntryScan,
+	type EntryStructure,
 	isUuidV7,
 	type Register,
 	type SessionStats,
@@ -13,6 +16,7 @@ import {
 	type UsageRow,
 } from "@nguyenphutrong/pi-session-storage";
 import type { SqliteDatabase } from "../types.ts";
+import { readBranch, readBranchStructure } from "./branch-reader.ts";
 import type { SqliteFileQueue } from "./file-queue.ts";
 import type { TimerFactory, TimerHandle } from "./lifecycle.ts";
 import {
@@ -123,6 +127,14 @@ export class SqliteStorageHandle {
 		}
 	}
 
+	scanBranch(query: BranchScan): Promise<Entry[]> {
+		return this.#branchRead(query, readBranch);
+	}
+
+	scanBranchStructure(query: BranchScan): Promise<EntryStructure[]> {
+		return this.#branchRead(query, readBranchStructure);
+	}
+
 	scanEntries(query: EntryScan = {}): Promise<Entry[]> {
 		try {
 			this.#assertOpen();
@@ -201,6 +213,29 @@ export class SqliteStorageHandle {
 			const admitted = [...ids];
 			if (admitted.length === 0) return this.#admitRead(() => new Map());
 			return this.#admitRead(() => read(this.#options.db, this.#options.lease.sessionId, admitted));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	#branchRead<T>(
+		query: BranchScan,
+		read: (db: SqliteDatabase, sessionId: string, query: BranchScan) => T[],
+	): Promise<T[]> {
+		try {
+			this.#assertOpen();
+			assertBranchScan(query);
+			if (!isUuidV7(query.start)) throw new StorageError("invalid_query", `Invalid branch start: ${query.start}`);
+			if (query.stopAtId !== undefined && !isUuidV7(query.stopAtId))
+				throw new StorageError("invalid_query", `Invalid branch stop id: ${query.stopAtId}`);
+			if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0))
+				throw new StorageError("invalid_query", "limit must be a positive safe integer");
+			if (query.cursor !== undefined && (!Number.isSafeInteger(query.cursor.seq) || query.cursor.seq < 0))
+				throw new StorageError("invalid_query", "cursor sequence must be non-negative");
+			if (query.customType !== undefined && query.type !== "custom")
+				throw new StorageError("invalid_query", "customType requires custom entry type");
+			const admitted = structuredClone(query);
+			return this.#admitRead(() => structuredClone(read(this.#options.db, this.#options.lease.sessionId, admitted)));
 		} catch (error) {
 			return Promise.reject(error);
 		}
