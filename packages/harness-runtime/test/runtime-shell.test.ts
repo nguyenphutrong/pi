@@ -2702,7 +2702,7 @@ describe("Phase 1 runtime shell", () => {
 					throw new Error("branch structure scan forbidden");
 				};
 				const reopened = await createRuntimeShell(session(storage), config());
-				expect(await reopened.peekAction()).toBeUndefined();
+				expect(await reopened.peekAction()).toMatchObject({ kind: "recover_tool_effect", sourceIndex: 0 });
 				expect(storage.committedTransactions).toEqual([]);
 				await reopened.close();
 			},
@@ -3250,7 +3250,7 @@ describe("Phase 1 runtime shell", () => {
 			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
 			await parkedStorage.close();
 			const reopened = await createRuntimeShell(session(prepared.state.createStorage()), config());
-			expect(await reopened.peekAction()).toBeUndefined();
+			expect(await reopened.peekAction()).toMatchObject({ kind: "recover_tool_effect", sourceIndex: 0 });
 			await reopened.close();
 		});
 
@@ -4034,9 +4034,329 @@ describe("Phase 1 runtime shell", () => {
 			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
 			await parkedStorage.close();
 			const reopened = await createRuntimeShell(session(prepared.state.createStorage()), config());
-			expect(await reopened.peekAction()).toBeUndefined();
+			expect(await reopened.peekAction()).toMatchObject({ kind: "recover_tool_effect", sourceIndex: 0 });
 			await reopened.close();
 		});
+	});
+
+	describe("D-029 restored tool-effect recovery", () => {
+		async function pendingTool(replay: "never" | "safe", calls = [{ id: "call-a" }]) {
+			const prepareArguments = vi.fn(() => ({ value: "prepared" }));
+			const beforeToolCall = vi.fn(() => ({ args: { value: "persisted-effective" } }));
+			const prepared = await settledToolBatch(
+				toolMessage(calls),
+				{
+					tools: [runtimeTool({ replay, prepareArguments })],
+					toolContext: { batch: "initial" },
+					beforeToolCall,
+				},
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.close();
+			prepareArguments.mockClear();
+			beforeToolCall.mockClear();
+			return { ...prepared, prepareArguments, beforeToolCall };
+		}
+
+		it("replays safe+safe with exactly one authority and one settlement hydration read", async () => {
+			const pending = await pendingTool("safe");
+			const order: string[] = [];
+			const execute = vi.fn(async (_callId, args) => {
+				order.push("execute");
+				expect(args).toEqual({ value: "persisted-effective" });
+				return { content: [{ type: "text" as const, text: "replayed" }], details: { replayed: true } };
+			});
+			const afterToolCall = vi.fn(() => {
+				order.push("after");
+				return undefined;
+			});
+			const context = vi.fn(() => ({ batch: "restored" }));
+			const storage = instrumentStorage(pending.state.createStorage());
+			const reads: string[] = [];
+			const getRegister = storage.getRegister.bind(storage);
+			storage.getRegister = async (namespace, key) => {
+				reads.push(`${namespace}/${key}`);
+				return getRegister(namespace, key);
+			};
+			const shell = await createRuntimeShell(session(storage), config(), {
+				tools: [runtimeTool({ replay: "safe", prepareArguments: pending.prepareArguments, execute })],
+				toolContext: context,
+				beforeToolCall: pending.beforeToolCall,
+				afterToolCall,
+			});
+			const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
+				.value as unknown as RunState;
+			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+			const { assistantEntryId, turnId, calls } = durable.phase.batch;
+			const argsRead = `op.tool_args/${pending.fixture.operationId}:${turnId}:0`;
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(1);
+			reads.length = 0;
+			expect(await shell.peekAction()).toEqual({
+				kind: "recover_tool_effect",
+				operationId: pending.fixture.operationId,
+				assistantEntryId,
+				turnId,
+				sourceIndex: 0,
+				resultEntryId: calls[0].resultEntryId,
+			});
+			await shell.executeAction();
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(1);
+			for (const kind of ["dispatch_tool_effect", "await_tool_effect", "finalize_tool_effect"] as const) {
+				expect(await shell.peekAction()).toMatchObject({ kind });
+				await shell.executeAction();
+			}
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(1);
+			expect(await shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+			await shell.executeAction();
+			expect(pending.prepareArguments).not.toHaveBeenCalled();
+			expect(pending.beforeToolCall).not.toHaveBeenCalled();
+			expect(context).toHaveBeenCalledTimes(1);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(afterToolCall).toHaveBeenCalledTimes(1);
+			expect(order).toEqual(["execute", "after"]);
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(2);
+			const result = (await storage.getEntries([calls[0].resultEntryId])).get(calls[0].resultEntryId);
+			expect(result).toMatchObject({
+				id: calls[0].resultEntryId,
+				parentId: assistantEntryId,
+				payload: { toolCallId: "call-a", toolName: "echo", isError: false, details: { replayed: true } },
+			});
+			expect(
+				await storage.getRegister("op.tool_args", `${pending.fixture.operationId}:${turnId}:0`),
+			).toBeUndefined();
+			await shell.close();
+		});
+
+		it("treats an omitted current replay property as interrupted without context, effect, or usage", async () => {
+			const pending = await pendingTool("safe");
+			const execute = vi.fn();
+			const context = vi.fn(() => ({ batch: "must-not-resolve" }));
+			const definition = runtimeTool({ execute });
+			delete (definition as { replay?: "never" | "safe" }).replay;
+			const storage = pending.state.createStorage();
+			const shell = await createRuntimeShell(session(storage), config(), {
+				tools: [definition],
+				toolContext: context,
+			});
+			const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
+				.value as unknown as RunState;
+			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+			const call = durable.phase.batch.calls[0];
+			await expect(shell.executeAction()).resolves.toMatchObject({ kind: "recover_tool_effect" });
+			expect(context).not.toHaveBeenCalled();
+			expect(execute).not.toHaveBeenCalled();
+			expect(await storage.getUsageRows([call.resultEntryId])).toEqual(new Map());
+			expect((await storage.getEntries([call.resultEntryId])).get(call.resultEntryId)?.payload).toMatchObject({
+				isError: true,
+				content: [{ type: "text", text: "Tool outcome unknown after interruption" }],
+			});
+			await shell.close();
+		});
+
+		it("hydrates detached tool argument objects across fresh attachments", async () => {
+			const pending = await pendingTool("safe");
+			const runtimeSession = session(pending.state.createStorage());
+			const first = await runtimeSession.refreshRuntimeAttachment();
+			const state = first.runState!.value;
+			if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+			const key = `${pending.fixture.operationId}:${state.phase.batch.turnId}:0`;
+			const firstArgs = first.toolArguments.get(key) as { value: string };
+			expect(() => {
+				firstArgs.value = "mutated attachment";
+			}).toThrow(TypeError);
+			const second = await runtimeSession.refreshRuntimeAttachment();
+			expect(second.toolArguments.get(key)).toEqual({ value: "persisted-effective" });
+			expect((await pending.state.createStorage().getRegister("op.tool_args", key))?.value).toEqual({
+				value: "persisted-effective",
+			});
+			await runtimeSession.close();
+		});
+
+		it("recovers call zero after a fresh reopen then ordinarily settles call one", async () => {
+			const pending = await pendingTool("safe", [{ id: "call-a" }, { id: "call-b" }]);
+			const sourceOrder: string[] = [];
+			const execute = vi.fn(async (callId: string) => {
+				sourceOrder.push(callId);
+				return { content: [{ type: "text" as const, text: callId }], details: { callId } };
+			});
+			const runtimeSession = session(pending.state.createStorage());
+			const shell = await createRuntimeShell(runtimeSession, config(), {
+				tools: [runtimeTool({ replay: "safe", execute })],
+				toolContext: { batch: "reopened" },
+			});
+			const initial = await runtimeSession.refreshRuntimeAttachment();
+			if (initial.runState?.value.phase.kind !== "tools") throw new Error("tool batch missing");
+			const { assistantEntryId, turnId, calls } = initial.runState.value.phase.batch;
+			const keys = calls.map((_, index) => `${pending.fixture.operationId}:${turnId}:${index}`);
+			expect(calls.map(({ status }) => status)).toEqual(["effect_pending", "planned"]);
+			await shell.executeAction();
+			for (let stage = 0; stage < 4; stage++) await shell.executeAction();
+			const afterFirst = await runtimeSession.refreshRuntimeAttachment();
+			expect(sourceOrder).toEqual(["call-a"]);
+			const firstResult = (await pending.state.createStorage().getEntries([calls[0].resultEntryId])).get(
+				calls[0].resultEntryId,
+			);
+			expect(firstResult).toMatchObject({
+				id: calls[0].resultEntryId,
+				parentId: assistantEntryId,
+				payload: { toolCallId: "call-a", toolName: "echo" },
+			});
+			expect(afterFirst.toolArguments.has(keys[0])).toBe(false);
+			expect(await pending.state.createStorage().getRegister("op.tool_args", keys[0])).toBeDefined();
+
+			expect(await shell.peekAction()).toMatchObject({ kind: "prepare_tool_call", sourceIndex: 1 });
+			await shell.executeAction();
+			for (let stage = 0; stage < 4; stage++) await shell.executeAction();
+			expect(sourceOrder).toEqual(["call-a", "call-b"]);
+			const entries = await pending.state
+				.createStorage()
+				.getEntries(calls.map(({ resultEntryId }) => resultEntryId));
+			expect(entries.get(calls[0].resultEntryId)).toMatchObject({
+				id: calls[0].resultEntryId,
+				parentId: assistantEntryId,
+				payload: { toolCallId: "call-a", toolName: "echo" },
+			});
+			expect(entries.get(calls[1].resultEntryId)).toMatchObject({
+				id: calls[1].resultEntryId,
+				parentId: calls[0].resultEntryId,
+				payload: { toolCallId: "call-b", toolName: "echo" },
+			});
+			expect(await pending.state.createStorage().getRegister("op.tool_args", keys[0])).toBeUndefined();
+			expect(await pending.state.createStorage().getRegister("op.tool_args", keys[1])).toBeUndefined();
+			const final = (await pending.state.createStorage().getRegister("op.state", pending.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(final.phase).toEqual({
+				kind: "checkpoint",
+				continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+				triggerEntryId: calls[1].resultEntryId,
+			});
+			await shell.close();
+			const reopened = await createRuntimeShell(session(pending.state.createStorage()), config());
+			expect(await reopened.peekAction()).toMatchObject({ kind: "start_assistant_step" });
+			await reopened.close();
+		});
+
+		it.each([
+			["never", "safe", true],
+			["safe", "never", true],
+			["safe", "missing", false],
+		] as const)(
+			"synthesizes exact interruption for persisted %s/current %s without identity side effects",
+			async (persisted, current, hasDefinition) => {
+				const pending = await pendingTool(persisted);
+				const execute = vi.fn();
+				const context = vi.fn(() => ({ batch: "must-not-resolve" }));
+				const storage = instrumentStorage(pending.state.createStorage());
+				const runtimeSession = session(storage);
+				const next = vi.spyOn(runtimeSession.idGenerator, "next");
+				const shell = await createRuntimeShell(runtimeSession, config(), {
+					...(hasDefinition ? { tools: [runtimeTool({ replay: current as "never" | "safe", execute })] } : {}),
+					toolContext: context,
+				});
+				const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
+					.value as unknown as RunState;
+				if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+				const { assistantEntryId, calls } = durable.phase.batch;
+				await expect(shell.executeAction()).resolves.toMatchObject({ kind: "recover_tool_effect" });
+				expect(context).not.toHaveBeenCalled();
+				expect(execute).not.toHaveBeenCalled();
+				expect(next).not.toHaveBeenCalled();
+				const result = (await storage.getEntries([calls[0].resultEntryId])).get(calls[0].resultEntryId);
+				expect(result).toEqual(
+					expect.objectContaining({
+						id: calls[0].resultEntryId,
+						parentId: assistantEntryId,
+						payload: {
+							role: "toolResult",
+							toolCallId: "call-a",
+							toolName: "echo",
+							content: [{ type: "text", text: "Tool outcome unknown after interruption" }],
+							details: {},
+							isError: true,
+							timestamp: expect.any(Number),
+						},
+					}),
+				);
+				expect(await storage.getUsageRows([calls[0].resultEntryId])).toEqual(new Map());
+				const state = (await storage.getRegister("op.state", pending.fixture.operationId))!
+					.value as unknown as RunState;
+				expect(state.phase).toEqual({
+					kind: "checkpoint",
+					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+					triggerEntryId: calls[0].resultEntryId,
+				});
+				await shell.close();
+			},
+		);
+
+		it.each(["throw", "reject"] as const)("faults write-free when safe replay toolContext %s", async (kind) => {
+			const pending = await pendingTool("safe");
+			const cause = new Error(`recovery context ${kind}`);
+			const storage = instrumentStorage(pending.state.createStorage());
+			const shell = await createRuntimeShell(session(storage), config(), {
+				tools: [runtimeTool({ replay: "safe" })],
+				toolContext:
+					kind === "throw"
+						? () => {
+								throw cause;
+							}
+						: () => Promise.reject(cause),
+			});
+			const before = storage.committedTransactions.length;
+			const fault = await shell.executeAction().catch((error: unknown) => error);
+			expect(fault).toMatchObject({ code: "fault", cause });
+			expect(storage.committedTransactions).toHaveLength(before);
+			await expect(shell.peekAction()).rejects.toBe(fault);
+			await shell.close();
+		});
+
+		it("faults write-free when a pending source was absent from captured active names", async () => {
+			const pending = await pendingTool("safe");
+			const mutationStorage = pending.state.createStorage();
+			const current = (await mutationStorage.getRegister("op.state", pending.fixture.operationId))!;
+			const corrupted = structuredClone(current.value) as unknown as RunState;
+			if (corrupted.phase.kind !== "tools") throw new Error("tool batch missing");
+			corrupted.phase.batch.configuration.activeToolNames = [];
+			await mutationStorage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: pending.fixture.operationId,
+						value: json(corrupted),
+					},
+				],
+			});
+			await mutationStorage.close();
+			const storage = instrumentStorage(pending.state.createStorage());
+			const shell = await createRuntimeShell(session(storage), config(), {
+				tools: [runtimeTool({ replay: "safe" })],
+			});
+			const before = storage.committedTransactions.length;
+			await expect(shell.executeAction()).rejects.toMatchObject({ code: "fault" });
+			expect(storage.committedTransactions).toHaveLength(before);
+			await shell.close();
+		});
+
+		it.each([0, 1, 2, 3] as const)(
+			"fresh reopen recovers every unsettled safe replay local boundary %s",
+			async (stages) => {
+				const pending = await pendingTool("safe");
+				const options = { tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "restored" } };
+				const first = await createRuntimeShell(session(pending.state.createStorage()), config(), options);
+				await first.executeAction();
+				for (let index = 0; index < stages; index++) await first.executeAction();
+				await first.close();
+				const reopened = await createRuntimeShell(session(pending.state.createStorage()), config(), options);
+				expect(await reopened.peekAction()).toMatchObject({ kind: "recover_tool_effect", sourceIndex: 0 });
+				await reopened.executeAction();
+				for (let index = 0; index < 4; index++) await reopened.executeAction();
+				expect(await reopened.peekAction()).toMatchObject({ kind: "start_assistant_step" });
+				await reopened.close();
+			},
+		);
 	});
 
 	it.each(["duplicate", "directly known", "occupied entry", "occupied usage"] as const)(

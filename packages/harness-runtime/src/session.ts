@@ -127,6 +127,7 @@ function decodeIdleMainStateRegister(candidate: unknown): void {
 interface CurrentStateHydration {
 	readonly entries: ReadonlyMap<string, MessageEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
+	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
 
 async function hydrateCurrentState(
@@ -206,6 +207,7 @@ async function hydrateCurrentState(
 			throw new SessionError("corruption", "Current-state usage lookup returned the wrong identity");
 		usageRows.set(id, Object.freeze(structuredClone(candidate)));
 	}
+	const toolArguments = new Map<string, Readonly<Record<string, JsonValue>>>();
 
 	const requireEntry = (id: string, name: string): MessageEntry => {
 		const entry = entries.get(id);
@@ -317,6 +319,7 @@ async function hydrateCurrentState(
 						Array.isArray(args.value)
 					)
 						throw new SessionError("corruption", "Pending tool arguments register has invalid identity or value");
+					toolArguments.set(args.key, Object.freeze(structuredClone(args.value)));
 				} else if (call.status === "completed") {
 					if (
 						unfinishedSeen ||
@@ -368,7 +371,7 @@ async function hydrateCurrentState(
 		if (usage && (usage.id !== usageId || usage.adjustment || usage.entryId !== responseEntryId))
 			throw new SessionError("corruption", "Materialized usage reservation does not match its response");
 	}
-	return Object.freeze({ entries, usageRows });
+	return Object.freeze({ entries, usageRows, toolArguments });
 }
 
 export async function validateMainLane(storage: Storage): Promise<void> {
@@ -413,6 +416,7 @@ export interface RuntimeAttachment {
 	readonly runState?: CurrentRegister<RunState>;
 	readonly entries: ReadonlyMap<string, MessageEntry>;
 	readonly usageRows: ReadonlyMap<string, UsageRow>;
+	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
 
 export interface StartAssistantStepTransition {
@@ -790,6 +794,44 @@ export class MemorySession implements Session {
 					throw new SessionError("corruption", "Open operation registers are missing");
 				runOperation = decodeRunOperationRegister(metadata, operationId);
 				runState = decodeRunStateRegister(currentState, operationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	refreshRuntimeAttachment(): Promise<RuntimeAttachment> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const laneConfiguration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (laneState.value.currentOperationId !== null) {
+				const operationId = laneState.value.currentOperationId;
+				const [metadataCandidate, stateCandidate] = await Promise.all([
+					this.#storage.getRegister("op.meta", operationId),
+					this.#storage.getRegister("op.state", operationId),
+				]);
+				if (!metadataCandidate || !stateCandidate)
+					throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(metadataCandidate, operationId);
+				runState = decodeRunStateRegister(stateCandidate, operationId);
 			}
 			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
 			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
@@ -1590,19 +1632,8 @@ export class MemorySession implements Session {
 			if (!source || !isDeepStrictEqual(source, transition.toolCall))
 				throw new SessionError("corruption", "Tool settlement source identity does not match the assistant entry");
 			const argsKey = `${transition.operationId}:${transition.turnId}:${transition.sourceIndex}`;
-			const argsRegister = await this.#storage.getRegister("op.tool_args", argsKey);
-			if (!argsRegister) throw new SessionError("corruption", "Tool settlement arguments register is missing");
-			try {
-				assertRegister(argsRegister);
-				assertJsonValue(argsRegister.value);
-			} catch (error) {
-				throw new SessionError("corruption", "Tool settlement arguments register is malformed", error);
-			}
-			if (
-				argsRegister.namespace !== "op.tool_args" ||
-				argsRegister.key !== argsKey ||
-				!isDeepStrictEqual(argsRegister.value, transition.args)
-			)
+			const retainedArgs = hydrated.toolArguments.get(argsKey);
+			if (!retainedArgs || !isDeepStrictEqual(retainedArgs, transition.args))
 				throw new SessionError("corruption", "Tool settlement arguments do not match the retained preparation");
 			const priorParent =
 				transition.sourceIndex === 0
@@ -1760,6 +1791,9 @@ export class MemorySession implements Session {
 				}),
 			);
 			const usageRows = new Map(hydrated.usageRows);
+			const toolArguments = new Map(hydrated.toolArguments);
+			toolArguments.delete(argsKey);
+			if (final) for (const register of cleanup) toolArguments.delete(register.key);
 			if (usageId !== undefined && transition.usage !== undefined)
 				usageRows.set(
 					usageId,
@@ -1779,6 +1813,7 @@ export class MemorySession implements Session {
 					runState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextState) }),
 					entries,
 					usageRows,
+					toolArguments,
 				}),
 			});
 		});
@@ -1900,11 +1935,14 @@ export class MemorySession implements Session {
 						},
 					],
 				});
+				const toolArguments = new Map(hydrated.toolArguments);
+				toolArguments.set(argsKey, Object.freeze(structuredClone(transition.outcome.args)));
 				return Object.freeze({
 					status: "committed" as const,
 					attachment: Object.freeze({
 						...attachment,
 						runState: Object.freeze({ seq: committed.seqs[1], value: structuredClone(nextState) }),
+						toolArguments,
 					}),
 				});
 			}
@@ -2008,6 +2046,8 @@ export class MemorySession implements Session {
 			];
 			const committed = await this.#storage.commit({ writes });
 			const entries = new Map(hydrated.entries);
+			const toolArguments = new Map(hydrated.toolArguments);
+			if (final) for (const register of cleanup) toolArguments.delete(register.key);
 			entries.set(
 				transition.resultEntryId,
 				Object.freeze({
@@ -2026,6 +2066,7 @@ export class MemorySession implements Session {
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.resultEntryId }),
 					runState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextState) }),
 					entries,
+					toolArguments,
 				}),
 			});
 		});
@@ -2217,6 +2258,7 @@ export class MemorySession implements Session {
 					mainLeaf,
 					entries: hydrated.entries,
 					usageRows: hydrated.usageRows,
+					toolArguments: new Map(),
 				}),
 			});
 		});
@@ -2382,6 +2424,7 @@ export class MemorySession implements Session {
 					runState: Object.freeze({ seq: committed.seqs[offset + 2], value: structuredClone(runState) }),
 					entries,
 					usageRows: hydrated.usageRows,
+					toolArguments: hydrated.toolArguments,
 				}),
 			});
 		});

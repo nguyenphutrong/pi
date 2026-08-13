@@ -111,6 +111,7 @@ function attachment(
 		usageRows: new Map(
 			materialized ? [[usageId, { marker: true }]] : [],
 		) as unknown as RuntimeAttachment["usageRows"],
+		toolArguments: new Map(),
 	};
 	return { value, operationId, triggerEntryId, stepId, responseEntryId, usageId };
 }
@@ -214,20 +215,28 @@ describe("pure Phase 1 action planner", () => {
 		).toEqual({ kind, operationId: fixture.operationId, effectKey: key });
 	});
 
-	it("parks a restored pending tool without an exact process-local effect", () => {
+	it("recovers a restored pending tool with every stable identity field", () => {
 		const fixture = attachment("need");
+		const assistantEntryId = id();
+		const turnId = id();
+		const resultEntryId = id();
 		fixture.value.runState!.value.phase = {
 			kind: "tools",
 			batch: {
-				assistantEntryId: id(),
-				turnId: id(),
+				assistantEntryId,
+				turnId,
 				configuration: fixture.value.laneConfiguration.value,
-				calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId: id(), replay: "never" }],
+				calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId, replay: "never" }],
 			},
 		};
-		expect(
-			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined }),
-		).toBeUndefined();
+		expect(planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info).toEqual({
+			kind: "recover_tool_effect",
+			operationId: fixture.operationId,
+			assistantEntryId,
+			turnId,
+			sourceIndex: 0,
+			resultEntryId,
+		});
 	});
 
 	it("keeps retry waits stable without exact elapsed proof and releases only on an exact proof", () => {

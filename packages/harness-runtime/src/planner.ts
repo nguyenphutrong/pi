@@ -21,6 +21,14 @@ export type ActionInfo =
 	| { kind: "await_tool_effect"; operationId: string; effectKey: string }
 	| { kind: "finalize_tool_effect"; operationId: string; effectKey: string }
 	| { kind: "settle_tool_effect"; operationId: string; effectKey: string }
+	| {
+			kind: "recover_tool_effect";
+			operationId: string;
+			assistantEntryId: string;
+			turnId: string;
+			sourceIndex: number;
+			resultEntryId: string;
+	  }
 	| { kind: "finish_run"; operationId: string; triggerEntryId: string }
 	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string };
 
@@ -99,7 +107,15 @@ export function planAction(
 				info = { kind: "finalize_tool_effect", operationId: operation.value.operationId, effectKey: key };
 			else if (status === "finalized")
 				info = { kind: "settle_tool_effect", operationId: operation.value.operationId, effectKey: key };
-			else return undefined;
+			else
+				info = {
+					kind: "recover_tool_effect",
+					operationId: operation.value.operationId,
+					assistantEntryId: phase.batch.assistantEntryId,
+					turnId: phase.batch.turnId,
+					sourceIndex: call.sourceIndex,
+					resultEntryId: call.resultEntryId,
+				};
 		}
 	} else if (phase.generation.status === "ready") {
 		info = {

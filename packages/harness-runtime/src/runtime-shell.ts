@@ -33,6 +33,7 @@ import {
 	finishRun,
 	prepareAssistantEffect,
 	recoverAssistantEffect,
+	refreshRuntimeAttachment,
 	releaseAssistantRetry,
 	settleAssistantEffect,
 	settleToolCall,
@@ -406,6 +407,122 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 						},
 					});
 				}
+				return info;
+			}
+			if (action.info.kind === "recover_tool_effect") {
+				const info = action.info;
+				const phase = this.#current.runState?.value.phase;
+				const call = phase?.kind === "tools" ? phase.batch.calls[info.sourceIndex] : undefined;
+				if (
+					this.#current.runOperation?.value.operationId !== info.operationId ||
+					phase?.kind !== "tools" ||
+					phase.batch.assistantEntryId !== info.assistantEntryId ||
+					phase.batch.turnId !== info.turnId ||
+					call?.status !== "effect_pending" ||
+					call.resultEntryId !== info.resultEntryId
+				)
+					throw new RuntimeShellError("stale", "Tool effect is no longer recoverable");
+				const assistant = this.#current.entries.get(info.assistantEntryId);
+				const source =
+					assistant?.message.role === "assistant"
+						? assistant.message.content.filter((content) => content.type === "toolCall")[info.sourceIndex]
+						: undefined;
+				const argsKey = `${info.operationId}:${info.turnId}:${info.sourceIndex}`;
+				const args = this.#current.toolArguments.get(argsKey);
+				if (!source || !args)
+					throw this.#faultShell(undefined, undefined, "Recovered tool source or arguments are missing");
+				if (!phase.batch.configuration.activeToolNames.includes(source.name))
+					throw this.#faultShell(
+						undefined,
+						undefined,
+						"Recovered tool source was not active in its captured batch",
+					);
+				const definition = call.replay === "safe" ? this.#toolDefinitions.get(source.name) : undefined;
+				const currentReplay = definition?.replay ?? "never";
+				if (call.replay === "safe" && definition && currentReplay === "safe") {
+					let context: TContext;
+					try {
+						context =
+							typeof this.#toolContext === "function"
+								? await this.#toolContext()
+								: (this.#toolContext as TContext);
+					} catch (cause) {
+						throw this.#faultShell(undefined, cause, "Tool context callback violated its runtime contract");
+					}
+					const refreshed = await refreshRuntimeAttachment(this.#session).catch((cause: unknown) => {
+						throw this.#transitionFailure(cause);
+					});
+					this.#current = refreshed;
+					if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
+					const currentPhase = refreshed.runState?.value.phase;
+					const currentCall =
+						currentPhase?.kind === "tools" ? currentPhase.batch.calls[info.sourceIndex] : undefined;
+					const firstUnfinished =
+						currentPhase?.kind === "tools"
+							? currentPhase.batch.calls.findIndex((candidate) => candidate.status !== "completed")
+							: undefined;
+					if (
+						refreshed.runOperation?.value.operationId !== info.operationId ||
+						currentPhase?.kind !== "tools" ||
+						currentPhase.batch.assistantEntryId !== info.assistantEntryId ||
+						currentPhase.batch.turnId !== info.turnId ||
+						firstUnfinished !== info.sourceIndex ||
+						currentCall?.status !== "effect_pending" ||
+						currentCall.sourceIndex !== info.sourceIndex ||
+						currentCall.resultEntryId !== info.resultEntryId ||
+						currentCall.replay !== "safe"
+					)
+						throw new RuntimeShellError("stale", "Tool effect is no longer recoverable");
+					const currentAssistant = refreshed.entries.get(info.assistantEntryId);
+					const currentSource =
+						currentAssistant?.message.role === "assistant"
+							? currentAssistant.message.content.filter((content) => content.type === "toolCall")[
+									info.sourceIndex
+								]
+							: undefined;
+					const currentArgs = refreshed.toolArguments.get(argsKey);
+					if (!currentSource || !currentArgs)
+						throw this.#faultShell(undefined, undefined, "Recovered tool source or arguments are missing");
+					if (!currentPhase.batch.configuration.activeToolNames.includes(currentSource.name))
+						throw this.#faultShell(
+							undefined,
+							undefined,
+							"Recovered tool source was not active in its captured batch",
+						);
+					const currentDefinition = this.#toolDefinitions.get(currentSource.name);
+					if (!currentDefinition || (currentDefinition.replay ?? "never") !== "safe")
+						throw new RuntimeShellError("stale", "Tool effect is no longer safely replayable");
+					const prepared: PreparedToolCall = Object.freeze({
+						kind: "prepared",
+						toolCall: structuredClone(currentSource),
+						tool: bindRuntimeTool(currentDefinition, context),
+						args: structuredClone(currentArgs),
+						replay: "safe",
+					});
+					const key = toolEffectKey(info.operationId, info.turnId, info.sourceIndex);
+					this.#preparedTools.set(`${info.assistantEntryId}:${info.sourceIndex}`, prepared);
+					this.#toolEffects.set(key, { status: "planned", plan: { key, ...info, prepared } });
+					return info;
+				}
+				const result = await settleToolCall(this.#session, {
+					operationId: info.operationId,
+					assistantEntryId: info.assistantEntryId,
+					turnId: info.turnId,
+					sourceIndex: info.sourceIndex,
+					resultEntryId: info.resultEntryId,
+					replay: call.replay,
+					toolCall: structuredClone(source),
+					args: structuredClone(args),
+					content: [{ type: "text", text: "Tool outcome unknown after interruption" }],
+					details: {},
+					isError: true,
+					terminate: false,
+				}).catch((cause: unknown) => {
+					throw this.#toolFailure(toolEffectKey(info.operationId, info.turnId, info.sourceIndex), cause);
+				});
+				this.#current = result.attachment;
+				if (result.status === "obsolete")
+					throw new RuntimeShellError("stale", "Tool effect is no longer authoritative");
 				return info;
 			}
 			if (action.info.kind === "dispatch_tool_effect") {

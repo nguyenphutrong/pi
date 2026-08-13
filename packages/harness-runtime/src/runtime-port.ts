@@ -29,6 +29,12 @@ export function attachRuntime(session: Session, seed: LaneConfiguration): Promis
 	return session.attachRuntime(seed);
 }
 
+export function refreshRuntimeAttachment(session: Session): Promise<RuntimeAttachment> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support an internal runtime attachment"));
+	return session.refreshRuntimeAttachment();
+}
+
 export function startAssistantStep(
 	session: Session,
 	transition: StartAssistantStepTransition,
