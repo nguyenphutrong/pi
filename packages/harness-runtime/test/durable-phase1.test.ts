@@ -208,6 +208,40 @@ describe("Phase 1 durable codecs", () => {
 		expect(() => decodeRunStateRegister(register("op.state", id(), value), OPERATION_ID)).toThrow();
 	});
 
+	it("round-trips nonempty writes and rejects malformed or duplicate queue ownership", () => {
+		const writeA = id();
+		const writeB = id();
+		const value = { ...common(phases.ready), inbox: { steer: [], followUp: [], writes: [writeA, writeB] } };
+		expect(decodeState(value)).toEqual({ seq: 17, value });
+		for (const inbox of [
+			{ steer: [], followUp: [], writes: ["not-a-uuid"] },
+			{ steer: [], followUp: [], writes: [writeA, writeA] },
+			{ steer: [writeA], followUp: [], writes: [writeA] },
+			{ steer: [], followUp: [writeA], writes: [writeA] },
+		])
+			expectCorruption(() => decodeState({ ...common(phases.ready), inbox }));
+		const control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [writeA],
+			drainedFollowUp: [],
+		} as const;
+		expectCorruption(() =>
+			decodeState({
+				...common(phases.ready),
+				control,
+				inbox: { steer: [], followUp: [], writes: [writeA] },
+			}),
+		);
+		expectCorruption(() =>
+			decodeState({
+				...common(phases.ready),
+				control: { ...control, drainedSteer: [], drainedFollowUp: [writeA] },
+				inbox: { steer: [], followUp: [], writes: [writeA] },
+			}),
+		);
+	});
+
 	it("round-trips exact cancel_requested control and rejects malformed variants", () => {
 		const control = { status: "cancel_requested", requestedAt: 123, drainedSteer: [], drainedFollowUp: [] } as const;
 		const value = { ...common(phases.ready), control };

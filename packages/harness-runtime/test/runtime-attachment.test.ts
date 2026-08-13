@@ -289,6 +289,31 @@ function forbidScansAndRecordLookups(storage: Storage) {
 	return { wrapped, entryLookups, usageLookups };
 }
 
+function addPendingWrites(
+	fixture: ReturnType<typeof operationFixture>,
+	pending: Array<{ id: string; value: JsonValue }>,
+): Write[] {
+	return [
+		...fixture.writes.map((write): Write => {
+			if (write.kind !== "register" || write.op !== "set" || write.namespace !== "op.state") return write;
+			return {
+				...write,
+				value: {
+					...(write.value as Record<string, JsonValue>),
+					inbox: { steer: [], followUp: [], writes: pending.map(({ id: entryId }) => entryId) },
+				},
+			};
+		}),
+		...pending.map(({ id: key, value }) => ({
+			kind: "register" as const,
+			op: "set" as const,
+			namespace: "pending.entry",
+			key,
+			value,
+		})),
+	];
+}
+
 describe("runtime attachment boundary", () => {
 	it("publishes attachment ownership before blocked hydration so raw writes and close cannot queue behind it", async () => {
 		const instrumented = instrumentStorage(await storageWith());
@@ -442,6 +467,159 @@ describe("runtime attachment boundary", () => {
 			await closeAttachedRuntime(runtimeSession);
 		},
 	);
+
+	it("hydrates mixed writes with exact point and batch reads while preserving absent and null payloads", async () => {
+		const fixture = operationFixture();
+		const pending = [
+			{ id: id(), value: json({ type: "message", payload: user("write") }) },
+			{ id: id(), value: json({ type: "custom", customType: "absent" }) },
+			{ id: id(), value: json({ type: "custom", customType: "null", payload: null }) },
+			{ id: id(), value: json({ type: "custom", customType: "nested", payload: { a: [1, { b: true }] } }) },
+		];
+		const delegate = await storageWith(addPendingWrites(fixture, pending));
+		const { wrapped, entryLookups, usageLookups } = forbidScansAndRecordLookups(delegate);
+		const registerReads: string[] = [];
+		const getRegister = wrapped.getRegister.bind(wrapped);
+		wrapped.getRegister = async (namespace, key) => {
+			registerReads.push(`${namespace}/${key}`);
+			if (namespace === "lane.lastResult") throw new Error("lane.lastResult forbidden");
+			return getRegister(namespace, key);
+		};
+		const runtimeSession = session(wrapped);
+		const attached = await attachRuntime(runtimeSession, seed());
+		expect(registerReads.filter((read) => read.startsWith("pending.entry/"))).toEqual(
+			pending.map(({ id: entryId }) => `pending.entry/${entryId}`),
+		);
+		expect(entryLookups).toHaveLength(1);
+		expect(new Set(entryLookups[0])).toEqual(
+			new Set([fixture.source, fixture.prompt, ...pending.map(({ id }) => id)]),
+		);
+		expect(usageLookups).toEqual([[...pending.map(({ id: entryId }) => entryId)]]);
+		expect(attached.pendingEntries.get(pending[0].id)).toEqual({ type: "message", payload: user("write") });
+		expect(attached.pendingEntries.get(pending[1].id)).not.toHaveProperty("payload");
+		expect(attached.pendingEntries.get(pending[2].id)).toHaveProperty("payload", null);
+		expect(attached.pendingEntries.get(pending[3].id)).toHaveProperty("payload", { a: [1, { b: true }] });
+		await closeAttachedRuntime(runtimeSession);
+	});
+
+	it.each(["nextRun", "steer", "followUp", "drained"] as const)(
+		"rejects custom pending content in the message-only %s owner",
+		async (owner) => {
+			const fixture = operationFixture();
+			const pendingId = id();
+			const writes = fixture.writes.map((write): Write => {
+				if (
+					write.kind === "register" &&
+					write.op === "set" &&
+					write.namespace === "lane.state" &&
+					owner === "nextRun"
+				)
+					return { ...write, value: { currentOperationId: fixture.operationId, pendingNextRun: [pendingId] } };
+				if (
+					write.kind !== "register" ||
+					write.op !== "set" ||
+					write.namespace !== "op.state" ||
+					owner === "nextRun"
+				)
+					return write;
+				const value = structuredClone(write.value) as Record<string, JsonValue>;
+				if (owner === "steer" || owner === "followUp")
+					(value.inbox as Record<string, JsonValue>)[owner] = [pendingId];
+				else {
+					value.control = {
+						status: "cancel_requested",
+						requestedAt: 1,
+						drainedSteer: [pendingId],
+						drainedFollowUp: [],
+					};
+				}
+				return { ...write, value };
+			});
+			writes.push({
+				kind: "register",
+				op: "set",
+				namespace: "pending.entry",
+				key: pendingId,
+				value: { type: "custom", customType: "not-message" },
+			});
+			await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+		},
+	);
+
+	it.each(["missing", "malformed", "entry", "usage"] as const)("rejects pending-write %s corruption", async (kind) => {
+		const fixture = operationFixture();
+		const pendingId = id();
+		const writes = addPendingWrites(fixture, [
+			{
+				id: pendingId,
+				value: kind === "malformed" ? json({ type: "custom" }) : json({ type: "custom", customType: "x" }),
+			},
+		]);
+		if (kind === "missing") writes.pop();
+		if (kind === "entry")
+			writes.push({ kind: "entry", entry: { id: pendingId, parentId: null, type: "custom", customType: "x" } });
+		if (kind === "usage")
+			writes.push({
+				kind: "usage",
+				row: { id: pendingId, entryId: fixture.prompt, adjustment: false, usage: ZERO_USAGE },
+			});
+		await expect(validateMainLane(await storageWith(writes))).rejects.toMatchObject({ code: "corruption" });
+	});
+
+	it.each([
+		["operation", "need_assistant"],
+		["source", "need_assistant"],
+		["prompt", "need_assistant"],
+		["trigger", "need_assistant"],
+		["latest assistant", "may_finish"],
+		["step", "effect_pending"],
+		["response", "effect_pending"],
+		["usage reservation", "effect_pending"],
+	] as const)("rejects write ownership colliding with %s", async (field, position) => {
+		const fixture = operationFixture(position);
+		const stateWrite = fixture.writes.find(
+			(write) => write.kind === "register" && write.op === "set" && write.namespace === "op.state",
+		) as Extract<Write, { kind: "register"; op: "set" }>;
+		const phase = (stateWrite.value as Record<string, JsonValue>).phase as Record<string, JsonValue>;
+		const generation = phase.generation as Record<string, JsonValue> | undefined;
+		const context = generation?.context as Record<string, JsonValue> | undefined;
+		const pendingId =
+			field === "operation"
+				? fixture.operationId
+				: field === "source"
+					? fixture.source
+					: field === "prompt" || field === "trigger"
+						? fixture[field]
+						: field === "latest assistant" || field === "response"
+							? fixture.response
+							: field === "usage reservation"
+								? fixture.usage
+								: (context?.stepId as string);
+		await expect(
+			validateMainLane(
+				await storageWith(
+					addPendingWrites(fixture, [{ id: pendingId, value: json({ type: "custom", customType: "x" }) }]),
+				),
+			),
+		).rejects.toMatchObject({ code: "corruption" });
+	});
+
+	it.each(["turn", "tool result"] as const)("rejects write ownership colliding with a %s identity", async (field) => {
+		const fixture = pendingToolFixture("planned");
+		const stateWrite = fixture.writes.find(
+			(write) => write.kind === "register" && write.op === "set" && write.namespace === "op.state",
+		) as Extract<Write, { kind: "register"; op: "set" }>;
+		const batch = ((stateWrite.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
+			.batch as Record<string, JsonValue>;
+		const pendingId = field === "turn" ? (batch.turnId as string) : fixture.result;
+		await expect(
+			validateMainLane(
+				await storageWith(
+					addPendingWrites(fixture, [{ id: pendingId, value: json({ type: "custom", customType: "x" }) }]),
+				),
+			),
+		).rejects.toMatchObject({ code: "corruption" });
+	});
 
 	it("hydrates retry_wait without old reservation ids or lane.lastResult and writes nothing", async () => {
 		const fixture = operationFixture("retry_wait");

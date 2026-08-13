@@ -141,7 +141,7 @@ export interface RunState {
 		toolExecution: "sequential" | "parallel";
 	};
 	phase: CheckpointPhase | AssistantPhase | ToolsPhase | FailureDrainPhase;
-	inbox: { steer: string[]; followUp: string[]; writes: [] };
+	inbox: { steer: string[]; followUp: string[]; writes: string[] };
 	latestAssistantEntryId: string | null;
 }
 
@@ -242,11 +242,6 @@ function strings(value: unknown, name: string, uuids = false): asserts value is 
 		value.some((item) => typeof item !== "string" || (uuids && !isUuidV7(item)))
 	)
 		fail(`${name} must be an array of ${uuids ? "UUIDv7s" : "strings"}`);
-}
-
-function emptyArray(value: unknown, name: string): asserts value is [] {
-	strings(value, name);
-	if (value.length !== 0) fail(`${name} must be empty`);
 }
 
 function decodeRegister<T>(
@@ -526,8 +521,8 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 		const inbox = object(state.inbox, ["steer", "followUp", "writes"], "inbox");
 		strings(inbox.steer, "inbox.steer", true);
 		strings(inbox.followUp, "inbox.followUp", true);
-		emptyArray(inbox.writes, "inbox.writes");
-		const queueIds = [...inbox.steer, ...inbox.followUp, ...drainedQueueIds];
+		strings(inbox.writes, "inbox.writes", true);
+		const queueIds = [...inbox.steer, ...inbox.followUp, ...inbox.writes, ...drainedQueueIds];
 		if (new Set(queueIds).size !== queueIds.length)
 			fail("Operation queue IDs must be unique across active and drained lists");
 		uuidOrNull(state.latestAssistantEntryId, "latestAssistantEntryId");

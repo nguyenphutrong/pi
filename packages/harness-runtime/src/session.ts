@@ -240,7 +240,7 @@ function collectCurrentLogicalIds(
 	if (runOperation.sourceLeafId !== null) nonQueue.add(runOperation.sourceLeafId);
 	for (const id of runOperation.intent.promptEntryIds) nonQueue.add(id);
 	if (runState.latestAssistantEntryId !== null) nonQueue.add(runState.latestAssistantEntryId);
-	for (const id of [...runState.inbox.steer, ...runState.inbox.followUp]) queue.add(id);
+	for (const id of [...runState.inbox.steer, ...runState.inbox.followUp, ...runState.inbox.writes]) queue.add(id);
 	if (runState.control.status === "cancel_requested")
 		for (const id of [...runState.control.drainedSteer, ...runState.control.drainedFollowUp]) queue.add(id);
 	const phase = runState.phase;
@@ -274,6 +274,7 @@ async function hydrateCurrentState(
 		? [
 				...runState.value.inbox.steer,
 				...runState.value.inbox.followUp,
+				...runState.value.inbox.writes,
 				...(runState.value.control.status === "cancel_requested"
 					? [...runState.value.control.drainedSteer, ...runState.value.control.drainedFollowUp]
 					: []),
@@ -285,7 +286,10 @@ async function hydrateCurrentState(
 	const logicalIds = collectCurrentLogicalIds(laneState.value, runOperation?.value, runState?.value);
 	if (pendingIds.some((id) => logicalIds.nonQueue.has(id)))
 		throw new SessionError("corruption", "Pending entry ID overlaps a non-queue logical reservation");
-	for (const id of pendingIds) entryIds.add(id);
+	for (const id of pendingIds) {
+		entryIds.add(id);
+		usageIds.add(id);
+	}
 
 	let triggerEntryId: string | undefined;
 	let responseEntryId: string | undefined;
@@ -356,9 +360,11 @@ async function hydrateCurrentState(
 		}
 		if (register.namespace !== "pending.entry" || register.key !== id)
 			throw new SessionError("corruption", "Pending entry register has the wrong identity");
-		if (storedEntries.has(id)) throw new SessionError("corruption", "Pending entry is also materialized");
+		if (storedEntries.has(id) || storedUsageRows.has(id))
+			throw new SessionError("corruption", "Pending entry ID is already materialized");
 		const pending = decodePendingEntry(register.value);
-		if (pending.type !== "message")
+		const writeOwned = runState?.value.inbox.writes.includes(id) === true;
+		if (!writeOwned && pending.type !== "message")
 			throw new SessionError("corruption", "Message-only queue references a custom pending entry");
 		pendingEntries.set(id, pending);
 	}
@@ -1372,7 +1378,9 @@ export class StoredSession implements Session {
 		const operation = this.#mutationLine.then(async () => {
 			const attachment = await this.#loadRuntimeAttachment();
 			const operationKind = attachment.runState
-				? (["steer", "followUp"] as const).find((kind) => attachment.runState!.value.inbox[kind].includes(entryId))
+				? (["steer", "followUp", "writes"] as const).find((kind) =>
+						attachment.runState!.value.inbox[kind].includes(entryId),
+					)
 				: undefined;
 			if (!attachment.laneState.value.pendingNextRun.includes(entryId) && !operationKind) {
 				const entry = await this.#storage.getEntries([entryId]);
@@ -3040,6 +3048,7 @@ export class StoredSession implements Session {
 			const operationPendingIds = [
 				...runState.value.inbox.steer,
 				...runState.value.inbox.followUp,
+				...runState.value.inbox.writes,
 				...(runState.value.control.status === "cancel_requested"
 					? [...runState.value.control.drainedSteer, ...runState.value.control.drainedFollowUp]
 					: []),

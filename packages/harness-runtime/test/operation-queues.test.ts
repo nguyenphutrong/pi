@@ -20,6 +20,10 @@ const configuration: LaneConfiguration = {
 	activeToolNames: [],
 };
 
+function jsonValue(value: unknown): JsonValue {
+	return value as JsonValue;
+}
+
 function session(storage: Storage): StoredSession {
 	return new StoredSession(
 		{ id: id(), createdAt: 1, storageVersion: CURRENT_STORAGE_VERSION },
@@ -108,6 +112,33 @@ function planner(attachment: Awaited<ReturnType<typeof attachRuntime>>) {
 	return planAction(attachment, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info;
 }
 
+async function installWrites(
+	prepared: Awaited<ReturnType<typeof active>>,
+	pending: Array<{ id: string; value: JsonValue }>,
+): Promise<void> {
+	const current = await prepared.runtimeSession.refreshRuntimeAttachment();
+	const state = structuredClone(current.runState!.value);
+	state.inbox.writes = pending.map(({ id: entryId }) => entryId);
+	await prepared.storage.commit({
+		writes: [
+			...pending.map(({ id: key, value }) => ({
+				kind: "register" as const,
+				op: "set" as const,
+				namespace: "pending.entry",
+				key,
+				value,
+			})),
+			{
+				kind: "register",
+				op: "set",
+				namespace: "op.state",
+				key: current.runOperation!.value.operationId,
+				value: state as unknown as JsonValue,
+			},
+		],
+	});
+}
+
 describe("operation-owned queues", () => {
 	it("selectQueueDrain covers checkpoint, finish, failure rescue, skip, cancellation, modes, and immutable copies", () => {
 		const base: RunState = {
@@ -165,6 +196,133 @@ describe("operation-owned queues", () => {
 		expect(selectQueueDrain(skipped)).toBeUndefined();
 		skipped.control = { status: "cancel_requested", requestedAt: 1, drainedSteer: [], drainedFollowUp: [] };
 		expect(selectQueueDrain(skipped)).toBeUndefined();
+	});
+
+	it("does not select writes or add a write drain to planning", async () => {
+		const prepared = await active();
+		const writeId = id();
+		await installWrites(prepared, [{ id: writeId, value: { type: "custom", customType: "deferred" } }]);
+		const current = await prepared.runtimeSession.refreshRuntimeAttachment();
+		expect(selectQueueDrain(current.runState!.value)).toBeUndefined();
+		expect(planner(current)?.kind).toBe("start_assistant_step");
+		await closeAttachedRuntime(prepared.runtimeSession);
+	});
+
+	it("cancels exactly one custom write with total state first and preserves FIFO survivors", async () => {
+		const delegate = new MemoryStorage();
+		const prepared = await active(delegate);
+		const pending = [
+			{ id: id(), value: jsonValue({ type: "message", payload: user("first") }) },
+			{ id: id(), value: jsonValue({ type: "custom", customType: "cancel", payload: null }) },
+			{ id: id(), value: jsonValue({ type: "custom", customType: "keep", payload: { nested: [1] } }) },
+		];
+		await installWrites(prepared, pending);
+		const storage = instrumentStorage(delegate);
+		const runtimeSession = session(storage);
+		const before = await attachRuntime(runtimeSession, configuration);
+		const expectedState = structuredClone(before.runState!.value);
+		expectedState.inbox.writes = [pending[0].id, pending[2].id];
+		const result = await runtimeSession.cancelQueued(pending[1].id);
+		expect(result.outcome).toBe("cancelled");
+		expect(storage.committedTransactions).toHaveLength(1);
+		expect(storage.committedTransactions[0].writes).toEqual([
+			{
+				kind: "register",
+				op: "set",
+				namespace: "op.state",
+				key: before.runOperation!.value.operationId,
+				value: expectedState,
+			},
+			{ kind: "register", op: "delete", namespace: "pending.entry", key: pending[1].id },
+		]);
+		const restored = await runtimeSession.refreshRuntimeAttachment();
+		expect(restored.runState!.value.inbox.writes).toEqual([pending[0].id, pending[2].id]);
+		expect(restored.pendingEntries.get(pending[0].id)).toEqual({ type: "message", payload: user("first") });
+		expect(restored.pendingEntries.get(pending[2].id)).toEqual({
+			type: "custom",
+			customType: "keep",
+			payload: { nested: [1] },
+		});
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
+	});
+
+	it("preserves writes exactly across abort, repeated abort, and drained cancellation", async () => {
+		const delegate = new MemoryStorage();
+		const prepared = await active(delegate);
+		const pending = [
+			{ id: id(), value: jsonValue({ type: "custom", customType: "absent" }) },
+			{ id: id(), value: jsonValue({ type: "custom", customType: "null", payload: null }) },
+		];
+		await installWrites(prepared, pending);
+		const drained = await prepared.runtimeSession.queueOperationInput("steer", user("drained"));
+		const storage = instrumentStorage(delegate);
+		const runtimeSession = session(storage);
+		await attachRuntime(runtimeSession, configuration);
+		const first = await runtimeSession.requestAbort(() => undefined);
+		expect(first.status).toBe("committed");
+		expect(storage.committedTransactions).toHaveLength(1);
+		const stateWrite = storage.committedTransactions[0].writes[0];
+		expect(stateWrite).toMatchObject({
+			kind: "register",
+			op: "set",
+			value: expect.objectContaining({ inbox: { steer: [], followUp: [], writes: pending.map(({ id }) => id) } }),
+		});
+		expect(await runtimeSession.requestAbort(() => undefined)).toMatchObject({ status: "already_requested" });
+		expect(storage.committedTransactions).toHaveLength(1);
+		expect((await runtimeSession.cancelQueued(drained.entryId!)).outcome).toBe("not_found");
+		expect(await delegate.getRegister("pending.entry", drained.entryId!)).toBeDefined();
+		const restored = await runtimeSession.refreshRuntimeAttachment();
+		expect(restored.runState!.value.inbox.writes).toEqual(pending.map(({ id }) => id));
+		expect(restored.pendingEntries.get(pending[0].id)).not.toHaveProperty("payload");
+		expect(restored.pendingEntries.get(pending[1].id)).toHaveProperty("payload", null);
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
+	});
+
+	it.each(["cancel-abort", "abort-cancel"] as const)(
+		"serializes %s while preserving uncancelled writes",
+		async (order) => {
+			const prepared = await active();
+			const pending = [
+				{ id: id(), value: jsonValue({ type: "custom", customType: "cancel" }) },
+				{ id: id(), value: jsonValue({ type: "custom", customType: "keep", payload: null }) },
+			];
+			await installWrites(prepared, pending);
+			if (order === "cancel-abort") {
+				expect((await prepared.runtimeSession.cancelQueued(pending[0].id)).outcome).toBe("cancelled");
+				expect((await prepared.runtimeSession.requestAbort(() => undefined)).status).toBe("committed");
+			} else {
+				expect((await prepared.runtimeSession.requestAbort(() => undefined)).status).toBe("committed");
+				expect((await prepared.runtimeSession.cancelQueued(pending[0].id)).outcome).toBe("cancelled");
+			}
+			const restored = await prepared.runtimeSession.refreshRuntimeAttachment();
+			expect(restored.runState!.value.inbox.writes).toEqual([pending[1].id]);
+			expect(restored.pendingEntries.get(pending[1].id)).toHaveProperty("payload", null);
+			await closeAttachedRuntime(prepared.runtimeSession);
+		},
+	);
+
+	it("serializes concurrent independent write cancellations without reordering survivors", async () => {
+		const prepared = await active();
+		const pending = [0, 1, 2, 3].map((index) => ({
+			id: id(),
+			value: jsonValue({ type: "custom", customType: `write-${index}`, payload: index }),
+		}));
+		await installWrites(prepared, pending);
+		expect(
+			(
+				await Promise.all([
+					prepared.runtimeSession.cancelQueued(pending[1].id),
+					prepared.runtimeSession.cancelQueued(pending[3].id),
+				])
+			).map(({ outcome }) => outcome),
+		).toEqual(["cancelled", "cancelled"]);
+		const restored = await prepared.runtimeSession.refreshRuntimeAttachment();
+		expect(restored.runState!.value.inbox.writes).toEqual([pending[0].id, pending[2].id]);
+		expect(restored.pendingEntries.get(pending[0].id)).toHaveProperty("payload", 0);
+		expect(restored.pendingEntries.get(pending[2].id)).toHaveProperty("payload", 2);
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it.each(["all", "one-at-a-time"] as const)(
@@ -334,6 +492,32 @@ describe("operation-owned queues", () => {
 			expect(current.pendingEntries.get(accepted.entryId!)?.payload).toEqual(user("next"));
 			await closeAttachedRuntime(prepared.runtimeSession);
 		}
+	});
+
+	it("rejects finish with residual writes without writing and preserves next-run", async () => {
+		const delegate = new MemoryStorage();
+		const prepared = await cappedFailure(delegate);
+		const next = await prepared.runtimeSession.nextRun(user("next"));
+		const writeId = id();
+		await installWrites(prepared, [{ id: writeId, value: jsonValue({ type: "custom", customType: "residual" }) }]);
+		const storage = instrumentStorage(delegate);
+		const runtimeSession = session(storage);
+		const current = await attachRuntime(runtimeSession, configuration);
+		await expect(
+			runtimeSession.finishRun({
+				operationId: prepared.operationId,
+				expectedOperationStateSeq: current.runState!.seq,
+			}),
+		).rejects.toMatchObject({ code: "corruption" });
+		expect(storage.committedTransactions).toEqual([]);
+		expect(await delegate.getRegister("pending.entry", writeId)).toBeDefined();
+		expect(await delegate.getRegister("pending.entry", next.entryId!)).toBeDefined();
+		expect((await delegate.getRegister("lane.state", "main"))?.value).toEqual({
+			currentOperationId: prepared.operationId,
+			pendingNextRun: [next.entryId],
+		});
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it("orders abort and finish at a valid terminal boundary", async () => {
@@ -720,12 +904,19 @@ describe("operation-owned queues", () => {
 		await closeAttachedRuntime(reopened);
 	});
 
-	it.each(["active", "drained"] as const)(
+	it.each(["active", "drained", "write"] as const)(
 		"rejects a generated next-run id colliding with an %s operation queue without writing",
 		async (kind) => {
 			const delegate = new MemoryStorage();
 			const prepared = await active(delegate);
-			const queued = await prepared.runtimeSession.queueOperationInput("steer", user("reserved"));
+			const queued =
+				kind === "write"
+					? { entryId: id() }
+					: await prepared.runtimeSession.queueOperationInput("steer", user("reserved"));
+			if (kind === "write")
+				await installWrites(prepared, [
+					{ id: queued.entryId!, value: jsonValue({ type: "custom", customType: "reserved" }) },
+				]);
 			if (kind === "drained") await prepared.runtimeSession.requestAbort(() => undefined);
 			const storage = instrumentStorage(delegate);
 			const runtimeSession = session(storage);
@@ -738,8 +929,8 @@ describe("operation-owned queues", () => {
 		},
 	);
 
-	it("rejects cross-list, cross-lane, missing, malformed, materialized, and deferred-write references on reopen", async () => {
-		const cases = ["cross-list", "cross-lane", "missing", "malformed", "materialized", "write"] as const;
+	it("rejects cross-list, cross-lane, missing, malformed, and materialized references on reopen", async () => {
+		const cases = ["cross-list", "cross-lane", "missing", "malformed", "materialized"] as const;
 		for (const kind of cases) {
 			const durable = new MemoryStorageState();
 			const prepared = await active(durable.createStorage());
@@ -780,8 +971,6 @@ describe("operation-owned queues", () => {
 						payload: user("q") as unknown as JsonValue,
 					},
 				});
-			if (kind === "write")
-				value.inbox = { ...value.inbox, steer: [], writes: [queued.entryId!] } as unknown as RunState["inbox"];
 			writes.unshift({
 				kind: "register",
 				op: "set",
