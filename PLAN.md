@@ -3,16 +3,17 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.3f — Explicit branch repair and Harness SQLite integration
-- Status: Phase 3.3e completed by `886bb34ad`; unchanged full Memory/SQLite Storage conformance and focused segmented-cache gates pass independent review
+- Work item: 3.3f-A — Explicit history-free SQLite branch repair
+- Status: D-041 accepted by independent design review and committed as `7317b7695`; implementation starts with the engine-owned repair transaction and repository operation
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design and review explicit history-free branch repair and private `SqliteSessionRepo` integration.
-2. Implement explicit repair, then integrate the real SQLite repository with `StoredSession` and RuntimeShell.
-3. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
+1. Implement and independently review explicit branch repair plus its additive private repository seam.
+2. Implement private `SqliteSessionRepo`, lifecycle tests, and real RuntimeShell SQLite acceptance.
+3. Add storage, creation, and RuntimeShell subprocess crash matrices.
+4. Run whole-Phase-3 review and Recovery/QA.
 
 ## Phase order
 
