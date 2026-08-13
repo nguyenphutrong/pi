@@ -4,7 +4,7 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.4 — First complete durable tool-plan commit
-- Status: D-026 passed independent design review; implementation is next
+- Status: D-026 committed by `09c57bf49` after independent design review; implementation is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
