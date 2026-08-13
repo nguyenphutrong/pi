@@ -3,7 +3,7 @@ import { MemoryStorage } from "@nguyenphutrong/pi-session-storage";
 import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import { type BranchBounds, CURRENT_STORAGE_VERSION, type EntryQuery, MemorySessionRepo } from "../src/index.ts";
-import { MemorySession } from "../src/session.ts";
+import { StoredSession } from "../src/session.ts";
 import { asMessage, assistant, id, toolResult, user, ZERO_USAGE } from "./fixtures.ts";
 
 function metadata() {
@@ -18,12 +18,12 @@ function asBranchQuery(value: unknown): EntryQuery & BranchBounds {
 	return value as EntryQuery & BranchBounds;
 }
 
-function asEntryId(value: unknown): Parameters<MemorySession["getEntry"]>[0] {
-	return value as Parameters<MemorySession["getEntry"]>[0];
+function asEntryId(value: unknown): Parameters<StoredSession["getEntry"]>[0] {
+	return value as Parameters<StoredSession["getEntry"]>[0];
 }
 
-function asEntryIds(value: unknown): Parameters<MemorySession["getEntries"]>[0] {
-	return value as Parameters<MemorySession["getEntries"]>[0];
+function asEntryIds(value: unknown): Parameters<StoredSession["getEntries"]>[0] {
+	return value as Parameters<StoredSession["getEntries"]>[0];
 }
 
 async function initializedStorage(): Promise<MemoryStorage> {
@@ -43,10 +43,10 @@ async function initializedStorage(): Promise<MemoryStorage> {
 	return storage;
 }
 
-describe("MemorySession", () => {
+describe("StoredSession", () => {
 	it("serializes concurrent appends as one transaction and one parent chain", async () => {
 		const instrumented = instrumentStorage(await initializedStorage());
-		const session = new MemorySession(metadata(), instrumented, () => undefined);
+		const session = new StoredSession(metadata(), instrumented, () => undefined);
 		const ids = await Promise.all([
 			session.appendMessage(user("a")),
 			session.appendMessage(user("b")),
@@ -70,7 +70,7 @@ describe("MemorySession", () => {
 
 	it("close drains an append admitted before sealing", async () => {
 		const storage = await initializedStorage();
-		const session = new MemorySession(metadata(), storage, () => undefined);
+		const session = new StoredSession(metadata(), storage, () => undefined);
 		const append = session.appendMessage(user("admitted"));
 		const close = session.close();
 		const entryId = await append;

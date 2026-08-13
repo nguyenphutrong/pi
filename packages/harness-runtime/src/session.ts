@@ -768,7 +768,7 @@ export type PrepareAssistantEffectResult =
 			readonly usageId?: undefined;
 	  };
 
-export class MemorySession implements Session {
+export class StoredSession implements Session {
 	readonly metadata: SessionMetadata;
 	readonly idGenerator: IdGenerator;
 	readonly #storage: Storage;

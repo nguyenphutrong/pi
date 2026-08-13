@@ -1,5 +1,5 @@
 import { createIdGenerator, isUuidV7, MemoryStorageState } from "@nguyenphutrong/pi-session-storage";
-import { MemorySession, validateMainLane } from "./session.ts";
+import { StoredSession, validateMainLane } from "./session.ts";
 import { CURRENT_STORAGE_VERSION, type Session, SessionError, type SessionMetadata } from "./types.ts";
 
 interface CatalogItem {
@@ -105,7 +105,7 @@ export class MemorySessionRepo {
 				],
 			});
 			this.#catalog.set(id, { metadata, state });
-			return new MemorySession(metadataCopy(metadata), storage, () => this.#release(id, token));
+			return new StoredSession(metadataCopy(metadata), storage, () => this.#release(id, token));
 		} catch (error) {
 			try {
 				await storage.close();
@@ -132,7 +132,7 @@ export class MemorySessionRepo {
 		const storage = item.state.createStorage();
 		try {
 			await validateMainLane(storage);
-			return new MemorySession(metadataCopy(item.metadata), storage, () => this.#release(metadata.id, token));
+			return new StoredSession(metadataCopy(item.metadata), storage, () => this.#release(metadata.id, token));
 		} catch (error) {
 			try {
 				await storage.close();

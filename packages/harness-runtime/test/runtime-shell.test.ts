@@ -15,7 +15,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration, RunOperation, RunState } from "../src/durable.ts";
 import { MemorySessionRepo } from "../src/repo.ts";
 import { createRuntimeShell, type RuntimeShellOptions, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
-import { MemorySession } from "../src/session.ts";
+import { StoredSession } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
 import { asMessage, assistant, id, toolResult, user, ZERO_USAGE } from "./fixtures.ts";
 
@@ -175,7 +175,7 @@ async function rooted(
 }
 
 function session(storage: Storage) {
-	return new MemorySession(
+	return new StoredSession(
 		{ id: id(), createdAt: 1, storageVersion: CURRENT_STORAGE_VERSION },
 		storage,
 		() => undefined,
@@ -342,14 +342,14 @@ describe("D-019 no-tool fresh-handle lifecycle", () => {
 		try {
 			const repo = new MemorySessionRepo();
 			const created = await repo.create();
-			expect(created).toBeInstanceOf(MemorySession);
+			expect(created).toBeInstanceOf(StoredSession);
 			expect(created.metadata.createdAt).toBe(now);
 			const operationId = id();
 			const promptEntryId = id();
 			const stepId = id();
 			const responseEntryId = id();
 			const usageId = id();
-			const activeSession = created as MemorySession;
+			const activeSession = created as StoredSession;
 			vi.spyOn(activeSession.idGenerator, "next")
 				.mockReturnValueOnce(operationId)
 				.mockReturnValueOnce(promptEntryId)
@@ -409,7 +409,7 @@ describe("D-019 no-tool ordered writer audit", () => {
 		try {
 			const repo = new MemorySessionRepo();
 			const activeSession = await repo.create();
-			expect(activeSession).toBeInstanceOf(MemorySession);
+			expect(activeSession).toBeInstanceOf(StoredSession);
 			expect(activeSession.metadata.createdAt).toBe(now);
 			const activeStorage = handles[0];
 			if (!activeStorage) throw new Error("repository creation storage handle missing");
@@ -418,7 +418,7 @@ describe("D-019 no-tool ordered writer audit", () => {
 			const stepId = id();
 			const responseEntryId = id();
 			const usageId = id();
-			const memorySession = activeSession as MemorySession;
+			const memorySession = activeSession as StoredSession;
 			vi.spyOn(memorySession.idGenerator, "next")
 				.mockReturnValueOnce(operationId)
 				.mockReturnValueOnce(promptEntryId)
@@ -4899,7 +4899,7 @@ describe("Phase 1 runtime shell", () => {
 		await shell.close();
 	});
 
-	it("returns only a committed detached internal MemorySession finish result with exact final identities", async () => {
+	it("returns only a committed detached internal StoredSession finish result with exact final identities", async () => {
 		const fixture = await rooted("finish");
 		const instrumented = instrumentStorage(fixture.storage);
 		const runtimeSession = session(instrumented);

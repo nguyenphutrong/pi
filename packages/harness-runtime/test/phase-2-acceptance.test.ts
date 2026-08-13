@@ -3,7 +3,7 @@ import { MemoryStorageState, type Storage, type Transaction } from "@nguyenphutr
 import { describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { createRuntimeShell, type RuntimeShell, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
-import { MemorySession } from "../src/session.ts";
+import { StoredSession } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
 import { id, user, ZERO_USAGE } from "./fixtures.ts";
 
@@ -30,8 +30,8 @@ function providerMessage(content: AssistantMessage["content"], usage: AssistantM
 	};
 }
 
-function session(storage: Storage): MemorySession {
-	return new MemorySession(
+function session(storage: Storage): StoredSession {
+	return new StoredSession(
 		{ id: id(), createdAt: 1, storageVersion: CURRENT_STORAGE_VERSION },
 		storage,
 		() => undefined,

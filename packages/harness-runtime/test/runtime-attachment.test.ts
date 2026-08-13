@@ -10,7 +10,7 @@ import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { attachRuntime } from "../src/runtime-port.ts";
-import { MemorySession, validateMainLane } from "../src/session.ts";
+import { StoredSession, validateMainLane } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
 import { assistant, id, toolResult, user, ZERO_USAGE } from "./fixtures.ts";
 
@@ -46,8 +46,8 @@ async function storageWith(writes: Write[] = []): Promise<MemoryStorage> {
 	return storage;
 }
 
-function session(storage: Storage): MemorySession {
-	return new MemorySession(metadata(), storage, () => undefined);
+function session(storage: Storage): StoredSession {
+	return new StoredSession(metadata(), storage, () => undefined);
 }
 
 type Position = "need_assistant" | "ready" | "effect_pending" | "retry_wait" | "failure_drain" | "may_finish";
