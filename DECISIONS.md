@@ -821,3 +821,34 @@ Tier A covers the full persisted/current `safe|never|missing` matrix, captured-a
 Options 2 and 3 are rejected. Option 2 violates the specified safe-replay capability. Option 3 can change effective arguments or rerun `before_tool`, creates an unnecessary durable program-counter state, or requires a new declaration-revision contract not present in the spec. The corrected independent design review reports PASS with no §6 blocker.
 
 Commit `22d75bde0` implements the complete restored-effect boundary. Internal attachments retain only exact arguments for currently pending calls; safe recovery refreshes current authority after asynchronous context resolution before publishing a local effect; and non-replay recovery uses the ordinary atomic settlement path under the reserved result id. Harness runtime passes 355/355, `npm run check` and `git diff --check` pass, and the corrected independent final review reports PASS after stale attachment arguments, post-context authority, and two-call recovery evidence were fixed.
+
+## D-030 — Compose durable abort through orthogonal control and existing phases
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: approved by corrected independent design review; implementation pending
+- References: D-024–D-029; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.7–3.8, 3.11–3.13, 4.1–4.7, 5.1, 9.1–9.3
+
+### Options
+
+1. Commit cancellation and terminal cleanup together, synthesizing every unsettled output in one abort transition.
+2. Add a durable `cancelling` phase that wraps the prior phase and carries a reconciliation cursor.
+3. Keep the current phase as the program counter, add the canonical orthogonal `cancel_requested` control, and compose cancellation through phase-specific settlement plus the existing terminal transaction.
+
+### Choice
+
+Option 3.
+
+### Rationale
+
+The first abort reloads current lane authority on the Session mutation line and atomically replaces only total `op.state` control with `{ status:"cancel_requested", requestedAt, drainedSteer:[], drainedFollowUp:[] }`. Phase, inbox, reservations, leaf, and arguments remain unchanged. The empty drained arrays are exact for the current pre-queue scope. Only after that commit may a synchronous process-local callback publish the new attachment and signal registered running assistant/tool controllers. A repeated abort while the operation remains open writes and signals nothing and returns the same operation id and empty payloads; after the terminal transaction it reports no active operation. A failed marker commit faults without signalling. Close remains a write-free controlled crash.
+
+Ordinary assistant/tool dispatch and `after_tool` start re-enter the same Session mutation line. They reload exact semantic effect authority and require running control. Cancellation-first returns `not_started` and invokes no provider, tool, or hook. Start-first synchronously registers the controller/local ownership and invokes the external effect before releasing the line, so a later abort finds and signals the already-started effect. RuntimeShell abort bypasses an `executeAction()` admission job that may be awaiting an effect. Monotonic attachment publication prevents an older concurrently completing action from replacing a newer cancelled attachment.
+
+Provider rejection is never inferred to mean abort from the signal alone. `pi-ai` requires operational failures and cooperative cancellation to resolve as terminal assistant messages; a rejected provider stream remains a trusted runtime-contract fault. A valid response settling after the marker is copied under its reserved id with real usage, `stopReason:"aborted"`, and its existing `errorMessage` or `"Operation aborted"`. A cancelled restored or locally planned assistant intent settles synthetically under its reserved response/usage ids with empty content, `api:"harness"`, captured provider/model, exact zero usage, `stopReason:"aborted"`, `errorMessage:"Operation aborted"`, and a post-authority timestamp. Response, leaf, usage, `latestAssistantEntryId`, and cancelled `may_finish(includeFinalAssistant:true)` checkpoint commit together. Ready, retry-wait, checkpoint, and failure-drain states start no new work and can finish aborted without fabricating an assistant.
+
+Cancellation reconciliation remains source ordered. A planned tool call writes its reserved result with exactly `content:[{type:"text",text:"Operation aborted"}]`, `details:{}`, `isError:true`, `terminate:false`, no usage, no added names, no arguments register, and no effect or hook. This literal reuses `pi-agent-loop`'s established pre-effect abort normalization. A durable pending call with a matching local `planned` effect uses the same aborted result because its start gate did not run. A restored pending call has unknown execution and therefore always uses D-029's interrupted result, never safe replay. A live call may settle its real output. If abort wins before `after_tool`, the hook is skipped and normalized raw content, details, usage, added names, and error bit are retained with `terminate:false`. If hook start wins, the already-running hook is not signalled and its finalized transformed result, including terminate, is retained. Cancelled settlement of the final source enters `may_finish(includeFinalAssistant:false)` regardless of the calls' terminate values, then finishes aborted rather than requesting another assistant.
+
+The aborted terminal transaction runs only after every intended assistant/tool output has reconciled, or immediately for a phase with no intended output. It defensively deletes the operation's metadata, state, tool-argument, and preparation registers, writes `lane.lastResult` with `outcome:"aborted"`, the current leaf, and optional newest settled assistant, then clears only `lane.state.currentOperationId`. An aborted run may end on a prompt, tool result, or assistant and never requires a universal assistant closure. Every marker, individual settlement, and terminal boundary is independently reopenable and selects one deterministic next action from current registers.
+
+Options 1 and 2 are rejected. Option 1 cannot atomically reconcile an already-running effect or preserve the specified live-result and post-hook race. Option 2 duplicates the existing program counter, diverges from the canonical control shape, and adds a migration without improving recovery. The selected design changes no Storage contract, namespace set, `pi-ai`, provider adapter, public package contract, or forbidden history surface. Queues, deferred cancellation, parallel tools, automatic drive, events, and structural operations remain later ordered work. The corrected independent design review reports PASS with no §6 escalation.
