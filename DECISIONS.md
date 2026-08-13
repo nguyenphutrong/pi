@@ -749,3 +749,36 @@ Execute, update, finalize, `after_tool`, real-result settlement and usage, repla
 The fresh independent design gate reports PASS after the terminated-tools finish contract, completed-result closure, and explicit reopen assertions were made exact.
 
 Commit `be47c4560` implements the complete clearance boundary. The retained registry now snapshots nested TypeBox schema data, symbols, descriptors, and prototypes rather than retaining caller-mutable nested objects. Harness runtime passes 313/313, `npm run check` and `git diff --check` pass, and the fresh independent final review reports PASS with no blocking findings. Real tool execution remains absent by design and is the next work item.
+
+## D-028 — Separate live sequential tool execution, finalization, and settlement
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: approved after corrected independent design review
+- References: D-024–D-027; `packages/agent/docs/harness-v3.md` §§1.2, 1.6, 3.2–3.3, 3.8, 3.13, 4.1–4.7, 5.7, 9.1–9.3
+
+### Options
+
+1. Fold dispatch, execution, finalization, and durable settlement into one action.
+2. Separate dispatch and await, but fold `after_tool` finalization and durable settlement into the await action.
+3. Use four process-local manual stages over one unchanged durable `effect_pending` call: dispatch, await raw output, finalize, then settle.
+
+### Choice
+
+Option 3.
+
+### Rationale
+
+The durable program counter remains the existing `effect_pending` call from D-027. Four process-local statuses expose `dispatch_tool_effect → await_tool_effect → finalize_tool_effect → settle_tool_effect` without adding a durable state. This preserves the spec's effect, source-ordered callback, and transaction boundaries and makes every boundary independently parkable in manual drive. Options 1 and 2 hide those crash and close positions and cannot provide the required Tier B ordering evidence.
+
+Clearance retains the exact `PreparedToolCall` and batch lease. Dispatch is serialized through RuntimeShell admission, validates the semantic effect identity, installs a running state and controller before invoking `executeToolCall`, and transfers ownership from the prepared map. Close-first starts nothing; dispatch-first gives close and future abort a registered controller. Await stores only the normalized raw result. Finalization has its own admitted start check, reuses the same prepared call and controller signal, and invokes the construction-captured aggregate `afterToolCall` through `finalizeToolCall`. Future abort-first can therefore skip an unstarted finalizer and force `terminate:false`, while finalization-first may finish; D-028 does not yet implement abort reconciliation. Expected tool throws, invalid results, and `after_tool` failures remain in-band. Internal defects use first-terminal-condition arbitration: close-first remains closed, fault-first preserves its original fault.
+
+Settlement does not compare stale pre-effect register sequences. It reloads the latest current state on the lane mutation line, requires the same open operation and semantic pending identity, exact persisted arguments, completed-prefix parent and leaf, and absent result/usage conflicts, then merges completion into that latest state. This preserves future concurrent control and inbox mutations rather than erasing them. A same-value state rewrite cannot invalidate an otherwise authoritative live result. Semantically obsolete effects write nothing and discard all matching local artifacts; malformed arguments, parents, or reservations are corruption and fault instead of stranding a local stage.
+
+When a finalized result reports usage, settlement mints a fresh UUIDv7 only after semantic authority validation, validates its uniqueness and absence from the shared entry/usage namespace, then commits exactly: result entry, lane leaf, optional usage row linked to the result with `adjustment:false`, final sorted validated argument-prefix deletes when this is the last call, and total latest `op.state`. No reported usage means no id allocation and no row. Earlier argument registers remain until final source settlement. The last call enters `may_finish(includeFinalAssistant:false)` only when every completed call terminates; otherwise it enters `need_assistant(false)`.
+
+Close writes nothing, aborts registered tool controllers, prevents locally observed outputs from finalizing or settling, and clears tool effects, prepared calls, and batch leases after admitted work drains. Valid transient updates are intentionally ignored in this slice by omitting an update sink; event delivery and sink isolation remain later work, while `agent-loop` conformance already covers update normalization and draining.
+
+Tier A covers real success, tool/error normalization, `after_tool` patches and failures, usage/no-usage, termination, two-call source and parent order, exact retained args/identity, final cleanup, close/reopen, and completed reopen. Tier B proves `clearance commit → registered dispatch → raw result → finalization → one settlement transaction` and exact write order. Tier C covers both close/fault orders at dispatch, raw, finalization, and settlement boundaries, semantic settlement across unrelated sequence advancement, and obsolete local cleanup.
+
+Replay/interrupted recovery, public abort and cancelled-output reconciliation, parallel tools, full hooks/events, and genuine-length explanatory results remain later Phase 2 items. This changes no durable schema, Storage contract, public Harness API, `pi-ai`, provider adapter, legacy agent package, or forbidden record/history surface. The corrected independent design review reports PASS and requires no §6 escalation.

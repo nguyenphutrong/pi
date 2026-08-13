@@ -4,17 +4,17 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.5b — Sequential tool dispatch, finalization, and durable real-result settlement
-- Status: D-027 clearance implemented by `be47c4560` after full verification and independent final review; real tool effects are next
+- Status: D-028 four-stage live tool-effect design approved after corrected independent review; implementation is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the tool effect and settlement sections and design the smallest D-028 boundary.
-2. Implement sequential execute/update/finalize through the retained prepared plan.
-3. Atomically settle a real durable tool result and advance the batch/checkpoint.
-4. Add Tier A/B/C dispatch, finalization, settlement, close, and stale-authority coverage.
-5. Independently review D-028, then add replay/interrupted recovery, abort, and the Phase 2 crash matrix.
+1. Implement four-stage sequential dispatch, raw await, and finalization through the retained prepared plan.
+2. Atomically settle a real durable tool result and advance the batch/checkpoint.
+3. Add Tier A/B/C dispatch, finalization, settlement, close, fault, and semantic-authority coverage.
+4. Independently review and rework the complete D-028 slice.
+5. Add replay/interrupted recovery, abort, and the Phase 2 crash matrix.
 
 ## Phase order
 
