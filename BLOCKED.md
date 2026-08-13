@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-029 restored tool-effect replay/interruption recovery is implemented by `22d75bde0` after corrected independent final review; durable abort is next.
+No active blocker. D-030 durable abort design is committed by `2ae7dbdd9` after corrected independent design review; implementation is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

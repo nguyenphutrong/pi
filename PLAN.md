@@ -4,17 +4,17 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.7 — Durable abort and terminal reconciliation
-- Status: D-029 restored tool recovery implemented by `22d75bde0`; Harness 355/355, root check, diff check, and corrected independent final review PASS
+- Status: D-030 design committed by `2ae7dbdd9` after corrected independent design review PASS; implementation pending
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read abort control, reconciliation, and terminal transaction sections and design D-030.
-2. Implement the durable first-abort marker and idempotent repeated abort result.
-3. Reconcile planned, restored pending, and live tool outputs without starting forbidden effects.
-4. Add abort-versus-effect/settlement/close Tier A/B/C coverage and the complete Phase 2 crash matrix.
-5. Run the Phase 2 done-bar review and Recovery/QA gate.
+1. Implement D-030's durable first-abort marker, cancelled codecs, and start gates.
+2. Reconcile cancelled assistant and planned, restored-pending, and live tool outputs.
+3. Add abort-versus-effect/settlement/finish/close Tier A/B/C coverage.
+4. Run the full Harness suite, root check, diff check, and independent final D-030 review.
+5. Run the complete Phase 2 crash matrix, done-bar review, and Recovery/QA gate.
 
 ## Phase order
 
