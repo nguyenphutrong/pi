@@ -2,7 +2,7 @@ import { createIdGenerator, isUuidV7, type Transaction } from "@nguyenphutrong/p
 import { initializeSqliteSchema, SQLITE_SCHEMA_VERSION } from "../schema.ts";
 import type { SqliteDatabase, SqliteDatabaseFactory } from "../types.ts";
 import { SqliteFileQueue } from "./file-queue.ts";
-import { type SqliteHandleMetadata, SqliteStorageHandle } from "./handle.ts";
+import { type SqliteSessionMetadata, SqliteStorageHandle, type SqliteStorageSession } from "./handle.ts";
 import { nativeTimerFactory, type TimerFactory } from "./lifecycle.ts";
 import { type PreparedTransaction, prepareTransaction } from "./prepared-transaction.ts";
 import {
@@ -142,7 +142,7 @@ export class SqliteStorageRepository {
 		void initialization.catch(() => undefined);
 	}
 
-	create(options: SqliteCreateOptions): Promise<SqliteStorageHandle> {
+	create(options: SqliteCreateOptions): Promise<SqliteStorageSession> {
 		try {
 			this.#admit();
 			const input = plain(options, ["id", "parentSessionId", "initialTransaction"], "create options");
@@ -182,7 +182,7 @@ export class SqliteStorageRepository {
 		}
 	}
 
-	open(metadata: SqliteHandleMetadata): Promise<SqliteStorageHandle> {
+	open(metadata: SqliteSessionMetadata): Promise<SqliteStorageSession> {
 		try {
 			this.#admit();
 			const input = plain(metadata, ["id", "createdAt", "storageVersion", "parentSessionId"], "metadata");
@@ -223,7 +223,7 @@ export class SqliteStorageRepository {
 		}
 	}
 
-	list(): Promise<SqliteHandleMetadata[]> {
+	list(): Promise<SqliteSessionMetadata[]> {
 		try {
 			this.#admit();
 		} catch (error) {
@@ -261,7 +261,7 @@ export class SqliteStorageRepository {
 		);
 	}
 
-	delete(metadata: SqliteHandleMetadata): Promise<{ deleted: boolean }> {
+	delete(metadata: SqliteSessionMetadata): Promise<{ deleted: boolean }> {
 		try {
 			this.#admit();
 			const input = plain(metadata, ["id", "createdAt", "storageVersion", "parentSessionId"], "metadata");
@@ -301,7 +301,7 @@ export class SqliteStorageRepository {
 		}
 	}
 
-	repairBranchProjection(metadata: SqliteHandleMetadata): Promise<void> {
+	repairBranchProjection(metadata: SqliteSessionMetadata): Promise<void> {
 		try {
 			this.#admit();
 			const input = plain(metadata, ["id", "createdAt", "storageVersion", "parentSessionId"], "metadata");
@@ -381,7 +381,7 @@ export class SqliteStorageRepository {
 		return this.#closePromise;
 	}
 
-	#register(metadata: SqliteHandleMetadata, ownerId: string, fence: number): SqliteStorageHandle {
+	#register(metadata: SqliteSessionMetadata, ownerId: string, fence: number): SqliteStorageHandle {
 		let handle: SqliteStorageHandle;
 		handle = new SqliteStorageHandle({
 			db: this.#database(),

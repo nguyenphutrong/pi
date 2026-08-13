@@ -14,8 +14,8 @@ import {
 	type SqliteDatabase,
 	type SqliteDatabaseFactory,
 	type SqliteStatement,
+	type SqliteStorageSession,
 } from "../src/index.ts";
-import type { SqliteStorageHandle } from "../src/sqlite/storage/handle.ts";
 import type { TimerFactory, TimerHandle } from "../src/sqlite/storage/lifecycle.ts";
 import { READ_REGISTERS_SQL } from "../src/sqlite/storage/ordinary-reader.ts";
 import { prepareTransaction } from "../src/sqlite/storage/prepared-transaction.ts";
@@ -62,7 +62,7 @@ class ManualTimers extends DormantTimers {
 
 interface Fixture extends OrdinaryReadConformanceFixture {
 	readonly db: SqliteDatabase;
-	readonly handle: SqliteStorageHandle;
+	readonly handle: SqliteStorageSession;
 	readonly repository: SqliteStorageRepository;
 }
 
@@ -379,7 +379,7 @@ describe("SQLite ordinary-reader invariants", () => {
 				heartbeatMs: 5,
 				timers: new DormantTimers(),
 			});
-			let handle: SqliteStorageHandle | undefined;
+			let handle: SqliteStorageSession | undefined;
 			try {
 				handle = await repositoryA.create({ id: sessionId });
 				await repositoryB.list();

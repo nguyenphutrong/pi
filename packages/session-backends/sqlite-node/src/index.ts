@@ -103,3 +103,10 @@ export function createNodeSqliteFactory(): SqliteDatabaseFactory {
 
 // Re-export the private SQLite schema and adapter boundary.
 export * from "./sqlite/index.ts";
+export type { SqliteSessionMetadata, SqliteStorageSession } from "./sqlite/storage/handle.ts";
+export type {
+	SqliteCreateOptions,
+	SqliteRepositoryErrorCode,
+	SqliteRepositoryOptions,
+} from "./sqlite/storage/repository.ts";
+export { SqliteRepositoryError, SqliteStorageRepository } from "./sqlite/storage/repository.ts";

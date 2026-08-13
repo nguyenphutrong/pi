@@ -10,10 +10,10 @@ import {
 	type SqliteDatabase,
 	type SqliteDatabaseFactory,
 	type SqliteStatement,
+	type SqliteStorageSession,
 } from "../src/index.ts";
 import { MATERIALIZE_SEGMENT_SQL } from "../src/sqlite/storage/branch-chain.ts";
 import { READ_BRANCH_PAYLOAD_SQL, READ_TYPED_BRANCH_PAYLOAD_SQL } from "../src/sqlite/storage/branch-reader.ts";
-import type { SqliteStorageHandle } from "../src/sqlite/storage/handle.ts";
 import type { TimerFactory, TimerHandle } from "../src/sqlite/storage/lifecycle.ts";
 import { SqliteStorageRepository } from "../src/sqlite/storage/repository.ts";
 import { deleteSqliteSession, isPersistedSqliteCorruption } from "../src/sqlite/storage/transaction-engine.ts";
@@ -39,7 +39,7 @@ class DormantTimers implements TimerFactory {
 
 interface Fixture extends AsyncDisposable {
 	readonly db: SqliteDatabase;
-	readonly handle: SqliteStorageHandle;
+	readonly handle: SqliteStorageSession;
 	readonly repository: SqliteStorageRepository;
 }
 
@@ -82,11 +82,11 @@ function entry(
 	};
 }
 
-async function commit(handle: SqliteStorageHandle, ...writes: Transaction["writes"]): Promise<void> {
+async function commit(handle: SqliteStorageSession, ...writes: Transaction["writes"]): Promise<void> {
 	await handle.commit({ writes });
 }
 
-function exact(entries: Awaited<ReturnType<SqliteStorageHandle["scanBranch"]>>) {
+function exact(entries: Awaited<ReturnType<SqliteStorageSession["scanBranch"]>>) {
 	return entries.map(({ id, seq, type, customType, payload }) => ({ id, seq, type, customType, payload }));
 }
 
@@ -103,7 +103,7 @@ async function expectPersistedCorruption(operation: Promise<unknown>): Promise<u
 	return terminal;
 }
 
-async function seedComplex(handle: SqliteStorageHandle): Promise<void> {
+async function seedComplex(handle: SqliteStorageSession): Promise<void> {
 	await commit(
 		handle,
 		entry(0, null),
@@ -405,7 +405,7 @@ describe("SQLite segmented branch reader", () => {
 				heartbeatMs: 5,
 				timers: new DormantTimers(),
 			});
-			let handle: SqliteStorageHandle | undefined;
+			let handle: SqliteStorageSession | undefined;
 			try {
 				handle = await repositoryA.create({ id: sessionId });
 				await repositoryB.list();

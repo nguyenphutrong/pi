@@ -3,19 +3,21 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { type JsonValue, StorageError, type Transaction } from "@nguyenphutrong/pi-session-storage";
+import { type JsonValue, type Storage, StorageError, type Transaction } from "@nguyenphutrong/pi-session-storage";
 import { describe, expect, it } from "vitest";
 import {
 	createNodeSqliteFactory,
 	initializeSqliteSchema,
 	type SqliteDatabase,
 	type SqliteDatabaseFactory,
+	SqliteRepositoryError,
+	type SqliteSessionMetadata,
 	type SqliteStatement,
+	SqliteStorageRepository,
+	type SqliteStorageSession,
 } from "../src/index.ts";
 import { SqliteFileQueue } from "../src/sqlite/storage/file-queue.ts";
-import type { SqliteStorageHandle } from "../src/sqlite/storage/handle.ts";
 import type { TimerFactory, TimerHandle } from "../src/sqlite/storage/lifecycle.ts";
-import { type SqliteRepositoryError, SqliteStorageRepository } from "../src/sqlite/storage/repository.ts";
 import {
 	acquireSqliteLease,
 	createSqliteSession,
@@ -155,8 +157,8 @@ describe("SQLite repository lifecycle", () => {
 	it("reserves parallel producers and keeps successful handles registered through promise resolution", async () => {
 		let owner = 0;
 		const { repo } = await capturedRepository({ ownerId: () => `owner-${owner++}` });
-		let created: SqliteStorageHandle | undefined;
-		let opened: SqliteStorageHandle | undefined;
+		let created: SqliteStorageSession | undefined;
+		let opened: SqliteStorageSession | undefined;
 		try {
 			const firstCreate = repo.create({ id: id1 });
 			const losingCreate = repo.create({ id: id1 });
@@ -181,7 +183,7 @@ describe("SQLite repository lifecycle", () => {
 
 	it("orders delete before create for the same id", async () => {
 		const { repo } = await capturedRepository();
-		let handle: SqliteStorageHandle | undefined;
+		let handle: SqliteStorageSession | undefined;
 		try {
 			handle = await repo.create({ id: id1 });
 			const metadata = handle.metadata;
@@ -306,8 +308,8 @@ describe("SQLite repository lifecycle", () => {
 	it("rejects missing segment creation membership on the exact-tip path, rolls back, and seals its handle", async () => {
 		let owner = 0;
 		const { repo, db } = await capturedRepository({ ownerId: () => `owner-${owner++}` });
-		let affected: SqliteStorageHandle | undefined;
-		let sibling: SqliteStorageHandle | undefined;
+		let affected: SqliteStorageSession | undefined;
+		let sibling: SqliteStorageSession | undefined;
 		try {
 			affected = await repo.create({ id: id1 });
 			sibling = await repo.create({ id: id2 });
@@ -563,8 +565,8 @@ describe("SQLite repository lifecycle", () => {
 			})(),
 			timers,
 		});
-		let first: SqliteStorageHandle | undefined;
-		let second: SqliteStorageHandle | undefined;
+		let first: SqliteStorageSession | undefined;
+		let second: SqliteStorageSession | undefined;
 		try {
 			first = await repo.create({ id: id1 });
 			second = await repo.create({ id: id2 });
@@ -590,8 +592,8 @@ describe("SQLite repository lifecycle", () => {
 	it("faults only the source handle for persisted canonical corruption", async () => {
 		let owner = 0;
 		const { repo, db } = await capturedRepository({ ownerId: () => `owner-${owner++}` });
-		let first: SqliteStorageHandle | undefined;
-		let second: SqliteStorageHandle | undefined;
+		let first: SqliteStorageSession | undefined;
+		let second: SqliteStorageSession | undefined;
 		try {
 			first = await repo.create({ id: id1 });
 			second = await repo.create({ id: id2 });
@@ -659,8 +661,8 @@ describe("SQLite repository lifecycle", () => {
 			ownerId: () => `owner-${owner++}`,
 			timers: new FakeTimers(),
 		});
-		let h1: SqliteStorageHandle | undefined;
-		let h2: SqliteStorageHandle | undefined;
+		let h1: SqliteStorageSession | undefined;
+		let h2: SqliteStorageSession | undefined;
 		try {
 			h1 = await repo.create({ id: id1 });
 			h2 = await repo.create({ id: id2 });
@@ -824,8 +826,8 @@ describe("SQLite repository lifecycle", () => {
 			heartbeatMs: 5,
 			timers: timers2,
 		});
-		let stale: SqliteStorageHandle | undefined;
-		let replacement: SqliteStorageHandle | undefined;
+		let stale: SqliteStorageSession | undefined;
+		let replacement: SqliteStorageSession | undefined;
 		try {
 			stale = await repo1.create({ id: id1 });
 			now = 109;
@@ -870,7 +872,7 @@ describe("SQLite repository lifecycle", () => {
 			heartbeatMs: 5,
 			timers: new FakeTimers(),
 		});
-		let stale: SqliteStorageHandle | undefined;
+		let stale: SqliteStorageSession | undefined;
 		try {
 			stale = await repo1.create({ id: id1 });
 			const metadata = stale.metadata;
@@ -950,18 +952,54 @@ describe("SQLite lease boundaries", () => {
 });
 
 describe("SQLite lifecycle module boundary", () => {
-	it("keeps lifecycle private and transaction ownership confined to the engine after schema", () => {
+	it("exports only the complete repository integration seam and keeps internals private", async () => {
 		const root = dirname(fileURLToPath(import.meta.url));
 		const sourceRoot = join(root, "../src");
 		const rootIndex = readFileSync(join(sourceRoot, "index.ts"), "utf8");
 		const sqliteIndex = readFileSync(join(sourceRoot, "sqlite/index.ts"), "utf8");
-		expect(rootIndex).not.toMatch(/storage\/|SqliteStorageRepository|SqliteStorageHandle/);
-		expect(sqliteIndex).not.toMatch(/storage\/|SqliteStorageRepository|SqliteStorageHandle/);
-		for (const name of ["file-queue.ts", "handle.ts", "lifecycle.ts", "prepared-transaction.ts", "repository.ts"])
-			expect(readFileSync(join(sourceRoot, "sqlite/storage", name), "utf8"), name).not.toMatch(/\.transaction\s*\(/);
-		const engine = readFileSync(join(sourceRoot, "sqlite/storage/transaction-engine.ts"), "utf8");
-		expect(engine).toMatch(/\.transaction\s*\(/);
-		for (const forbidden of ["record", "reducer", "history", "branch", "Harness"])
-			expect(`${rootIndex}\n${sqliteIndex}`).not.toContain(forbidden);
+		const { repo } = await capturedRepository();
+		let handle: SqliteStorageSession | undefined;
+		try {
+			const create: (options: Parameters<SqliteStorageRepository["create"]>[0]) => Promise<SqliteStorageSession> =
+				SqliteStorageRepository.prototype.create;
+			const open: (metadata: SqliteSessionMetadata) => Promise<SqliteStorageSession> =
+				SqliteStorageRepository.prototype.open;
+			void create;
+			void open;
+			handle = await repo.create({ id: id1 });
+			const storage: Storage = handle;
+			void storage;
+			expect(rootIndex).toMatch(/SqliteStorageRepository/);
+			expect(rootIndex).toMatch(/SqliteRepositoryError/);
+			expect(rootIndex).toMatch(/SqliteStorageSession/);
+			expect(rootIndex).toMatch(/SqliteSessionMetadata/);
+			expect(rootIndex).not.toMatch(
+				/SqliteStorageHandle|transaction-engine|file-queue|lifecycle|prepared-transaction|branch-reader|ordinary-reader/,
+			);
+			expect(sqliteIndex).not.toMatch(/storage\/|SqliteStorageRepository|SqliteStorageHandle/);
+			const publicModule = await import("../src/index.ts");
+			expect(publicModule.SqliteStorageRepository).toBe(SqliteStorageRepository);
+			expect(publicModule.SqliteRepositoryError).toBe(SqliteRepositoryError);
+			for (const forbidden of [
+				"SqliteStorageHandle",
+				"SqliteFileQueue",
+				"SqliteTransactionEngine",
+				"SqliteRepairEngine",
+				"PreparedTransaction",
+				"TimerFactory",
+			])
+				expect(publicModule).not.toHaveProperty(forbidden);
+			for (const name of ["file-queue.ts", "handle.ts", "lifecycle.ts", "prepared-transaction.ts", "repository.ts"])
+				expect(readFileSync(join(sourceRoot, "sqlite/storage", name), "utf8"), name).not.toMatch(
+					/\.transaction\s*\(/,
+				);
+			const engine = readFileSync(join(sourceRoot, "sqlite/storage/transaction-engine.ts"), "utf8");
+			expect(engine).toMatch(/\.transaction\s*\(/);
+			for (const forbidden of ["record", "reducer", "history", "branch", "Harness"])
+				expect(`${rootIndex}\n${sqliteIndex}`).not.toContain(forbidden);
+		} finally {
+			await handle?.close().catch(() => undefined);
+			await repo.close().catch(() => undefined);
+		}
 	});
 });

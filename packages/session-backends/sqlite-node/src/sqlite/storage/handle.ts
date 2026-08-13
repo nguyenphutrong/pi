@@ -11,6 +11,7 @@ import {
 	isUuidV7,
 	type Register,
 	type SessionStats,
+	type Storage,
 	StorageError,
 	type Transaction,
 	type UsageRow,
@@ -37,18 +38,22 @@ import {
 	SqliteEngineError,
 } from "./transaction-engine.ts";
 
-export interface SqliteHandleMetadata {
+export interface SqliteSessionMetadata {
 	readonly id: string;
 	readonly createdAt: number;
 	readonly storageVersion: number;
 	readonly parentSessionId?: string;
 }
 
+export interface SqliteStorageSession extends Storage {
+	readonly metadata: SqliteSessionMetadata;
+}
+
 interface HandleOptions {
 	db: SqliteDatabase;
 	queue: SqliteFileQueue;
 	lease: LeaseIdentity;
-	metadata: SqliteHandleMetadata;
+	metadata: SqliteSessionMetadata;
 	now: () => number;
 	ttlMs: number;
 	heartbeatMs: number;
@@ -57,7 +62,7 @@ interface HandleOptions {
 }
 
 export class SqliteStorageHandle {
-	readonly metadata: SqliteHandleMetadata;
+	readonly metadata: SqliteSessionMetadata;
 	readonly #options: HandleOptions;
 	#sealed = false;
 	#terminal: unknown;
