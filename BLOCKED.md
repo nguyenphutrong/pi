@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. D-050 increment 4.2b is complete; durable `inbox.writes` hydration, cancellation, and cleanup are next.
+No active blockers. D-050 increment 4.2c is complete; active write admission and atomic placement are next.
 
 ## B-016 — Choose the custom-entry projector timing contract
 
