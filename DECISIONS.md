@@ -678,7 +678,7 @@ Commit `e6e6b1cd0` implements the complete boundary. Recovery and retry-release 
 
 - Date: 2026-08-13
 - Phase: 2
-- Status: approved by independent design review; implementation pending
+- Status: implemented by `929407e39` after independent final review
 - References: D-024–D-025; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.7–3.8, 4.1, 4.4–4.5, 9.1–9.3; `packages/agent/docs/harness-v2.md` tool-batch crash catalog
 
 ### Options
@@ -702,3 +702,5 @@ Restore hydrates the batch's assistant entry and any completed result entries by
 Option 1 carries a superseded v2 record-era crash prefix into the v3 register state machine and requires a new intermediate state solely for implementation sequencing. Option 3 cannot know call count or order before the provider response and would create unused reservations. Neither is acceptable.
 
 This item changes no Storage contract, provider adapter, `pi-ai` surface, public Harness API, or private `agent-loop` behavior. Clearance, `op.tool_args`, replay, dispatch, tool settlement, abort, genuine-length explanatory results, and batch completion remain later Phase 2 work.
+
+Commit `929407e39` implements the complete boundary. Tool-bearing `stop`, `toolUse`, and genuine output-limit `length` responses commit response, leaf, usage, and complete planned batch atomically; below-limit `length`, errors, and deferred responses remain later classification work. Result ids are follower UUIDv7s and restore validates their timestamp relationship, exact source ordering, planned non-materialization, assistant closure, and lane/latest identity without scans, identity resolution, or writes. Harness runtime passes 283/283, `npm run check` and `git diff --check` pass, and the fresh independent final review reports PASS.

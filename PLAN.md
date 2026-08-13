@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.4 — First complete durable tool-plan commit
-- Status: D-026 committed by `09c57bf49` after independent design review; implementation is next
+- Work item: 2.5 — Durable sequential tool clearance and settlement
+- Status: item 2.4 implemented by `929407e39` after independent final review; clearance design is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement and test the complete durable tool-plan settlement before clearance or effects.
-2. Independently review the implementation against D-026 and the exact writer transaction.
-3. Add durable clearance, persisted effective arguments, replay policy, and sequential tool settlement.
-4. Add durable abort/reconciliation after sequential tool states are abort-ready.
-5. Add close/reopen crash matrices at every Phase 2 commit boundary and run the done-bar gate.
+1. Re-read tool clearance, effect, settlement, and recovery sections and design the smallest durable sequential slice.
+2. Persist effective arguments and replay declaration atomically before dispatch.
+3. Execute/finalize one call at a time and atomically settle its reserved result, optional usage, and total state.
+4. Add restored safe replay versus synthetic interrupted settlement and complete-batch checkpoint cleanup.
+5. Add durable abort/reconciliation, then close/reopen crash matrices and the Phase 2 done-bar gate.
 
 ## Phase order
 
