@@ -2,7 +2,29 @@
 
 ## Current status
 
-No active blockers. Phase 4.1 is complete at `219526a1a`; deferred tree writes are next.
+Phase 4.2 is blocked by B-016. Phase 4.1 remains complete at `219526a1a`.
+
+## B-016 — Choose the custom-entry projector timing contract
+
+- Date: 2026-08-13
+- Phase: 4
+- Work item: 4.2 — deferred tree writes design
+- Trigger: a major, hard-to-reverse public callback or Storage contract decision; the current spec requires mutually unavailable precommit and postcommit information
+- Status: awaiting human decision; no deferred-write code has been written
+
+### Context
+
+The placement transaction must atomically choose between projection-dependent state transitions. However, `EntryProjector` receives a complete `CustomEntry` whose `seq` and `timestamp` are assigned only when that same transaction commits. Current `Storage.commit()` returns those values afterward and exposes no precommit reservation. Projecting after commit creates a crash gap; fabricating metadata violates the callback contract. Focused design analysis found no contract-preserving implementation.
+
+### Decision needed
+
+1. **Recommended:** projector input becomes `Omit<CustomEntry, "seq" | "timestamp">`. Projection remains deterministic and atomic without changing Storage.
+2. Preserve complete `CustomEntry`; add an atomic precommit Storage transaction-builder/reservation across every backend.
+3. Treat registered-projector presence as projecting even if it returns `undefined`. This changes specified behavior and is not recommended.
+
+### Resume point
+
+After selection, update D-050 with the exact selected callback/storage contract, complete the remaining deferred-write transaction/action/race design, obtain fresh independent design review, then implement. Do not write production code before that review passes.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 

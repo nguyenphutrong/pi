@@ -4,13 +4,13 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.2 — Deferred tree writes design
-- Status: Phase 4.1 queue durability is complete; re-read the deferred-write, recovery, public API, and testing sections before producing concrete design options
+- Status: blocked by B-016; the spec requires a complete committed `CustomEntry` for projection while the same placement transaction must already encode the projection-dependent next state
 - Done bar: an approved design fixes durable admission, cancellation, checkpoint consumption, placement ordering, recovery validation, and Tier A/B/C evidence for deferred tree writes without widening the Storage contract or reintroducing history-derived recovery
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design deferred tree writes and obtain independent design approval.
+1. Resolve B-016, correct D-050, and obtain independent deferred-write design approval.
 2. Implement the approved deferred-write vertical slice with Tier A/B/C coverage.
 3. Add `waitForIdle` and `runWhenIdle`.
 4. Complete whole-Phase-4 acceptance and independent done-bar review.

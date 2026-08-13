@@ -1441,3 +1441,24 @@ Fresh independent design review verifies both earlier findings are closed and ev
 Implementation uses three dedicated test files and no production seam. The first implementation review correctly rejected a `toolStarts` counter that was not connected to RuntimeShell. The corrected fixture registers a real `RuntimeToolDefinition` spy on every initial, recovery, and final-idle shell, so zero tool starts is observed at the effect boundary rather than assumed. A fresh independent review confirms that finding is closed and the complete S0–S4 grammar, exact durable oracle, fencing, effect, and idle-write requirements pass.
 
 Focused queue/process recovery passes 40/40, the complete Harness runtime passes 562/562, `npm run check` passes, and `git diff --check` passes. Phase 4.1 is complete; deferred tree writes are next.
+
+## D-050 — Resolve custom-entry projection before atomic placement
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: blocked by B-016 pending a human contract decision
+- References: D-047–D-049; `packages/agent/docs/harness-v3.md` §§1.1, 1.4, 2.2, 3.11–3.12, 5.2
+
+### Problem
+
+Deferred custom writes must decide whether they project into provider context. A projecting write atomically enters `need_assistant(false)` and resets overflow recovery; an unprojected write preserves the complete prior continuation. The same placement transaction inserts the entry, deletes its `pending.entry` register, moves the leaf, and writes that projection-dependent total operation state.
+
+The specified `EntryProjector` receives a complete `CustomEntry`, including storage-assigned `seq` and `timestamp`. Those fields exist only in `CommitResult`, after the transaction has already been constructed and committed. The current Storage contract has no precommit metadata reservation or transaction-builder callback. Computing projection after commit creates a crash gap and breaks register/entry exclusivity; fabricating or omitting fields violates the projector contract.
+
+### Options
+
+1. Change the projector input to precommit custom-entry content, `Omit<CustomEntry, "seq" | "timestamp">`. The same deterministic input is available before placement and later during context projection. This is the recommended smallest durable design, but it changes the specified public callback capability.
+2. Preserve complete `CustomEntry` and extend Storage with an atomic precommit transaction builder/reservation that assigns exact sequence and timestamp before invoking the asynchronous projector. This preserves projector capability but changes every backend and holds writer ownership across application code.
+3. Define any custom type with a registered projector as projecting, regardless of whether the callback later returns `undefined`. This needs no contract change but violates the specified unprojected behavior and can trigger a provider request with no new projected context; not recommended.
+
+A separate durable projection intermediate does not solve the input-timing problem and also breaks atomic placement semantics. Independent focused analysis found no contract-preserving fifth path. Phase 4.2 must not implement a preview cast, second state commit, or new durable intermediate before B-016 is resolved.
