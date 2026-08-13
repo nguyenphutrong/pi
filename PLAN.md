@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.2a — Rename the backend-neutral Session implementation to `StoredSession`
-- Status: D-032 SQLite/storage/repository/lease design passed the independent design gate; implementation has not started
+- Status: D-032 SQLite/storage/repository/lease design committed as `4d48660dd` after the independent design gate; implementation has not started
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
