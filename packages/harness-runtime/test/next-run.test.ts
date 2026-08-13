@@ -3,7 +3,7 @@ import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { MemorySessionRepo } from "../src/repo.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { StoredSession } from "../src/session.ts";
 import { id, user } from "./fixtures.ts";
 
@@ -89,7 +89,7 @@ describe("lane-owned next-run queue", () => {
 		]);
 		expect(cancelled.attachment.laneState.value.pendingNextRun).toEqual([]);
 		expect(cancelled.outcome).toBe("cancelled");
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 	});
 
 	it("writes exact FIFO capture order, caller-only intent, sequence offsets, and optional skip", async () => {
@@ -118,7 +118,7 @@ describe("lane-owned next-run queue", () => {
 				triggerEntryId: callerIds[1],
 				...(pendingCount === 0 ? {} : { skipInboxOnce: true }),
 			});
-			await session.close();
+			await closeAttachedRuntime(session);
 		}
 	});
 
@@ -127,7 +127,7 @@ describe("lane-owned next-run queue", () => {
 		await session.nextRun(user("captured"));
 		const accepted = await session.acceptPrompt(promptTransition(attachment));
 		if (accepted.status !== "committed") throw new Error("Prompt was not committed");
-		await session.close();
+		await closeAttachedRuntime(session);
 		const reopened = await repo.open(session.metadata);
 		if (!(reopened instanceof StoredSession)) throw new Error("Expected StoredSession");
 		const restored = await attachRuntime(reopened, configuration);
@@ -145,7 +145,7 @@ describe("lane-owned next-run queue", () => {
 			retryPolicy: { maxAttempts: 1, baseDelayMs: 0 },
 		});
 		expect(ready.attachment.runState!.value.phase).not.toHaveProperty("skipInboxOnce");
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 	});
 
 	it.each([
@@ -203,7 +203,7 @@ describe("lane-owned next-run queue", () => {
 		const queued = await session.nextRun(caller);
 		caller.content[0] = { type: "text", text: "changed" };
 		expect(queued.attachment.pendingEntries.get(queued.entryId!)?.payload).toEqual(user("queued"));
-		await session.close();
+		await closeAttachedRuntime(session);
 
 		const reopened = await repo.open(session.metadata);
 		if (!(reopened instanceof StoredSession)) throw new Error("Expected StoredSession");
@@ -212,7 +212,7 @@ describe("lane-owned next-run queue", () => {
 		expect(restored.entries.has(queued.entryId!)).toBe(false);
 		expect((await reopened.cancelQueued(queued.entryId!)).outcome).toBe("cancelled");
 		expect((await reopened.cancelQueued(queued.entryId!)).outcome).toBe("not_found");
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 	});
 
 	it("publishes pending entries through an immutable runtime map with detached nested messages", async () => {
@@ -238,7 +238,7 @@ describe("lane-owned next-run queue", () => {
 		returned.content[0] = { type: "text", text: "mutated" };
 		const refreshed = await session.refreshRuntimeAttachment();
 		expect(refreshed.pendingEntries.get(queued.entryId!)?.payload).toEqual(user("immutable"));
-		await session.close();
+		await closeAttachedRuntime(session);
 	});
 
 	it.each(["operation", "caller"] as const)(
@@ -269,7 +269,7 @@ describe("lane-owned next-run queue", () => {
 			expect(current.mainLeaf).toEqual(attachment.mainLeaf);
 			expect(current.entries.has(fresh)).toBe(false);
 			expect(current.pendingEntries.get(queued.entryId!)?.payload).toEqual(user("captured"));
-			await session.close();
+			await closeAttachedRuntime(session);
 		},
 	);
 
@@ -314,7 +314,7 @@ describe("lane-owned next-run queue", () => {
 			kind: "assistant",
 			generation: { status: "ready" },
 		});
-		await session.close();
+		await closeAttachedRuntime(session);
 	});
 
 	it("accepts a prompt after next-run then cancellation restore the pending authority", async () => {
@@ -326,7 +326,7 @@ describe("lane-owned next-run queue", () => {
 		if (accepted.status !== "committed") throw new Error("Prompt was not committed");
 		expect(accepted.attachment.laneState.value.pendingNextRun).toEqual([]);
 		expect(accepted.attachment.entries.has(queued.entryId!)).toBe(false);
-		await session.close();
+		await closeAttachedRuntime(session);
 	});
 
 	it("serializes next-run and prompt in both exact commit orders", async () => {
@@ -347,7 +347,7 @@ describe("lane-owned next-run queue", () => {
 				expect(current.laneState.value.pendingNextRun).toEqual([late.entryId]);
 				expect(current.pendingEntries.get(late.entryId!)?.payload).toEqual(user("queued"));
 			}
-			await session.close();
+			await closeAttachedRuntime(session);
 		}
 	});
 
@@ -363,7 +363,7 @@ describe("lane-owned next-run queue", () => {
 			expect(current.laneState.value.pendingNextRun).toEqual([]);
 			expect(current.pendingEntries.size).toBe(0);
 			expect(accepted.attachment.entries.has(queued.entryId!)).toBe(first === "prompt");
-			await session.close();
+			await closeAttachedRuntime(session);
 		}
 	});
 

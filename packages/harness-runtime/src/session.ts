@@ -1,6 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AssistantMessage, Message, ToolCall, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import {
+	assertIdList,
 	assertJsonValue,
 	assertRegister,
 	assertUsageRow,
@@ -111,6 +112,35 @@ function validateQuery(query: unknown, branch: boolean): asserts query is EntryQ
 		throw new SessionError("invalid_query", 'stopAtType must be "message" or "custom"');
 	if (query.stopAtId !== undefined && (typeof query.stopAtId !== "string" || !isUuidV7(query.stopAtId)))
 		throw new SessionError("invalid_query", "stopAtId must be a UUIDv7");
+}
+
+export function captureEntryId(id: unknown): string {
+	if (typeof id !== "string" || !isUuidV7(id)) throw new SessionError("invalid_query", "entry id must be a UUIDv7");
+	return id;
+}
+
+export function captureEntryIds(ids: unknown): string[] {
+	try {
+		assertIdList(ids, "entry");
+	} catch (error) {
+		throw storageFailure(error);
+	}
+	for (const id of ids) captureEntryId(id);
+	return [...ids];
+}
+
+export function captureEntryQuery(query: unknown, branch: boolean): EntryQuery & Partial<BranchBounds> {
+	validateQuery(query, branch);
+	return Object.freeze({
+		...(query.type === undefined ? {} : { type: query.type }),
+		...(query.customType === undefined ? {} : { customType: query.customType }),
+		...(query.order === undefined ? {} : { order: query.order }),
+		...(query.limit === undefined ? {} : { limit: query.limit }),
+		...(query.cursor === undefined ? {} : { cursor: Object.freeze({ seq: query.cursor.seq }) }),
+		...(query.start === undefined ? {} : { start: query.start }),
+		...(query.stopAtType === undefined ? {} : { stopAtType: query.stopAtType }),
+		...(query.stopAtId === undefined ? {} : { stopAtId: query.stopAtId }),
+	});
 }
 
 function decodeMainLeafRegister(candidate: unknown): CurrentRegister<string | null> {
@@ -942,6 +972,18 @@ export type PrepareAssistantEffectResult =
 			readonly usageId?: undefined;
 	  };
 
+export interface RuntimeOwner {
+	readonly attachment: RuntimeAttachment;
+	readonly appendMessage: (message: Message) => Promise<RuntimeAppendResult>;
+	readonly appendCustomEntry: (customType: string, data?: JsonValue) => Promise<RuntimeAppendResult>;
+	readonly close: () => Promise<void>;
+}
+
+export interface RuntimeAppendResult {
+	readonly entryId: string;
+	readonly attachment: RuntimeAttachment;
+}
+
 export class StoredSession implements Session {
 	readonly metadata: SessionMetadata;
 	readonly idGenerator: IdGenerator;
@@ -951,6 +993,7 @@ export class StoredSession implements Session {
 	#mutationLine: Promise<void> = Promise.resolve();
 	#closePromise: Promise<void> | undefined;
 	#runtimeAttached = false;
+	#runtimeAttaching = false;
 
 	constructor(metadata: SessionMetadata, storage: Storage, release: () => void) {
 		this.metadata = metadata;
@@ -963,7 +1006,7 @@ export class StoredSession implements Session {
 		if (this.#sealed) throw new SessionError("closed", "Session is closed");
 	}
 
-	attachRuntime(seed: LaneConfiguration): Promise<RuntimeAttachment> {
+	attachRuntime(seed: LaneConfiguration): Promise<RuntimeOwner> {
 		this.#assertOpen();
 		let encodedSeed: ReturnType<typeof encodeLaneConfiguration>;
 		try {
@@ -971,8 +1014,9 @@ export class StoredSession implements Session {
 		} catch (error) {
 			return Promise.reject(error);
 		}
-		if (this.#runtimeAttached) return Promise.reject(new SessionError("active", "A runtime is already attached"));
-		this.#runtimeAttached = true;
+		if (this.#runtimeAttached || this.#runtimeAttaching)
+			return Promise.reject(new SessionError("active", "A runtime is already attached"));
+		this.#runtimeAttaching = true;
 		const operation = this.#mutationLine.then(async () => {
 			const [configuration, state, leaf] = await Promise.all([
 				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
@@ -1014,13 +1058,31 @@ export class StoredSession implements Session {
 				runState = decodeRunStateRegister(currentState, operationId);
 			}
 			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, laneState, runOperation, runState);
-			return Object.freeze({ laneConfiguration, laneState, mainLeaf, runOperation, runState, ...hydrated });
+			const attachment = Object.freeze({
+				laneConfiguration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			const owner = Object.freeze({
+				attachment,
+				appendMessage: (message: Message) => this.#appendRuntimeMessage(message),
+				appendCustomEntry: (customType: string, data?: JsonValue) =>
+					this.#appendRuntimeCustomEntry(customType, data),
+				close: () => this.#close(),
+			});
+			this.#runtimeAttached = true;
+			this.#runtimeAttaching = false;
+			return owner;
 		});
 		this.#mutationLine = operation.then(
 			() => undefined,
 			() => undefined,
 		);
 		return operation.catch((error) => {
+			this.#runtimeAttaching = false;
 			throw storageFailure(error);
 		});
 	}
@@ -3340,6 +3402,12 @@ export class StoredSession implements Session {
 	}
 
 	appendMessage(message: Message): Promise<string> {
+		if (this.#runtimeAttaching || this.#runtimeAttached)
+			return Promise.reject(new SessionError("active", "Session tree writes are owned by the attached runtime"));
+		return this.#appendMessage(message);
+	}
+
+	#appendMessage(message: Message): Promise<string> {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		let payload: ReturnType<typeof encodeMessage>;
 		let id: string;
@@ -3374,7 +3442,25 @@ export class StoredSession implements Session {
 			});
 	}
 
+	#appendRuntimeMessage(message: Message): Promise<RuntimeAppendResult> {
+		let payload: ReturnType<typeof encodeMessage>;
+		let captured: Message;
+		try {
+			payload = encodeMessage(message);
+			captured = structuredClone(message);
+		} catch (error) {
+			return Promise.reject(storageFailure(error));
+		}
+		return this.#appendRuntimeEntry({ type: "message", payload, captured });
+	}
+
 	appendCustomEntry(customType: string, data?: JsonValue): Promise<string> {
+		if (this.#runtimeAttaching || this.#runtimeAttached)
+			return Promise.reject(new SessionError("active", "Session tree writes are owned by the attached runtime"));
+		return this.#appendCustomEntry(customType, data);
+	}
+
+	#appendCustomEntry(customType: string, data?: JsonValue): Promise<string> {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		let pending: Extract<PendingEntry, { type: "custom" }>;
 		let id: string;
@@ -3420,6 +3506,97 @@ export class StoredSession implements Session {
 			});
 	}
 
+	#appendRuntimeCustomEntry(customType: string, data?: JsonValue): Promise<RuntimeAppendResult> {
+		let pending: Extract<PendingEntry, { type: "custom" }>;
+		try {
+			pending = decodePendingEntry(
+				encodePendingEntry(
+					data === undefined ? { type: "custom", customType } : { type: "custom", customType, payload: data },
+				),
+			) as Extract<PendingEntry, { type: "custom" }>;
+		} catch (error) {
+			return Promise.reject(storageFailure(error));
+		}
+		return this.#appendRuntimeEntry({ type: "custom", pending });
+	}
+
+	#appendRuntimeEntry(
+		entry:
+			| { readonly type: "message"; readonly payload: ReturnType<typeof encodeMessage>; readonly captured: Message }
+			| { readonly type: "custom"; readonly pending: Extract<PendingEntry, { type: "custom" }> },
+	): Promise<RuntimeAppendResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const id = this.idGenerator.next();
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			decodeIdleMainStateRegister({
+				namespace: STATE_NAMESPACE,
+				key: MAIN,
+				seq: attachment.laneState.seq,
+				value: attachment.laneState.value as unknown as JsonValue,
+			});
+			const parentId = attachment.mainLeaf.value;
+			const committed = await this.#storage.commit({
+				writes: [
+					entry.type === "message"
+						? { kind: "entry", entry: { id, parentId, type: "message", payload: entry.payload } }
+						: {
+								kind: "entry",
+								entry: {
+									id,
+									parentId,
+									type: "custom",
+									customType: entry.pending.customType,
+									...(Object.hasOwn(entry.pending, "payload")
+										? { payload: structuredClone(entry.pending.payload) }
+										: {}),
+								},
+							},
+					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: id },
+				],
+			});
+			const entries = new Map(attachment.entries);
+			entries.set(
+				id,
+				entry.type === "message"
+					? Object.freeze({
+							id,
+							parentId,
+							seq: committed.seqs[0],
+							timestamp: committed.timestamp,
+							type: "message",
+							message: structuredClone(entry.captured),
+						})
+					: Object.freeze({
+							id,
+							parentId,
+							seq: committed.seqs[0],
+							timestamp: committed.timestamp,
+							type: "custom",
+							customType: entry.pending.customType,
+							...(Object.hasOwn(entry.pending, "payload")
+								? { data: structuredClone(entry.pending.payload) }
+								: {}),
+						}),
+			);
+			return Object.freeze({
+				entryId: id,
+				attachment: Object.freeze({
+					...attachment,
+					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: id }),
+					entries: new ImmutableMap(entries),
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
 	async projectBuiltinContext(): Promise<Message[]> {
 		this.#assertOpen();
 		const entries = await this.findEntriesOnBranch({ order: "oldestFirst" });
@@ -3432,6 +3609,12 @@ export class StoredSession implements Session {
 	}
 
 	close(): Promise<void> {
+		if (this.#runtimeAttaching || this.#runtimeAttached)
+			return Promise.reject(new SessionError("active", "Session lifecycle is owned by the attached runtime"));
+		return this.#close();
+	}
+
+	#close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#sealed = true;
 		this.#closePromise = this.#mutationLine

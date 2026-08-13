@@ -7,7 +7,7 @@ import {
 	SessionError,
 	type SessionMetadata,
 } from "../src/index.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { id, user, ZERO_USAGE } from "./fixtures.ts";
 
 const configuration = (): LaneConfiguration => ({
@@ -64,7 +64,7 @@ describe("MemorySessionRepo", () => {
 		expect(firstAttachment.laneConfiguration.seq).toBe(firstAttachment.laneState.seq + 1);
 		expect(firstAttachment.runOperation).toBeUndefined();
 		expect(firstAttachment.runState).toBeUndefined();
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 
 		const reopenedAgain = await repo.open(session.metadata);
 		const secondAttachment = await attachRuntime(reopenedAgain, {
@@ -76,7 +76,7 @@ describe("MemorySessionRepo", () => {
 		expect(secondAttachment.laneConfiguration).toEqual(firstAttachment.laneConfiguration);
 		expect(secondAttachment.runOperation).toBeUndefined();
 		expect(secondAttachment.runState).toBeUndefined();
-		await reopenedAgain.close();
+		await closeAttachedRuntime(reopenedAgain);
 
 		const mutable = await repo.open(session.metadata);
 		await mutable.appendMessage(user("first"));

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import type { ActionInfo } from "../src/planner.ts";
 import { SqliteSessionRepo } from "../src/repo.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { createRuntimeShell, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
 import type { Entry, MessageEntry, Session, SessionMetadata } from "../src/types.ts";
 import { user, ZERO_USAGE } from "./fixtures.ts";
@@ -140,7 +140,7 @@ async function freshLifecycle(
 		expect([...attached.entries.keys()]).toEqual([terminalLeaf]);
 		expect(attached.entries.get(terminalLeaf)).toMatchObject({ id: terminalLeaf, message: { role: "assistant" } });
 	} finally {
-		await inspection?.close();
+		if (inspection) await closeAttachedRuntime(inspection);
 		await inspectionRepo.close();
 	}
 	const afterAttachment = evidence(path, metadata.id);

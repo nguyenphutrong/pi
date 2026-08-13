@@ -23,13 +23,13 @@ import {
 	prepareToolCall,
 } from "@nguyenphutrong/pi-agent-loop";
 import { isUuidV7, type JsonValue } from "@nguyenphutrong/pi-session-storage";
-import { encodeMessage } from "./codec.ts";
+import { decodePendingEntry, encodeMessage, encodePendingEntry } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction, toolEffectKey } from "./planner.ts";
 import {
 	acceptPrompt,
-	attachRuntime,
 	cancelQueued,
+	claimRuntime,
 	clearToolCall,
 	consumeOperationQueue,
 	finishRun,
@@ -47,8 +47,16 @@ import {
 	startToolEffect,
 } from "./runtime-port.ts";
 import { RuntimeSettingsOwner } from "./runtime-settings.ts";
-import type { ClearToolCallOutcome, RuntimeAttachment } from "./session.ts";
-import type { Session } from "./types.ts";
+import {
+	type ClearToolCallOutcome,
+	captureEntryId,
+	captureEntryIds,
+	captureEntryQuery,
+	type RuntimeAppendResult,
+	type RuntimeAttachment,
+	type RuntimeOwner,
+} from "./session.ts";
+import type { Session, SessionTree } from "./types.ts";
 
 export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed" | "fault";
 
@@ -209,6 +217,8 @@ function captureToolDefinitions<TContext extends object | undefined>(
 
 export class RuntimeShell<TContext extends object | undefined = object | undefined> {
 	readonly #session: Session;
+	readonly #owner: RuntimeOwner;
+	readonly session: SessionTree;
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
 	readonly #toolDefinitions: ReadonlyMap<string, RuntimeToolDefinition<TContext>>;
@@ -231,12 +241,71 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	constructor(
 		session: Session,
 		settings: RuntimeSettingsOwner,
-		attachment: RuntimeAttachment,
+		owner: RuntimeOwner,
 		options: RuntimeShellOptions<TContext>,
 	) {
 		this.#session = session;
+		this.#owner = owner;
+		const facade: SessionTree = {
+			getLeafId: () => this.#admit(() => session.getLeafId()),
+			getEntry: (id) =>
+				this.#captureThenAdmit(
+					() => captureEntryId(id),
+					(captured) => session.getEntry(captured),
+				),
+			getEntries: (ids) =>
+				this.#captureThenAdmit(
+					() => captureEntryIds(ids),
+					(captured) => session.getEntries(captured),
+				),
+			getStats: () => this.#admit(() => session.getStats()),
+			findEntries: (query) =>
+				this.#captureThenAdmit(
+					() => captureEntryQuery(query === undefined ? {} : query, false),
+					(captured) => session.findEntries(captured),
+				),
+			findEntry: (query) =>
+				this.#captureThenAdmit(
+					() => captureEntryQuery(query === undefined ? {} : query, false),
+					(captured) => session.findEntry(captured),
+				),
+			findEntriesOnBranch: (query) =>
+				this.#captureThenAdmit(
+					() => captureEntryQuery(query === undefined ? {} : query, true),
+					(captured) => session.findEntriesOnBranch(captured),
+				),
+			findEntryOnBranch: (query) =>
+				this.#captureThenAdmit(
+					() => captureEntryQuery(query === undefined ? {} : query, true),
+					(captured) => session.findEntryOnBranch(captured),
+				),
+			appendMessage: (message) =>
+				this.#captureThenAdmit(
+					() => encodeMessage(message) as unknown as Message,
+					(captured) => this.#appendIdle(() => owner.appendMessage(captured)),
+				),
+			appendCustomEntry: (customType, data) =>
+				this.#captureThenAdmit(
+					() => {
+						const captured = decodePendingEntry(
+							encodePendingEntry(
+								data === undefined
+									? { type: "custom", customType }
+									: { type: "custom", customType, payload: data },
+							),
+						);
+						if (captured.type !== "custom") throw new Error("Captured custom entry changed type");
+						return {
+							customType: captured.customType,
+							data: Object.hasOwn(captured, "payload") ? captured.payload : undefined,
+						};
+					},
+					(captured) => this.#appendIdle(() => owner.appendCustomEntry(captured.customType, captured.data)),
+				),
+		};
+		this.session = Object.freeze(facade);
 		this.#settings = settings;
-		this.#current = attachment;
+		this.#current = owner.attachment;
 		this.#models = options.models;
 		this.#toolDefinitions = captureToolDefinitions(options.tools ?? []);
 		this.#toolContext = options.toolContext;
@@ -313,9 +382,41 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return this.#faultShell(undefined, cause, "Runtime transition failed");
 	}
 
+	async #appendIdle(append: () => Promise<RuntimeAppendResult>): Promise<string> {
+		if (this.#current.laneState.value.currentOperationId !== null)
+			throw new RuntimeShellError("busy", "Main lane is busy");
+		try {
+			const result = await append();
+			this.#publish(result.attachment);
+			return result.entryId;
+		} catch (cause) {
+			throw this.#transitionFailure(cause);
+		}
+	}
+
+	#captureThenAdmit<TCapture, TResult>(
+		capture: () => TCapture,
+		operation: (captured: TCapture) => Promise<TResult>,
+	): Promise<TResult> {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		try {
+			const captured = capture();
+			return this.#admit(() => operation(captured));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	#lifecycleError(): RuntimeShellError | undefined {
+		if (this.#fault) return this.#fault;
+		if (this.#sealed) return new RuntimeShellError("closed", "Runtime shell is closed");
+		return undefined;
+	}
+
 	#admit<T>(operation: () => Promise<T> | T): Promise<T> {
-		if (this.#fault) return Promise.reject(this.#fault);
-		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
 		const admitted = this.#admissionLine.then(() => {
 			if (this.#fault) throw this.#fault;
 			return operation();
@@ -1197,7 +1298,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 			this.#toolBatches.clear();
 			this.#preparedTools.clear();
 			this.#retryElapsed.clear();
-			return this.#session.close();
+			return this.#owner.close();
 		});
 		return this.#closePromise;
 	}
@@ -1215,5 +1316,5 @@ export async function createRuntimeShell<TContext extends object | undefined = o
 		options.steeringMode,
 		options.followUpMode,
 	);
-	return new RuntimeShell(session, settings, await attachRuntime(session, seed), { ...options, tools });
+	return new RuntimeShell(session, settings, await claimRuntime(session, seed), { ...options, tools });
 }

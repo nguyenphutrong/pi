@@ -24,6 +24,285 @@ const config = (activeToolNames: string[] = []): LaneConfiguration => ({
 	thinkingLevel: "medium",
 	activeToolNames,
 });
+
+describe("D-050 RuntimeShell SessionTree façade", () => {
+	it("is frozen and exposes exactly the SessionTree surface", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		expect(Object.isFrozen(shell.session)).toBe(true);
+		expect(Object.keys(shell.session).sort()).toEqual(
+			[
+				"appendCustomEntry",
+				"appendMessage",
+				"findEntries",
+				"findEntriesOnBranch",
+				"findEntry",
+				"findEntryOnBranch",
+				"getEntries",
+				"getEntry",
+				"getLeafId",
+				"getStats",
+			].sort(),
+		);
+		for (const hidden of ["metadata", "idGenerator", "close", "projectBuiltinContext", "finishRun", "nextRun"])
+			expect(shell.session).not.toHaveProperty(hidden);
+		await shell.close();
+	});
+
+	it("places idle message and custom writes in exact FIFO transactions and prompts from the latest façade leaf", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const raw = session(storage);
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(raw, config(), { models });
+		storage.committedTransactions.length = 0;
+		const mutable = user("facade message");
+		const customData = { nested: { value: "original" } };
+		const messageIdPromise = shell.session.appendMessage(mutable);
+		const absentIdPromise = shell.session.appendCustomEntry("absent");
+		const nullIdPromise = shell.session.appendCustomEntry("null", null);
+		const detachedIdPromise = shell.session.appendCustomEntry("detached", customData);
+		mutable.content = [{ type: "text", text: "mutated" }];
+		customData.nested.value = "mutated";
+		const [messageId, absentId, nullId, detachedId] = await Promise.all([
+			messageIdPromise,
+			absentIdPromise,
+			nullIdPromise,
+			detachedIdPromise,
+		]);
+		expect(new Set([messageId, absentId, nullId, detachedId])).toHaveLength(4);
+		expect(storage.committedTransactions).toHaveLength(4);
+		for (const [index, entryId] of [messageId, absentId, nullId, detachedId].entries()) {
+			const transaction = storage.committedTransactions[index];
+			expect(transaction.writes).toEqual([
+				expect.objectContaining({ kind: "entry", entry: expect.objectContaining({ id: entryId }) }),
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: entryId },
+			]);
+			if (transaction.writes[0].kind === "entry")
+				expect(transaction.writes[0].entry.parentId).toBe(
+					index === 0 ? null : [messageId, absentId, nullId][index - 1],
+				);
+		}
+		const entries = await shell.session.getEntries([messageId, absentId, nullId, detachedId]);
+		expect(entries.get(messageId)).toMatchObject({ type: "message", message: user("facade message") });
+		expect(entries.get(absentId)).not.toHaveProperty("data");
+		expect(entries.get(nullId)).toHaveProperty("data", null);
+		expect(entries.get(detachedId)).toHaveProperty("data", { nested: { value: "original" } });
+
+		const prompted = await shell.prompt(user("after facade"));
+		expect(prompted.runOperation?.value.sourceLeafId).toBe(detachedId);
+		expect(prompted.entries.get(prompted.runOperation!.value.intent.promptEntryIds[0])?.parentId).toBe(detachedId);
+		await shell.close();
+	});
+
+	it("resolves a durable façade append without any postcommit storage read", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("idle", state.createStorage());
+		const backing = fixture.storage;
+		const readNames = new Set<PropertyKey>([
+			"getEntries",
+			"getUsageRows",
+			"getRegister",
+			"listRegisters",
+			"scanEntries",
+			"scanBranch",
+			"getStats",
+		]);
+		let armed = false;
+		let committed = false;
+		const storage = new Proxy(backing, {
+			get(target, property) {
+				const value: unknown = Reflect.get(target, property);
+				if (property === "commit")
+					return async (transaction: Parameters<Storage["commit"]>[0]) => {
+						const result = await target.commit(transaction);
+						if (armed) committed = true;
+						return result;
+					};
+				if (typeof value !== "function") return value;
+				return (...args: unknown[]) => {
+					if (readNames.has(property) && committed) return Promise.reject(new Error("read after commit"));
+					return Reflect.apply(value, target, args);
+				};
+			},
+		}) as Storage;
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(storage), config(), { models });
+		armed = true;
+		const entryId = await shell.session.appendMessage(user("durable once"));
+		expect((await state.createStorage().getEntries([entryId])).has(entryId)).toBe(true);
+		committed = false;
+		const prompted = await shell.prompt(user("after durable append"));
+		expect(prompted.runOperation?.value.sourceLeafId).toBe(entryId);
+		await shell.close();
+	});
+
+	it("serializes reads after an admitted façade write and lets close wait for that write", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		const commit = storage.commit.bind(storage);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const admitted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let gate = true;
+		storage.commit = async (transaction) => {
+			if (gate) {
+				gate = false;
+				entered();
+				await blocked;
+			}
+			return commit(transaction);
+		};
+		const append = shell.session.appendMessage(user("ordered"));
+		await admitted;
+		let readSettled = false;
+		const read = shell.session.getLeafId().then((value) => {
+			readSettled = true;
+			return value;
+		});
+		const close = shell.close();
+		await Promise.resolve();
+		expect(readSettled).toBe(false);
+		release();
+		const entryId = await append;
+		await expect(read).resolves.toBe(entryId);
+		await close;
+	});
+
+	it("captures façade ids, queries, cursors, and branch bounds before blocked admission", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const raw = session(storage);
+		const existingId = await raw.appendMessage(user("existing"));
+		const shell = await createRuntimeShell(raw, config());
+		const commit = storage.commit.bind(storage);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const admitted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		storage.commit = async (transaction) => {
+			entered();
+			await blocked;
+			return commit(transaction);
+		};
+		const append = shell.session.appendMessage(user("gate"));
+		await admitted;
+		const ids = [existingId];
+		const cursor = { seq: 0 };
+		const query = { type: "message" as const, order: "oldestFirst" as const, limit: 7, cursor };
+		const branch = { ...query, start: existingId, stopAtId: existingId };
+		const entries = shell.session.getEntries(ids);
+		const global = shell.session.findEntries(query);
+		const onBranch = shell.session.findEntriesOnBranch(branch);
+		ids[0] = id();
+		(query as { type: "message" | "custom" }).type = "custom";
+		query.limit = 1;
+		cursor.seq = 99;
+		branch.start = id();
+		branch.stopAtId = id();
+		release();
+		await append;
+		expect((await entries).has(existingId)).toBe(true);
+		expect(await global).toHaveLength(2);
+		expect(await onBranch).toHaveLength(1);
+		await shell.close();
+	});
+
+	it("classifies malformed façade read inputs before admission without accessors or storage", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		const reads = ["getEntries", "scanEntries", "scanBranch"] as const;
+		const spies = reads.map((name) => vi.spyOn(storage, name));
+		let executed = false;
+		const accessor = Object.defineProperty({}, "limit", {
+			enumerable: true,
+			get: () => {
+				executed = true;
+				throw new Error("must not execute");
+			},
+		});
+		const hidden = Object.defineProperty({}, "limit", { enumerable: false, value: 1 });
+		const symbol = { [Symbol("unsupported")]: true };
+		const sparse = new Array<string>(1);
+		for (const operation of [
+			shell.session.getEntry("not-an-id"),
+			shell.session.getEntries(sparse),
+			shell.session.findEntries(accessor),
+			shell.session.findEntry(hidden),
+			shell.session.findEntriesOnBranch(symbol),
+		])
+			await expect(operation).rejects.toMatchObject({ code: "invalid_query" });
+		expect(executed).toBe(false);
+		for (const spy of spies) expect(spy).not.toHaveBeenCalled();
+		await shell.close();
+	});
+
+	it("rejects active-run façade writes busy and retained raw bypasses active without minting or writing", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const raw = session(storage);
+		const ids = vi.spyOn(raw.idGenerator, "next");
+		const shell = await createRuntimeShell(raw, config());
+		const beforeIds = ids.mock.calls.length;
+		const beforeWrites = storage.attempts.length;
+		await expect(shell.session.appendMessage(user("busy"))).rejects.toMatchObject({ code: "busy" });
+		await expect(shell.session.appendCustomEntry("busy")).rejects.toMatchObject({ code: "busy" });
+		await Promise.all(
+			Array.from({ length: 4 }, async (_, index) => {
+				await expect(raw.appendMessage(user(`raw-${index}`))).rejects.toMatchObject({ code: "active" });
+				await expect(raw.appendCustomEntry(`raw-${index}`)).rejects.toMatchObject({ code: "active" });
+			}),
+		);
+		await expect(raw.close()).rejects.toMatchObject({ code: "active" });
+		expect(ids).toHaveBeenCalledTimes(beforeIds);
+		expect(storage.attempts).toHaveLength(beforeWrites);
+		await expect(shell.session.getLeafId()).resolves.toBe(fixture.prompt);
+		await shell.close();
+	});
+
+	it("seals later façade reads and writes before malformed argument capture", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const closeStorage = vi.spyOn(storage, "close");
+		const raw = session(storage);
+		const ids = vi.spyOn(raw.idGenerator, "next");
+		const reads = ["getEntries", "scanEntries", "scanBranch", "getStats"] as const;
+		const readSpies = reads.map((name) => vi.spyOn(storage, name));
+		const shell = await createRuntimeShell(raw, config());
+		await expect(raw.close()).rejects.toMatchObject({ code: "active" });
+		const beforeIds = ids.mock.calls.length;
+		const beforeReads = readSpies.map((spy) => spy.mock.calls.length);
+		const close = shell.close();
+		await expect(shell.session.getLeafId()).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.session.appendMessage(user("late"))).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.session.getEntry("not-an-id")).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.session.getEntries(new Array<string>(1))).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.session.appendMessage(null as unknown as AssistantMessage)).rejects.toMatchObject({
+			code: "closed",
+		});
+		await expect(
+			shell.session.appendCustomEntry(null as unknown as string, Symbol("invalid") as unknown as JsonValue),
+		).rejects.toMatchObject({
+			code: "closed",
+		});
+		expect(ids).toHaveBeenCalledTimes(beforeIds);
+		for (const [index, spy] of readSpies.entries()) expect(spy).toHaveBeenCalledTimes(beforeReads[index]);
+		await close;
+		expect(closeStorage).toHaveBeenCalledTimes(1);
+		expect(shell.close()).toBe(close);
+	});
+});
 const json = (value: unknown): JsonValue => value as JsonValue;
 
 async function rooted(

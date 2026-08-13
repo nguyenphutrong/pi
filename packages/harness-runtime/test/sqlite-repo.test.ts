@@ -5,7 +5,7 @@ import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
 import * as Harness from "../src/index.ts";
 import { CURRENT_STORAGE_VERSION, SessionError, type SessionMetadata, SqliteSessionRepo } from "../src/index.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { id, user, ZERO_USAGE } from "./fixtures.ts";
 
 const directories: string[] = [];
@@ -114,7 +114,7 @@ describe("SqliteSessionRepo", () => {
 		expect(attached.mainLeaf).toEqual({ seq: 1, value: null });
 		expect(attached.laneState).toEqual({ seq: 2, value: { currentOperationId: null, pendingNextRun: [] } });
 		expect(attached.laneConfiguration.seq).toBe(3);
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 		await repo.close();
 	});
 

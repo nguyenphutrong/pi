@@ -17,6 +17,7 @@ import {
 	type RecoveryTransitionResult,
 	type ReleaseAssistantRetryTransition,
 	type RuntimeAttachment,
+	type RuntimeOwner,
 	type RuntimeTransitionResult,
 	type SettleAssistantEffectResult,
 	type SettleAssistantEffectTransition,
@@ -29,7 +30,27 @@ import {
 import type { Session } from "./types.ts";
 import { SessionError } from "./types.ts";
 
+const runtimeOwners = new WeakMap<StoredSession, RuntimeOwner>();
+
 export function attachRuntime(session: Session, seed: LaneConfiguration): Promise<RuntimeAttachment> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support an internal runtime attachment"));
+	return session.attachRuntime(seed).then((owner) => {
+		runtimeOwners.set(session, owner);
+		return owner.attachment;
+	});
+}
+
+export function closeAttachedRuntime(session: Session): Promise<void> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support an internal runtime attachment"));
+	const owner = runtimeOwners.get(session);
+	if (!owner) return Promise.reject(new SessionError("active", "Session has no low-level runtime owner"));
+	runtimeOwners.delete(session);
+	return owner.close();
+}
+
+export function claimRuntime(session: Session, seed: LaneConfiguration): Promise<RuntimeOwner> {
 	if (!(session instanceof StoredSession))
 		return Promise.reject(new SessionError("storage", "Session does not support an internal runtime attachment"));
 	return session.attachRuntime(seed);

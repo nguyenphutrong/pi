@@ -9,7 +9,7 @@ import {
 import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { StoredSession, validateMainLane } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
 import { assistant, id, toolResult, user, ZERO_USAGE } from "./fixtures.ts";
@@ -290,12 +290,46 @@ function forbidScansAndRecordLookups(storage: Storage) {
 }
 
 describe("runtime attachment boundary", () => {
+	it("publishes attachment ownership before blocked hydration so raw writes and close cannot queue behind it", async () => {
+		const instrumented = instrumentStorage(await storageWith());
+		const runtimeSession = session(instrumented);
+		const getRegister = instrumented.getRegister.bind(instrumented);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const attachmentEntered = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		let gate = true;
+		instrumented.getRegister = async (namespace, key) => {
+			if (gate) {
+				gate = false;
+				entered();
+				await blocked;
+			}
+			return getRegister(namespace, key);
+		};
+
+		const attachment = attachRuntime(runtimeSession, seed());
+		await attachmentEntered;
+		const before = instrumented.attempts.length;
+		await expect(runtimeSession.appendMessage(user("bypass"))).rejects.toMatchObject({ code: "active" });
+		await expect(runtimeSession.appendCustomEntry("bypass")).rejects.toMatchObject({ code: "active" });
+		await expect(runtimeSession.close()).rejects.toMatchObject({ code: "active" });
+		expect(instrumented.attempts).toHaveLength(before);
+		release();
+		await expect(attachment).resolves.toBeDefined();
+		await closeAttachedRuntime(runtimeSession);
+	});
+
 	it("validates the seed before consuming the exclusive attachment claim", async () => {
 		const runtimeSession = session(await storageWith());
 		const malformed = { ...seed(), unknown: true } as unknown as LaneConfiguration;
 		await expect(attachRuntime(runtimeSession, malformed)).rejects.toMatchObject({ code: "corruption" });
 		await expect(attachRuntime(runtimeSession, seed())).resolves.toBeDefined();
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("rejects a second attachment by its immediate promise", async () => {
@@ -303,7 +337,7 @@ describe("runtime attachment boundary", () => {
 		const first = attachRuntime(runtimeSession, seed());
 		await expect(attachRuntime(runtimeSession, seed())).rejects.toMatchObject({ code: "active" });
 		await expect(first).resolves.toBeDefined();
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("shares the Session mutation line and seeds exactly one config write when absent and idle", async () => {
@@ -319,7 +353,7 @@ describe("runtime attachment boundary", () => {
 			expect.objectContaining({ kind: "register", namespace: "lane.config", key: "main" }),
 		]);
 		expect(attached.laneConfiguration.seq).toBeGreaterThan((await runtimeSession.getEntry(entryId))?.seq ?? 0);
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("keeps existing config authoritative and detached from seed and returned mutations", async () => {
@@ -334,7 +368,7 @@ describe("runtime attachment boundary", () => {
 		attached.laneConfiguration.value.model.modelId = "returned mutation";
 		expect(instrumented.committedTransactions).toHaveLength(0);
 		expect((await instrumented.getRegister("lane.config", "main"))?.value).toEqual(existing);
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("rejects an open operation without configuration", async () => {
@@ -371,7 +405,7 @@ describe("runtime attachment boundary", () => {
 		returnedUsage.clear();
 		expect((await storage.getEntries([fixture.prompt])).get(fixture.prompt)?.payload).toEqual(user("prompt"));
 		expect((await storage.getUsageRows([fixture.usage])).get(fixture.usage)?.usage.input).toBe(0);
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("attaches idle state with one empty exact batch per kind and no scans", async () => {
@@ -381,7 +415,7 @@ describe("runtime attachment boundary", () => {
 		await expect(attachRuntime(runtimeSession, seed())).resolves.toBeDefined();
 		expect(entryLookups).toEqual([[]]);
 		expect(usageLookups).toEqual([[]]);
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it.each(["need_assistant", "ready", "effect_pending", "retry_wait", "failure_drain", "may_finish"] as const)(
@@ -405,7 +439,7 @@ describe("runtime attachment boundary", () => {
 			expect(usageLookups).toHaveLength(1);
 			expect(new Set(usageLookups[0])).toEqual(new Set(expectedUsage));
 			expect(usageLookups[0]).toHaveLength(new Set(usageLookups[0]).size);
-			await runtimeSession.close();
+			await closeAttachedRuntime(runtimeSession);
 		},
 	);
 
@@ -437,7 +471,7 @@ describe("runtime attachment boundary", () => {
 		expect(usageLookups).toEqual([[]]);
 		expect(reads).not.toContain("lane.lastResult/main");
 		expect(instrumented.committedTransactions).toEqual([]);
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 	});
 
 	it("accepts the D-025 failure_drain boundary with alternate typed entry-owned identity fields", async () => {
@@ -650,7 +684,7 @@ describe("bounded Phase 1 closure validation", () => {
 		await expect(attachRuntime(runtimeSession, seed())).resolves.toMatchObject({
 			entries: expect.anything(),
 		});
-		await runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
 
 		const malformedPrompt = customSource.map(
 			(write): Write =>
@@ -773,7 +807,7 @@ describe("bounded Phase 1 closure validation", () => {
 			runtimeSession.idGenerator.next = () => fixture.result;
 			await expect(runtimeSession.nextRun(user("collision"))).rejects.toMatchObject({ code: "storage" });
 			expect(storage.committedTransactions).toEqual([]);
-			await runtimeSession.close();
+			await closeAttachedRuntime(runtimeSession);
 		},
 	);
 
@@ -787,7 +821,7 @@ describe("bounded Phase 1 closure validation", () => {
 			runtimeSession.idGenerator.next = () => fixture[kind];
 			await expect(runtimeSession.nextRun(user("collision"))).rejects.toMatchObject({ code: "storage" });
 			expect(storage.committedTransactions).toEqual([]);
-			await runtimeSession.close();
+			await closeAttachedRuntime(runtimeSession);
 		},
 	);
 

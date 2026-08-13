@@ -9,7 +9,7 @@ import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
 import { type LaneConfiguration, type RunState, selectQueueDrain } from "../src/durable.ts";
 import { planAction } from "../src/planner.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { StoredSession } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
 import { id, user } from "./fixtures.ts";
@@ -187,7 +187,7 @@ describe("operation-owned queues", () => {
 					},
 				],
 			});
-			await failed.runtimeSession.close();
+			await closeAttachedRuntime(failed.runtimeSession);
 			const reopened = session(durable.createStorage());
 			const before = await attachRuntime(reopened, configuration);
 			expect(planner(before)).toMatchObject({ kind: "consume_queue", queue: "steer", entryIds: [steer.entryId] });
@@ -200,10 +200,10 @@ describe("operation-owned queues", () => {
 			expect(consumed.attachment.entries.get(steer.entryId!)?.parentId).toBe(failed.responseEntryId);
 			expect(consumed.attachment.runState!.value.phase).toMatchObject({ kind: "checkpoint", skipInboxOnce: true });
 			expect(consumed.attachment.runState!.value.inbox.followUp).toEqual([follow.entryId]);
-			await reopened.close();
+			await closeAttachedRuntime(reopened);
 			const after = session(durable.createStorage());
 			expect(planner(await attachRuntime(after, configuration))?.kind).toBe("start_assistant_step");
-			await after.close();
+			await closeAttachedRuntime(after);
 		},
 	);
 
@@ -219,7 +219,7 @@ describe("operation-owned queues", () => {
 			expectedOperationStateSeq: before.runState!.seq,
 		});
 		expect(consumed.attachment.runState!.value.phase).toMatchObject({ kind: "checkpoint", skipInboxOnce: true });
-		await failed.runtimeSession.close();
+		await closeAttachedRuntime(failed.runtimeSession);
 	});
 
 	it("one-at-a-time consume reopens through assistant-ready before the second steer is eligible", async () => {
@@ -250,7 +250,7 @@ describe("operation-owned queues", () => {
 			entryIds: [ids[0]],
 			expectedOperationStateSeq: before.runState!.seq,
 		});
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(prepared.runtimeSession);
 		const reopened = session(durable.createStorage());
 		const attached = await attachRuntime(reopened, configuration);
 		expect(planner(attached)?.kind).toBe("start_assistant_step");
@@ -267,10 +267,10 @@ describe("operation-owned queues", () => {
 		});
 		expect(ready.attachment.runState!.value.phase).not.toHaveProperty("skipInboxOnce");
 		expect(ready.attachment.runState!.value.inbox.steer).toEqual([ids[1]]);
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 		const twice = session(durable.createStorage());
 		expect(planner(await attachRuntime(twice, configuration))?.kind).toBe("prepare_assistant_effect");
-		await twice.close();
+		await closeAttachedRuntime(twice);
 	});
 
 	it("orders cancelQueued and consume_queue on the mutation line in both histories", async () => {
@@ -295,7 +295,7 @@ describe("operation-owned queues", () => {
 				expect((await prepared.runtimeSession.cancelQueued(queued.entryId!)).outcome).toBe("already_consumed");
 				expect(storage.committedTransactions).toHaveLength(1);
 			}
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 		}
 	});
 
@@ -314,7 +314,7 @@ describe("operation-owned queues", () => {
 				});
 				expect((await prepared.runtimeSession.refreshRuntimeAttachment()).pendingEntries.size).toBe(0);
 			}
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 		}
 	});
 
@@ -332,7 +332,7 @@ describe("operation-owned queues", () => {
 			const current = await prepared.runtimeSession.refreshRuntimeAttachment();
 			expect(current.laneState.value).toEqual({ currentOperationId: null, pendingNextRun: [accepted.entryId] });
 			expect(current.pendingEntries.get(accepted.entryId!)?.payload).toEqual(user("next"));
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 		}
 	});
 
@@ -362,7 +362,7 @@ describe("operation-owned queues", () => {
 			const current = await prepared.runtimeSession.refreshRuntimeAttachment();
 			expect(current.runState).toBeUndefined();
 			expect(current.pendingEntries.size).toBe(0);
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 		}
 	});
 	it("admits steer and follow-up with exact transactions and cancels only the selected queue item", async () => {
@@ -412,8 +412,8 @@ describe("operation-owned queues", () => {
 		expect(restored.runState!.value.inbox).toEqual({ steer: [], followUp: [followUp.entryId], writes: [] });
 		expect(restored.pendingEntries.has(steer.entryId!)).toBe(false);
 		expect(restored.pendingEntries.get(followUp.entryId!)?.payload).toEqual(user("follow"));
-		await runtimeSession.close();
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it.each(["all", "one-at-a-time"] as const)(
@@ -462,7 +462,7 @@ describe("operation-owned queues", () => {
 				expect(await prepared.storage.getRegister("pending.entry", entryId)).toBeUndefined();
 			for (const entryId of ids.slice(consume.length))
 				expect(await prepared.storage.getRegister("pending.entry", entryId)).toBeDefined();
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 		},
 	);
 
@@ -532,8 +532,8 @@ describe("operation-owned queues", () => {
 			});
 			expect(result.attachment.runState!.seq).toBe(firstSeq + consumed.length * 2 + 1);
 			expect(result.attachment.runState!.value.inbox.steer).toEqual(mode === "all" ? [] : [ids[1]]);
-			await runtimeSession.close();
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(runtimeSession);
+			await closeAttachedRuntime(prepared.runtimeSession);
 		},
 	);
 
@@ -567,7 +567,7 @@ describe("operation-owned queues", () => {
 		});
 		state.control = { status: "cancel_requested", requestedAt: 1, drainedSteer: [], drainedFollowUp: [] };
 		expect(planner(modified)?.kind).toBe("finish_aborted_run");
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it.each([
@@ -625,8 +625,8 @@ describe("operation-owned queues", () => {
 		expect(result).toMatchObject({ committed: false, attachment: { runState: { seq: current.runState!.seq } } });
 		expect(storage.committedTransactions).toHaveLength(0);
 		expect((await delegate.getRegister("op.state", operationId))?.seq).toBe(current.runState!.seq);
-		await runtimeSession.close();
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it("commits the exact selector-backed plan", async () => {
@@ -644,7 +644,7 @@ describe("operation-owned queues", () => {
 		});
 		expect(result.committed).toBe(true);
 		expect(result.attachment.runState!.value.inbox.steer).toEqual([]);
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 
 	it("first abort drains exact payloads in one state write, repeat is write-free, and drained cancellation is not_found", async () => {
@@ -685,8 +685,8 @@ describe("operation-owned queues", () => {
 		expect(storage.committedTransactions).toHaveLength(1);
 		expect((await runtimeSession.cancelQueued(steer.entryId!)).outcome).toBe("not_found");
 		expect(await delegate.getRegister("pending.entry", steer.entryId!)).toBeDefined();
-		await runtimeSession.close();
-		await prepared.runtimeSession.close();
+		await closeAttachedRuntime(runtimeSession);
+		await closeAttachedRuntime(prepared.runtimeSession);
 		vi.restoreAllMocks();
 	});
 
@@ -698,7 +698,7 @@ describe("operation-owned queues", () => {
 		const next = await first.runtimeSession.nextRun(user("next"));
 		await first.runtimeSession.requestAbort(() => undefined);
 		const operationId = first.attachment.runOperation!.value.operationId;
-		await first.runtimeSession.close();
+		await closeAttachedRuntime(first.runtimeSession);
 		const reopened = session(state.createStorage());
 		const attachment = await attachRuntime(reopened, configuration);
 		expect(attachment.runState!.value.control).toMatchObject({
@@ -717,7 +717,7 @@ describe("operation-owned queues", () => {
 			pendingNextRun: [next.entryId],
 		});
 		await persisted.close();
-		await reopened.close();
+		await closeAttachedRuntime(reopened);
 	});
 
 	it.each(["active", "drained"] as const)(
@@ -733,8 +733,8 @@ describe("operation-owned queues", () => {
 			vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(queued.entryId!);
 			await expect(runtimeSession.nextRun(user("collision"))).rejects.toMatchObject({ code: "storage" });
 			expect(storage.committedTransactions).toEqual([]);
-			await runtimeSession.close();
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(runtimeSession);
+			await closeAttachedRuntime(prepared.runtimeSession);
 		},
 	);
 
@@ -790,7 +790,7 @@ describe("operation-owned queues", () => {
 				value: value as unknown as JsonValue,
 			});
 			await prepared.storage.commit({ writes });
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 			const reopened = session(durable.createStorage());
 			await expect(attachRuntime(reopened, configuration)).rejects.toMatchObject({ code: "corruption" });
 			await reopened.close();
@@ -827,7 +827,7 @@ describe("operation-owned queues", () => {
 					},
 				],
 			});
-			await prepared.runtimeSession.close();
+			await closeAttachedRuntime(prepared.runtimeSession);
 			const reopened = session(durable.createStorage());
 			await expect(attachRuntime(reopened, configuration)).rejects.toMatchObject({ code: "corruption" });
 			await reopened.close();

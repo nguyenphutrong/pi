@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { SqliteSessionRepo } from "../src/repo.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { StoredSession } from "../src/session.ts";
 import { user } from "./fixtures.ts";
 
@@ -40,7 +40,7 @@ describe("SQLite operation-owned queues", () => {
 			const second = await created.queueOperationInput("steer", user("second"));
 			const follow = await created.queueOperationInput("followUp", user("follow"));
 			const next = await created.nextRun(user("next"));
-			await created.close();
+			await closeAttachedRuntime(created);
 
 			const consuming = await new SqliteSessionRepo({ path }).open(created.metadata);
 			if (!(consuming instanceof StoredSession)) throw new Error("Expected StoredSession");
@@ -64,7 +64,7 @@ describe("SQLite operation-owned queues", () => {
 				drainedSteer: [user("second")],
 				drainedFollowUp: [user("follow")],
 			});
-			await consuming.close();
+			await closeAttachedRuntime(consuming);
 
 			const finishing = await new SqliteSessionRepo({ path }).open(created.metadata);
 			if (!(finishing instanceof StoredSession)) throw new Error("Expected StoredSession");
@@ -78,7 +78,7 @@ describe("SQLite operation-owned queues", () => {
 					expectedOperationStateSeq: beforeFinish.runState!.seq,
 				}),
 			).toMatchObject({ status: "committed" });
-			await finishing.close();
+			await closeAttachedRuntime(finishing);
 
 			const terminal = await new SqliteSessionRepo({ path }).open(created.metadata);
 			if (!(terminal instanceof StoredSession)) throw new Error("Expected StoredSession");
@@ -88,7 +88,7 @@ describe("SQLite operation-owned queues", () => {
 			expect(final.pendingEntries.has(second.entryId!)).toBe(false);
 			expect(final.pendingEntries.has(follow.entryId!)).toBe(false);
 			expect(final.mainLeaf.value).toBe(first.entryId);
-			await terminal.close();
+			await closeAttachedRuntime(terminal);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}

@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import type { LaneConfiguration } from "../src/durable.ts";
 import { SqliteSessionRepo } from "../src/repo.ts";
-import { attachRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
 import { StoredSession } from "../src/session.ts";
 import { user } from "./fixtures.ts";
 
@@ -24,7 +24,7 @@ describe("SQLite lane-owned next-run queue", () => {
 			if (!(session instanceof StoredSession)) throw new Error("Expected StoredSession");
 			await attachRuntime(session, configuration);
 			const queued = await session.nextRun(user("durable"));
-			await session.close();
+			await closeAttachedRuntime(session);
 
 			const freshRepo = new SqliteSessionRepo({ path });
 			const reopened = await freshRepo.open(session.metadata);
@@ -32,7 +32,7 @@ describe("SQLite lane-owned next-run queue", () => {
 			const restored = await attachRuntime(reopened, configuration);
 			expect(restored.pendingEntries.get(queued.entryId!)?.payload).toEqual(user("durable"));
 			expect((await reopened.cancelQueued(queued.entryId!)).outcome).toBe("cancelled");
-			await reopened.close();
+			await closeAttachedRuntime(reopened);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
@@ -63,7 +63,7 @@ describe("SQLite lane-owned next-run queue", () => {
 			const callerId = accepted.attachment.runOperation!.value.intent.promptEntryIds[0];
 			expect(accepted.attachment.entries.get(queued.entryId!)?.parentId).toBeNull();
 			expect(accepted.attachment.entries.get(callerId)?.parentId).toBe(queued.entryId);
-			await session.close();
+			await closeAttachedRuntime(session);
 
 			const reopened = await new SqliteSessionRepo({ path }).open(session.metadata);
 			if (!(reopened instanceof StoredSession)) throw new Error("Expected StoredSession");
@@ -76,7 +76,7 @@ describe("SQLite lane-owned next-run queue", () => {
 				triggerEntryId: callerId,
 			});
 			expect(await reopened.refreshRuntimeAttachment()).toBeDefined();
-			await reopened.close();
+			await closeAttachedRuntime(reopened);
 		} finally {
 			await rm(directory, { recursive: true, force: true });
 		}
