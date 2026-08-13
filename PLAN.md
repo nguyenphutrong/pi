@@ -4,7 +4,7 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.5b — Sequential tool dispatch, finalization, and durable real-result settlement
-- Status: D-028 four-stage live tool-effect design approved after corrected independent review; implementation is next
+- Status: D-028 four-stage live tool-effect design committed by `4f8f4c5cf` after corrected independent review; implementation is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

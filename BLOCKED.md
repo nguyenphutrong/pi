@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-027 durable sequential-tool clearance is implemented by `be47c4560`; D-028 sequential dispatch, finalization, and real-result settlement is next.
+No active blocker. D-028 sequential dispatch, finalization, and real-result settlement design is approved by `4f8f4c5cf`; implementation is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 
