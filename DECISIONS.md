@@ -881,3 +881,38 @@ The first composed prompt-to-tool test exposed an invalid recovery assumption: c
 The acceptance suite starts from a real prompt and fixes the exact 16-action uninterrupted sequence through a real sequential tool, durable result, post-tool provider request, final assistant, and terminal cleanup. It closes and reopens fresh handles at all 17 boundaries for both `replay:"safe"` and `replay:"never"`. Assertions distinguish permitted provider uncertainty and safe tool replay from durable duplication, verify the synthetic interrupted result for non-replay, and prove one durable transcript, usage ledger, leaf, `lane.lastResult`, operation/argument cleanup, and idle reopen.
 
 Commit `9e04a44c6` implements the driver, corrects bounded closure validation, and adds the full acceptance matrix. Harness runtime passes 388/388; the complete Phase 2 relevant suites pass 514/514 with 34 recovery scenarios across all 17 cuts; `npm run check` and `git diff --check` pass. Independent implementation review, whole-phase spec review, and Recovery/QA all report PASS. Phase 3 is unblocked.
+
+## D-032 — Rewrite SQLite behind a fenced Storage repository and backend-neutral Session
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-001–D-009, D-021–D-023, D-031; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.6, 2.8, 4.4–4.7, 8 slice 14, 9.3
+
+### Options
+
+1. Rewrite `packages/session-backends/sqlite-node` in place as a private fork-owned Storage backend, keep Harness integration in `harness-runtime`, and implement the SQLite-specific segmented branch index now.
+2. Create a second `packages/session-sqlite` tree while retaining the legacy public backend until later migration.
+3. Publish the rewritten backend immediately or let it depend on Harness/legacy `pi-agent-core` repository types.
+
+For SQLite branch reads, the implementation also considered a temporary parent-pointer walk and implementing the whole slice-14 product surface now.
+
+### Choice
+
+Option 1. The package identity becomes private workspace-only `@nguyenphutrong/pi-session-sqlite`; the source path remains the spec-owned `packages/session-backends/sqlite-node` so the existing `node:sqlite`, `BEGIN IMMEDIATE`, SQL, and fenced-lease primitives can be retained directly. Runtime branch reads implement the §2.6 segmented cache immediately. FTS/search and coherent fork operations remain explicitly incomplete slice-14 work for their ordered product and fork phases.
+
+### Rationale
+
+The rewritten package depends only on `@nguyenphutrong/pi-session-storage`. Its canonical tables are `sessions`, `session_sequences`, `entries`, `registers`, `usage_ledger`, `session_stats`, `writer_leases`, `branch_entries`, and `branch_meta`, with the normative indexes. It contains no records, lanes, fact history, values, `slot_history`, durable log, legacy reducer, or `pi-agent-core` import. Entries and usage share one transactionally enforced id namespace. Registers are the only orchestration mutation surface. The segmented branch index traverses complete base chains, finds compactions through that chain, uses the required `CROSS JOIN` read plan, has query-plan and chain-soundness guards, and can be rebuilt only by an explicit repair operation. Runtime reads never fall back to a table scan or parent walk.
+
+A private low-level `SqliteStorageRepository` owns one deliberately shared database file, its per-file FIFO, catalog, connections, writer leases, and disposable `Storage` handles. It supports create/open/list/delete/close, accepts an injectable `SqliteDatabaseFactory`, and accepts an optional initial transaction. Harness creation always supplies one initial transaction setting `lane.leaf/main = null` and empty `lane.state/main`. Repository create validates first, then atomically inserts the catalog, sequence, stats, lease, initial writes, and private branch projection in one `BEGIN IMMEDIATE`; a process crash therefore leaves either no session or one complete valid session. The shared file accepts SQLite's single-writer queue deliberately so future catalog/search inventory remains co-located.
+
+Every admitted `Storage.commit()` maps to exactly one `BEGIN IMMEDIATE` transaction. Exact unexpired `(sessionId, ownerId, fence)` renewal, sequence-range allocation, caller-ordered writes, branch projection, stats maintenance, and sequence advancement all occur inside it. A failed check or write rolls the whole transaction back. Heartbeats and final fenced release are separate queued lifecycle transactions, never hidden parts of a Harness commit. WAL, full synchronous durability, foreign keys, and a bounded busy timeout are configured before use.
+
+Each handle serializes reads, commits, heartbeat work, and close admission. The first close synchronously seals later admission, stops the timer, drains earlier work, then attempts one exact owner/fence release transaction; stale release is a no-op and cannot delete a replacement. Repeated close calls share one promise. Lease loss rolls back the current write, seals permanently, and uses the existing `StorageError("closed")`; no contract code is added. Unexpected commit SQL faults roll back, latch the original terminal error for current and already-admitted work, and close future admission. A transient background heartbeat SQL fault is contained and rescheduled, while every real commit still verifies ownership; a zero-row stale heartbeat seals. Close still attempts fenced release after an earlier fault and preserves the earlier fault over a release failure. Repository bookkeeping is released in all cases, and repository close drains active handles before closing the shared connection.
+
+The existing Session implementation already accepts generic `Storage`; only its nominal `MemorySession` name and runtime-port check block SQLite. A behavior-preserving first increment renames it package-internally to `StoredSession`, with no alias. `MemorySessionRepo` remains memory-specific. A later private `SqliteSessionRepo` in `harness-runtime` validates the existing exact metadata contract, wraps low-level SQLite handles in `StoredSession`, and exposes the unchanged `Session`/RuntimeShell surfaces. Dependency order is `session-storage → agent-loop/session-sqlite → harness-runtime`; the backend never depends upward on Harness.
+
+Verification is split by guarantee. The unchanged shared backend suite proves Memory/SQLite parity. Backend-specific tests prove exact `BEGIN IMMEDIATE` accounting, rollback, leases/fencing, WAL/reopen, branch plans and segment soundness. Subprocess SQL cuts prove a transaction is absent or complete; creation cuts prove a session is absent or valid. A separate real RuntimeShell process-crash matrix reuses the Phase 2 durable boundaries for `safe` and `never`, proving next-action and terminal-state equivalence rather than conflating SQL-internal cuts with Harness states.
+
+The package stays private because publishing a new fork-owned replacement API is harder to reverse than making it public later, matching D-021's established rule. The obsolete public package is removed from local-release inventory; no registry, publication, deployment, or external data action occurs. The corrected independent design review reports PASS. Phase 3 may complete its stated durability done bar without claiming completion of all Part 8 slice-14 product features; PLAN retains FTS/search and forks as named future work.

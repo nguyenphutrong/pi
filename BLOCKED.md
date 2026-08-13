@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. Phase 2 completed by `9e04a44c6` after both final gates passed; Phase 3 SQLite design is next.
+No active blocker. D-032 passed the corrected independent design gate; Phase 3.2a `StoredSession` rename is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.1 — SQLite backend and writer-ownership design
-- Status: Phase 2 completed by `9e04a44c6`; independent whole-phase review and Recovery/QA both PASS
+- Work item: 3.2a — Rename the backend-neutral Session implementation to `StoredSession`
+- Status: D-032 SQLite/storage/repository/lease design passed the independent design gate; implementation has not started
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the Harness v3 SQLite schema, transaction, ownership, recovery, and testing sections.
-2. Audit the current Storage contract, Memory conformance coverage, and package boundaries.
-3. Design `@nguyenphutrong/pi-session-sqlite`, including schema and writer lease/fencing, without changing the approved Storage contract unless the spec makes it unavoidable.
-4. Implement the smallest SQLite backend slice against the shared conformance suite.
-5. Add reopen and process-crash tests before the Phase 3 final gate.
+1. Rename package-internal `MemorySession` to `StoredSession` without changing behavior.
+2. Rewrite the legacy SQLite package as private `@nguyenphutrong/pi-session-sqlite`, including the canonical schema, shared conformance, segmented branch index, `BEGIN IMMEDIATE`, and fenced leases.
+3. Add the private `SqliteSessionRepo` adapter in Harness runtime and run the real RuntimeShell over SQLite.
+4. Add distinct storage-transaction, session-creation, and RuntimeShell subprocess crash matrices.
+5. Run independent whole-Phase-3 review and Recovery/QA gates.
 
 ## Phase order
 
@@ -52,4 +52,5 @@
 - Postgres partitioning and retention daemon.
 - Precise rewrite and general settlement-kernel migrations.
 - Multi-lane, queues, compaction, navigation, and serving concerns until their ordered phases.
+- SQLite FTS/search and coherent fork operations remain incomplete Part 8 slice-14 work assigned to the product-search and fork phases; Phase 3 does not claim the whole slice.
 - Canonical extensible `AgentMessage` ownership and custom-role schemas until before custom messages or the product shell.
