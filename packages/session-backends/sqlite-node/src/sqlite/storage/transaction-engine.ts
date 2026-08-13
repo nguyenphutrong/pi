@@ -6,7 +6,10 @@ import {
 	type UsageRow,
 } from "@nguyenphutrong/pi-session-storage";
 import type { SqliteDatabase } from "../types.ts";
+import { throwPersistedCorruption } from "./persisted-corruption.ts";
 import type { PreparedTransaction } from "./prepared-transaction.ts";
+
+export { isPersistedSqliteCorruption } from "./persisted-corruption.ts";
 
 export interface TransactionEngineContext {
 	readonly db: Pick<SqliteDatabase, "prepare">;
@@ -23,16 +26,8 @@ export interface TransactionEngineOptions {
 	projectInsertedEntry: (context: TransactionEngineContext, entry: Entry) => void;
 }
 
-const persistedCorruptions = new WeakSet<object>();
-
 function markedCorruption(message: string): never {
-	const error = new StorageError("corruption", message);
-	persistedCorruptions.add(error);
-	throw error;
-}
-
-export function isPersistedSqliteCorruption(error: unknown): boolean {
-	return typeof error === "object" && error !== null && persistedCorruptions.has(error);
+	return throwPersistedCorruption(message);
 }
 
 interface StatsRow {

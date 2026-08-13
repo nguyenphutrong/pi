@@ -260,6 +260,7 @@ export function assertEntryScan(value: unknown): asserts value is EntryScan {
 				invalid("invalid_query", `${key} must be a number`);
 		if (scan.order !== undefined && scan.order !== "asc" && scan.order !== "desc")
 			invalid("invalid_query", "Unknown entry order");
+		structuredClone(scan);
 	});
 }
 

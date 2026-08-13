@@ -11,6 +11,7 @@ import {
 } from "../src/index.ts";
 import {
 	assertIdGeneratorConformance,
+	createOrdinaryReadConformance,
 	createStorageConformance,
 	instrumentStorage,
 	type StorageConformanceFixture,
@@ -19,6 +20,17 @@ import {
 const conformance = createStorageConformance(() => {
 	const storage = new MemoryStorage();
 	return Promise.resolve<StorageConformanceFixture>({ storage, [Symbol.asyncDispose]: () => storage.close() });
+});
+
+const ordinaryReads = createOrdinaryReadConformance(() => {
+	const storage = new MemoryStorage();
+	return Promise.resolve({
+		storage,
+		seed: async (transaction: Transaction) => {
+			await storage.commit(transaction);
+		},
+		[Symbol.asyncDispose]: () => storage.close(),
+	});
 });
 
 const ids = {
@@ -191,6 +203,10 @@ describe("MemoryStorage conformance", () => {
 		expect(storage.attempts.at(-1)?.status).toBe("rejected");
 		expect(storage.committedTransactions).toEqual([duplicate]);
 	});
+});
+
+describe("MemoryStorage ordinary-read conformance", () => {
+	for (const testCase of ordinaryReads) it(`${testCase.group}: ${testCase.name}`, () => testCase.run());
 });
 
 describe("MemoryStorage shared state", () => {

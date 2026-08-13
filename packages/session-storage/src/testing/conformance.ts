@@ -2,7 +2,13 @@ import { deepStrictEqual, ok, rejects, strictEqual } from "node:assert/strict";
 import type { Usage } from "@earendil-works/pi-ai";
 import { createFollowerId, createIdGenerator, isUuidV7, uuidV7Timestamp } from "../id.ts";
 import { StorageError, type Transaction } from "../types.ts";
-import type { StorageConformanceCase, StorageConformanceFixture, StorageConformanceFixtureFactory } from "./types.ts";
+import type {
+	OrdinaryReadConformanceFixture,
+	OrdinaryReadConformanceFixtureFactory,
+	StorageConformanceCase,
+	StorageConformanceFixture,
+	StorageConformanceFixtureFactory,
+} from "./types.ts";
 
 const ids = [
 	"018f0000-0000-7000-8000-000000000001",
@@ -49,6 +55,251 @@ function testCase(
 			await run(fixture);
 		},
 	};
+}
+
+function ordinaryReadCase(
+	factory: OrdinaryReadConformanceFixtureFactory,
+	group: string,
+	name: string,
+	run: (fixture: OrdinaryReadConformanceFixture) => Promise<void>,
+): StorageConformanceCase {
+	return {
+		group,
+		name,
+		async run() {
+			await using fixture = await factory();
+			await run(fixture);
+		},
+	};
+}
+
+function generatedId(index: number): string {
+	return `018f0000-${index.toString(16).padStart(4, "0")}-7000-8000-${index.toString(16).padStart(12, "0")}`;
+}
+
+/** Runner-independent cases for the branch-independent Storage read surface. */
+export function createOrdinaryReadConformance(
+	factory: OrdinaryReadConformanceFixtureFactory,
+): readonly StorageConformanceCase[] {
+	const manyEntryIds = Array.from({ length: 905 }, (_, index) => generatedId(index + 100));
+	const manyUsageIds = Array.from({ length: 905 }, (_, index) => generatedId(index + 1100));
+	const scanIds = Array.from({ length: 6 }, (_, index) => generatedId(index + 2100));
+	return [
+		ordinaryReadCase(
+			factory,
+			"exact reads",
+			"returns empty, missing, request-ordered, and multi-chunk exact maps",
+			async ({ storage, seed }) => {
+				deepStrictEqual([...(await storage.getEntries([])).entries()], []);
+				deepStrictEqual([...(await storage.getUsageRows([])).entries()], []);
+				await seed({
+					writes: [
+						...manyEntryIds.map((id) => entry(id)),
+						...manyUsageIds.map((id, index) => ({
+							kind: "usage" as const,
+							row: { id, entryId: manyEntryIds[index], adjustment: false, usage: usage(index) },
+						})),
+					],
+				});
+				const missing = generatedId(3000);
+				const entryRequest = [manyEntryIds[904]!, missing, ...manyEntryIds.slice(0, 901)];
+				const usageRequest = [manyUsageIds[904]!, missing, ...manyUsageIds.slice(0, 901)];
+				deepStrictEqual(
+					[...(await storage.getEntries(entryRequest)).keys()],
+					entryRequest.filter((id) => id !== missing),
+				);
+				deepStrictEqual(
+					[...(await storage.getUsageRows(usageRequest)).keys()],
+					usageRequest.filter((id) => id !== missing),
+				);
+			},
+		),
+		ordinaryReadCase(
+			factory,
+			"registers",
+			"distinguishes absent and null and lists in sequence order",
+			async ({ storage, seed }) => {
+				strictEqual(await storage.getRegister("n", "absent"), undefined);
+				await seed({
+					writes: [
+						{ kind: "register", op: "set", namespace: "n", key: "later", value: { nested: [1] } },
+						{ kind: "register", op: "set", namespace: "n", key: "null", value: null },
+						{ kind: "register", op: "set", namespace: "other", key: "x", value: 1 },
+					],
+				});
+				strictEqual((await storage.getRegister("n", "null"))?.value, null);
+				deepStrictEqual(
+					(await storage.listRegisters("n")).map((row) => row.key),
+					["later", "null"],
+				);
+			},
+		),
+		ordinaryReadCase(
+			factory,
+			"entry scans",
+			"applies type, custom type, ranges, directions, and limits",
+			async ({ storage, seed }) => {
+				await seed({
+					writes: [
+						entry(scanIds[0]!),
+						entry(scanIds[1]!, null, "compaction"),
+						{
+							kind: "entry",
+							entry: { id: scanIds[2]!, parentId: null, type: "custom", customType: "a", payload: { n: 2 } },
+						},
+						{
+							kind: "entry",
+							entry: { id: scanIds[3]!, parentId: null, type: "custom", customType: "b", payload: null },
+						},
+						entry(scanIds[4]!),
+						entry(scanIds[5]!),
+					],
+				});
+				deepStrictEqual(
+					(await storage.scanEntries({ type: "message" })).map((row) => row.id),
+					[scanIds[0], scanIds[4], scanIds[5]],
+				);
+				deepStrictEqual(
+					(await storage.scanEntries({ type: "custom", customType: "a" })).map((row) => row.id),
+					[scanIds[2]],
+				);
+				deepStrictEqual(
+					(await storage.scanEntries({ fromSeq: 2, toSeq: 5 })).map((row) => row.seq),
+					[2, 3, 4, 5],
+				);
+				deepStrictEqual(
+					(await storage.scanEntries({ order: "desc", limit: 2 })).map((row) => row.seq),
+					[6, 5],
+				);
+			},
+		),
+		ordinaryReadCase(factory, "stats", "returns exact complete statistics", async ({ storage, seed }) => {
+			await seed({
+				writes: [
+					entry(scanIds[0]!),
+					entry(scanIds[1]!, null, "compaction"),
+					{ kind: "usage", row: { id: scanIds[2]!, entryId: scanIds[0], adjustment: false, usage: usage(3) } },
+				],
+			});
+			deepStrictEqual(await storage.getStats(), { messageCount: 1, usage: usage(3) });
+		}),
+		ordinaryReadCase(
+			factory,
+			"detachment",
+			"detaches every nested result and an admitted mutable scan query",
+			async ({ storage, seed }) => {
+				await seed({
+					writes: [
+						entry(scanIds[0]!),
+						{ kind: "register", op: "set", namespace: "n", key: "k", value: { nested: [1] } },
+						{
+							kind: "usage",
+							row: {
+								id: scanIds[1]!,
+								entryId: scanIds[0]!,
+								adjustment: false,
+								usage: usage(),
+								details: { nested: [1] },
+							},
+						},
+					],
+				});
+				const query = { order: "asc" as const, limit: 1 };
+				const admitted = storage.scanEntries(query);
+				(query as { order: string; limit: number }).order = "desc";
+				query.limit = 99;
+				deepStrictEqual(
+					(await admitted).map((row) => row.id),
+					[scanIds[0]],
+				);
+				const first = (await storage.getEntries([scanIds[0]!])).get(scanIds[0]!)!;
+				(first.payload as { id: string }).id = "changed";
+				const register = (await storage.getRegister("n", "k"))!;
+				(register.value as { nested: number[] }).nested.push(2);
+				const usageRow = (await storage.getUsageRows([scanIds[1]!])).get(scanIds[1]!)!;
+				usageRow.usage.cost.total = 999;
+				(usageRow.details as { nested: number[] }).nested.push(2);
+				const stats = await storage.getStats();
+				stats.usage.cost.total = 999;
+				strictEqual(
+					((await storage.getEntries([scanIds[0]!])).get(scanIds[0]!)!.payload as { id: string }).id,
+					scanIds[0],
+				);
+				deepStrictEqual((await storage.getRegister("n", "k"))?.value, { nested: [1] });
+				deepStrictEqual((await storage.getUsageRows([scanIds[1]!])).get(scanIds[1]!), {
+					id: scanIds[1],
+					entryId: scanIds[0],
+					seq: 3,
+					adjustment: false,
+					usage: usage(),
+					details: { nested: [1] },
+				});
+				strictEqual((await storage.getStats()).usage.cost.total, usage().cost.total);
+			},
+		),
+		ordinaryReadCase(
+			factory,
+			"validation",
+			"rejects malformed ordinary queries asynchronously as invalid_query",
+			async ({ storage }) => {
+				await rejects(storage.getEntries([scanIds[0]!, scanIds[0]!]), assertCode("invalid_query"));
+				await rejects(storage.getUsageRows([scanIds[0]!, scanIds[0]!]), assertCode("invalid_query"));
+				const sparse = Array(1) as string[];
+				for (const value of [null, "x", [1], ["bad"], sparse]) {
+					let result: Promise<unknown>;
+					try {
+						result = storage.getEntries(value as string[]);
+					} catch {
+						throw new Error("ordinary read validation must not throw synchronously");
+					}
+					await rejects(result, assertCode("invalid_query"));
+					await rejects(storage.getUsageRows(value as string[]), assertCode("invalid_query"));
+				}
+				for (const args of [
+					["", "k"],
+					["n\0", "k"],
+					["n", "k\0"],
+					[1, "k"],
+				] as const)
+					await rejects(storage.getRegister(args[0] as string, args[1]), assertCode("invalid_query"));
+				for (const namespace of [null, "", "n\0", 1])
+					await rejects(storage.listRegisters(namespace as string), assertCode("invalid_query"));
+				for (const query of [
+					null,
+					[],
+					{ customType: "x" },
+					{ fromSeq: -1 },
+					{ toSeq: 1.5 },
+					{ limit: 0 },
+					{ order: "bad" },
+				])
+					await rejects(storage.scanEntries(query as never), assertCode("invalid_query"));
+				const proxy = new Proxy({}, {});
+				await rejects(storage.scanEntries(proxy), assertCode("invalid_query"));
+			},
+		),
+		ordinaryReadCase(
+			factory,
+			"close",
+			"drains admitted reads and rejects all six later reads",
+			async ({ storage, seed }) => {
+				await seed({ writes: [entry(scanIds[0]!)] });
+				const admitted = storage.getStats();
+				const close = storage.close();
+				await admitted;
+				await close;
+				for (const operation of [
+					storage.getEntries([]),
+					storage.getUsageRows([]),
+					storage.getRegister("n", "k"),
+					storage.listRegisters("n"),
+					storage.scanEntries(),
+					storage.getStats(),
+				])
+					await rejects(operation, assertCode("closed"));
+			},
+		),
+	];
 }
 
 /** Runner-independent acceptance cases shared by memory and durable backends. */

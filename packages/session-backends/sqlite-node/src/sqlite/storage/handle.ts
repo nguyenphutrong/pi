@@ -1,7 +1,28 @@
-import { type CommitResult, StorageError, type Transaction } from "@nguyenphutrong/pi-session-storage";
+import {
+	assertEntryScan,
+	assertIdList,
+	assertQueryText,
+	type CommitResult,
+	type Entry,
+	type EntryScan,
+	isUuidV7,
+	type Register,
+	type SessionStats,
+	StorageError,
+	type Transaction,
+	type UsageRow,
+} from "@nguyenphutrong/pi-session-storage";
 import type { SqliteDatabase } from "../types.ts";
 import type { SqliteFileQueue } from "./file-queue.ts";
 import type { TimerFactory, TimerHandle } from "./lifecycle.ts";
+import {
+	readEntries,
+	readEntryScan,
+	readRegister,
+	readRegisters,
+	readStats,
+	readUsageRows,
+} from "./ordinary-reader.ts";
 import { hasPreparedEntries, prepareTransaction } from "./prepared-transaction.ts";
 import {
 	commitSqliteTransaction,
@@ -72,6 +93,65 @@ export class SqliteStorageHandle {
 		}
 	}
 
+	getEntries(ids: string[]): Promise<ReadonlyMap<string, Entry>> {
+		return this.#exactRead(ids, "entry", readEntries);
+	}
+
+	getUsageRows(ids: string[]): Promise<ReadonlyMap<string, UsageRow>> {
+		return this.#exactRead(ids, "usage", readUsageRows);
+	}
+
+	getRegister(namespace: string, key: string): Promise<Register | undefined> {
+		try {
+			this.#assertOpen();
+			assertQueryText(namespace, "namespace");
+			assertQueryText(key, "key");
+			this.#assertRegisterText(namespace, "namespace", false);
+			this.#assertRegisterText(key, "key", true);
+			return this.#admitRead(() => readRegister(this.#options.db, this.#options.lease.sessionId, namespace, key));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	listRegisters(namespace: string): Promise<Register[]> {
+		try {
+			this.#assertOpen();
+			assertQueryText(namespace, "namespace");
+			this.#assertRegisterText(namespace, "namespace", false);
+			return this.#admitRead(() => readRegisters(this.#options.db, this.#options.lease.sessionId, namespace));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	scanEntries(query: EntryScan = {}): Promise<Entry[]> {
+		try {
+			this.#assertOpen();
+			assertEntryScan(query);
+			if (query.limit !== undefined && (!Number.isSafeInteger(query.limit) || query.limit <= 0))
+				throw new StorageError("invalid_query", "limit must be a positive safe integer");
+			for (const name of ["fromSeq", "toSeq"] as const)
+				if (query[name] !== undefined && (!Number.isSafeInteger(query[name]) || query[name]! < 0))
+					throw new StorageError("invalid_query", `${name} must be non-negative`);
+			if (query.customType !== undefined && query.type !== "custom")
+				throw new StorageError("invalid_query", "customType requires custom entry type");
+			const admitted = structuredClone(query);
+			return this.#admitRead(() => readEntryScan(this.#options.db, this.#options.lease.sessionId, admitted));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	getStats(): Promise<SessionStats> {
+		try {
+			this.#assertOpen();
+			return this.#admitRead(() => readStats(this.#options.db, this.#options.lease.sessionId));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
 		this.#sealed = true;
@@ -109,6 +189,43 @@ export class SqliteStorageHandle {
 		if (this.#sealed || this.#timer) return;
 		this.#timer = this.#options.timers.schedule(() => this.#heartbeat(), this.#options.heartbeatMs);
 		this.#timer.unref?.();
+	}
+
+	#exactRead<T>(
+		ids: string[],
+		label: string,
+		read: (db: SqliteDatabase, sessionId: string, ids: readonly string[]) => ReadonlyMap<string, T>,
+	): Promise<ReadonlyMap<string, T>> {
+		try {
+			this.#assertOpen();
+			assertIdList(ids);
+			for (const id of ids) if (!isUuidV7(id)) throw new StorageError("invalid_query", `Invalid ${label} id: ${id}`);
+			const admitted = [...ids];
+			if (admitted.length === 0) return this.#admitRead(() => new Map());
+			return this.#admitRead(() => read(this.#options.db, this.#options.lease.sessionId, admitted));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
+	#admitRead<T>(read: () => T): Promise<T> {
+		return this.#options.queue.enqueue(() => {
+			if (this.#terminal) throw this.#terminal;
+			try {
+				return read();
+			} catch (error) {
+				this.#latch(error);
+				throw error;
+			}
+		});
+	}
+
+	#assertRegisterText(value: string, label: string, allowEmpty: boolean): void {
+		if ((!allowEmpty && value.length === 0) || value.includes("\u0000"))
+			throw new StorageError(
+				"invalid_query",
+				`${label} must ${allowEmpty ? "contain no NUL" : "be non-empty and contain no NUL"}`,
+			);
 	}
 
 	#latch(error: unknown): void {
