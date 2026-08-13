@@ -704,3 +704,46 @@ Option 1 carries a superseded v2 record-era crash prefix into the v3 register st
 This item changes no Storage contract, provider adapter, `pi-ai` surface, public Harness API, or private `agent-loop` behavior. Clearance, `op.tool_args`, replay, dispatch, tool settlement, abort, genuine-length explanatory results, and batch completion remain later Phase 2 work.
 
 Commit `929407e39` implements the complete boundary. Tool-bearing `stop`, `toolUse`, and genuine output-limit `length` responses commit response, leaf, usage, and complete planned batch atomically; below-limit `length`, errors, and deferred responses remain later classification work. Result ids are follower UUIDv7s and restore validates their timestamp relationship, exact source ordering, planned non-materialization, assistant closure, and lane/latest identity without scans, identity resolution, or writes. Harness runtime passes 283/283, `npm run check` and `git diff --check` pass, and the fresh independent final review reports PASS.
+
+## D-027 — Persist sequential tool clearance before dispatch
+
+- Date: 2026-08-13
+- Phase: 2
+- Status: approved for implementation after independent review
+- References: D-024–D-026; `packages/agent/docs/harness-v3.md` §§3.2–3.3, 3.8, 4.1–4.7, 5.7, 9.1–9.3
+
+### Options
+
+1. Perform one process-local clearance action through `@nguyenphutrong/pi-agent-loop` `prepareToolCall`, ending in one atomic prepared-intent or immediate-result transaction, without executing the tool.
+2. Split lookup/validation and `before_tool` into additional process-local and durable stages.
+3. Combine clearance with execute, finalize, and settlement.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The kernel does not import legacy `packages/agent` types. RuntimeShell owns a narrow private, structurally compatible context-aware runtime-tool option and adapter; `@nguyenphutrong/pi-agent-loop` continues to own only stateless `AgentTool` phases. This is a routine package seam within the already approved private architecture, not a §6 public or storage-contract decision, and it does not change D-021–D-023's private package or public release decisions.
+
+At prompt admission, every `activeToolName` must exist alongside the model or acceptance is write-free unavailable. At the first action for a batch, RuntimeShell captures definitions for every `batch.configuration.activeToolNames`, resolves `toolContext` exactly once, binds plain `AgentTool` leases, and retains the immutable snapshot under `assistantEntryId`. Missing definitions are write-free unavailable. A `toolContext` callback throw or rejection is a trusted deterministic application defect and faults the shell under §4.7; it is not missing identity. The source call is derived only from `assistantEntryId + sourceIndex`. A source name outside the retained active lease produces the ordinary immediate not-found result.
+
+One process-local `prepare_tool_call` performs lookup, `prepareArguments`, initial validation, aggregate `before_tool`, and replacement validation through `prepareToolCall`. Full hook-registry event aggregation remains deferred; this slice accepts one narrow aggregate before callback. Only a successful prepared-intent commit retains the same tool lease and prepared call for later dispatch.
+
+The prepared transaction is conditionally authorized by the expected lane-state sequence, operation-state sequence, current operation id, exact tools batch, assistant, turn, source, and result identities, first-unfinished position, leaf sequence and value, and absent argument register and result/usage reservations. It sets `op.tool_args/{operationId}:{turnId}:{sourceIndex}` to detached JSON-object effective arguments, then sets total `op.state` with only this planned call changed to `effect_pending(replay)`. It writes no entry, usage, leaf, or effect. RuntimeShell publishes the process-local prepared plan only after commit; obsolete or failed commits never publish or dispatch.
+
+The immediate transaction uses the same authority. It inserts the reserved `ToolResultMessage` with parent equal to `assistantEntryId` or the prior completed result id, sets `lane.leaf/main`, and sets total `op.state` with the call `completed(terminate)`. It writes no argument register or usage row. The mutation line captures the message timestamp after authority validation. `pi-agent-loop` normalizes the synthetic output with `isError:true`; only a valid intentional block may retain `terminate:true`.
+
+Clearance is strictly source ordered: only the first non-completed call may clear, every earlier call must be completed, and every later call remains planned. A pending earlier call blocks later clearance. If immediate settlement completes the batch, the same transaction deletes every `op.tool_args/{operationId}:{turnId}:*` key in deterministic key order, then checkpoints with `triggerEntryId` equal to the newest result: `may_finish(includeFinalAssistant:false)` iff every completed call terminates, otherwise `need_assistant(false)`. `latestAssistantEntryId` remains the batch-producing assistant while `lane.leaf` and `triggerEntryId` equal that newest tool result. For `may_finish(includeFinalAssistant:false)`, the later terminal transaction records `outcome:"completed"` and `runCompletion:"terminated_tools"`, omits `finalAssistantEntryId` and the final message, and performs the ordinary operation-register cleanup; it does not require the leaf to equal `latestAssistantEntryId` or contain an assistant. No final assistant is fabricated and terminal cleanup does not occur in the immediate-result transaction.
+
+Current-state restoration remains bounded and exact. `effect_pending` requires its deterministic arguments register and `planned` requires none. Completed calls are exactly one contiguous source-order prefix. Every completed result matches its source call's tool-call id, name, and reserved result id; result zero has parent `assistantEntryId`, each later completed result has the preceding result id as parent, and `lane.leaf` equals the last completed result or `assistantEntryId` when none are complete. `latestAssistantEntryId` remains `assistantEntryId` throughout the tools phase and its resulting checkpoint. Checkpoint hydration directly names the trigger and latest-assistant entries and does not reconstruct discarded batch history.
+
+A stale action may finish deterministic preparation and its hook before losing the conditional commit; it writes nothing, publishes no process-local prepared plan, and dispatches nothing. Storage failure faults the shell. Close before commit prevents publication and dispatch; close after commit leaves a valid `effect_pending` state without running the effect.
+
+Tier A covers prepared `safe` and `never` with exact arguments; missing active identity and `toolContext` fault; every representative immediate family (unknown tool, invalid arguments, preparation throw, invalid/throwing/blocking before callback); absence of usage and arguments for synthetics; and two-call source progression. Reopening both final-immediate checkpoints must prove unchanged `latestAssistantEntryId`, the exact result parent/tool identity chain, `need_assistant(false)` starting the next assistant from the newest result, and all-terminating completion committing `runCompletion:"terminated_tools"` with no final assistant and complete operation-register cleanup. Bounded corruption cases cover the same closure and argument-register invariants. Tier B proves exact resolution, preparation, hook, and transaction order plus exact write order. Tier C covers close and stale-authority races and retention of the lease across a delayed callback. The implementation reuses `pi-agent-loop`'s exhaustive callback-normalization tests rather than duplicating them.
+
+Option 2 adds durable program-counter states around stateless deterministic work without improving the §§4.1–4.7 authority or crash boundary; stale work can already be discarded before its one conditional commit. Option 3 crosses the required intent-before-effect boundary, preventing effective arguments and replay policy from becoming durable before dispatch and collapsing the §§3.8 and 9.1–9.3 crash cut. Both conflict with the split established by D-024–D-026.
+
+Execute, update, finalize, `after_tool`, real-result settlement and usage, replay/interrupted recovery, abort, parallelism, full hooks/events, registry setters, and genuine-length explanatory result specialization remain explicit later work unless a currently reachable action requires them.
+
+The fresh independent design gate reports PASS after the terminated-tools finish contract, completed-result closure, and explicit reopen assertions were made exact.

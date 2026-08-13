@@ -4,17 +4,17 @@
 
 - Phase: 2 — Durable tools and abort
 - Work item: 2.5 — Durable sequential tool clearance and settlement
-- Status: item 2.4 implemented by `929407e39` after independent final review; clearance design is next
+- Status: D-027 approved by independent review; retained batch leases and clearance transactions are next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read tool clearance, effect, settlement, and recovery sections and design the smallest durable sequential slice.
-2. Persist effective arguments and replay declaration atomically before dispatch.
-3. Execute/finalize one call at a time and atomically settle its reserved result, optional usage, and total state.
-4. Add restored safe replay versus synthetic interrupted settlement and complete-batch checkpoint cleanup.
-5. Add durable abort/reconciliation, then close/reopen crash matrices and the Phase 2 done-bar gate.
+1. Implement retained batch leases plus conditional clearance transactions.
+2. Add Tier A/B/C clearance tests.
+3. Independently review the complete clearance slice and rework any blockers.
+4. Implement sequential execute/finalize and atomic real settlement.
+5. Add replay/interrupted recovery, abort, crash matrix, and the Phase 2 gate.
 
 ## Phase order
 
