@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-038 passed corrected independent design review in `acb71408b`; ordinary bounded reads and shared seeded test vectors are next.
+No active blocker. D-038 was implemented in `bc071197b` after independent final review PASS; segmented branch projection and scans are next.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 
