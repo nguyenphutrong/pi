@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. B-013 option 1 was implemented in `cdd033a62` and passed final independent review; the per-file FIFO, repository, and fenced handle lifecycle are next.
+No active blocker. D-037 passed corrected independent design review in `3775d11f8`; the per-file FIFO, repository, and fenced handle lifecycle implementation is next.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 
