@@ -1024,6 +1024,12 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		});
 	}
 
+	async runToCompletion(): Promise<void> {
+		for (;;) {
+			if ((await this.executeAction()) === undefined) return;
+		}
+	}
+
 	abort(): Promise<{ readonly operationId: string; readonly drainedSteer: []; readonly drainedFollowUp: [] }> {
 		if (this.#fault) return Promise.reject(this.#fault);
 		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));

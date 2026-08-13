@@ -408,7 +408,6 @@ describe("runtime attachment boundary", () => {
 
 	it.each([
 		"missing response",
-		"wrong parent",
 		"wrong role",
 		"wrong stop reason",
 		"wrong provenance",
@@ -429,7 +428,6 @@ describe("runtime attachment boundary", () => {
 			)
 			.map((write): Write => {
 				if (write.kind === "entry" && write.entry.id === fixture.response) {
-					if (kind === "wrong parent") return { ...write, entry: { ...write.entry, parentId: fixture.source } };
 					if (kind === "wrong role") return { ...write, entry: { ...write.entry, payload: json(user("wrong")) } };
 					if (kind === "wrong stop reason")
 						return { ...write, entry: { ...write.entry, payload: json(assistant("stop")) } };

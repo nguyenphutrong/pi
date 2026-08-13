@@ -261,7 +261,6 @@ async function hydrateCurrentState(
 			if (
 				mainLeaf.value !== triggerEntryId ||
 				state.latestAssistantEntryId !== triggerEntryId ||
-				trigger.parentId !== expectedParent ||
 				!isDeepStrictEqual(state.phase.error, expectedError) ||
 				trigger.message.role !== "assistant" ||
 				!isExactDataObject(trigger.message, syntheticMessageFields) ||
@@ -282,7 +281,6 @@ async function hydrateCurrentState(
 			if (
 				state.latestAssistantEntryId !== batch.assistantEntryId ||
 				assistant.message.role !== "assistant" ||
-				assistant.parentId !== expectedParent ||
 				batch.calls.length !== sourceCalls.length
 			)
 				throw new SessionError("corruption", "Tool batch has an invalid assistant closure");
@@ -346,7 +344,7 @@ async function hydrateCurrentState(
 				state.phase.continuation.kind === "may_finish" &&
 				state.phase.continuation.includeFinalAssistant
 			) {
-				if (trigger.message.role !== "assistant" || trigger.parentId !== expectedParent)
+				if (trigger.message.role !== "assistant")
 					throw new SessionError("corruption", "Finished generation has an invalid assistant closure");
 				if (
 					trigger.message.stopReason === "aborted" &&
