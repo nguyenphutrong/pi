@@ -1162,3 +1162,5 @@ Option 1.
 ### Rationale
 
 Format and ownership are one segment-identity invariant and must not depend on whether an append reaches the exact-tip fast path or divergence materialization. One point check keeps the hot append path bounded while rejecting malformed ids and a valid-shaped id whose creation entry is absent. Complete exact-tip materialization adds unnecessary work, while format-only validation permits the known-invalid cache transition that triggered B-014.
+
+Commit `4a94c253c` implements D-039's projection increment and D-040. Concrete commits and atomic creation now project root, tip, and divergent entries through validated segmented closures. Every physical candidate agrees on canonical entry structure and sequence, compaction-bounded copies retain their exact owner junction, and segment identity is enforced uniformly on the exact-tip and divergence paths. SQLite passes 121/121 tests, its package build, `npm run check`, and `git diff --check`; the fresh independent final review reports PASS. Guarded branch reads and unchanged full Storage conformance remain the next increment.

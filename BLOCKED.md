@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. B-014 option 1 was selected; exact-tip segment ownership rework and fresh review are next.
+No active blocker. B-014 option 1 was implemented in `4a94c253c` after independent final review PASS.
 
 ## B-014 — Apply segment creation identity on the exact-tip path
 
@@ -11,7 +11,7 @@ No active blocker. B-014 option 1 was selected; exact-tip segment ownership rewo
 - Work item: 3.3e — segmented entry projection, divergence, and guarded branch scans
 - Trigger: two independent review-agent rejections for the same incomplete `segment:{creationEntryId}` validation boundary
 - Resolved: 2026-08-13 — human selected option 1
-- Status: resolved; recorded in D-040, implementation and fresh review pending
+- Status: resolved; recorded in D-040 and implemented by `4a94c253c` after independent final review PASS
 
 ### Context
 

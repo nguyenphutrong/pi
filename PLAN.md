@@ -4,17 +4,16 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3e — Segmented entry projection, divergence, and guarded branch scans
-- Status: B-014 option 1 selected; shared exact-tip and divergence segment-identity assertion is next
+- Status: projection core committed as `4a94c253c` after B-014 resolution and independent PASS; guarded branch reads are next
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Resolve B-014, complete exact-tip segment ownership validation, and obtain a fresh independent PASS.
-2. Implement and review guarded branch scans with exact query-plan and segment-chain soundness coverage.
-3. Run unchanged full Storage conformance for Memory and SQLite without weakening the suite.
-4. Add explicit repair and `SqliteSessionRepo` Harness integration.
-5. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
+1. Implement and review guarded branch scans with exact query-plan and segment-chain soundness coverage.
+2. Run unchanged full Storage conformance for Memory and SQLite without weakening the suite.
+3. Add explicit repair and `SqliteSessionRepo` Harness integration.
+4. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
 
 ## Phase order
 
