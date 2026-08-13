@@ -3,17 +3,17 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
-- Status: B-015 resolved by selecting the literal oracle; rework all provider contexts plus exact UUIDv7 usage identities and settlement sequences, then rerun verification and fresh independent review
+- Work item: 3.4b — SQLite storage and session-creation subprocess crash matrices
+- Status: design the exact kill/reopen matrix against D-032/D-033/D-041 and the Phase 3 process-crash done bar
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Audit every RuntimeShell SQLite commit boundary against the Phase 2 manual driver.
-2. Add storage and creation subprocess crash matrices.
-3. Add RuntimeShell subprocess crash matrices.
-4. Run whole-Phase-3 review and Recovery/QA.
+1. Design and implement storage and creation subprocess crash matrices.
+2. Design and implement RuntimeShell subprocess crash matrices.
+3. Run whole-Phase-3 review and Recovery/QA.
+4. Begin Phase 4 queue and interactive-control design only after Phase 3 acceptance.
 
 ## Phase order
 

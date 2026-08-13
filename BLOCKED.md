@@ -11,7 +11,7 @@ No active blockers. B-015 is resolved; Phase 3.4a literal-oracle rework is in pr
 - Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
 - Trigger: two independent implementation reviews rejected the same work item for incomplete exact durable/effect evidence; usage-ledger exactness remains the repeated underlying reason
 - Resolved: 2026-08-13 — human selected option 1
-- Status: resolved; recorded in D-044, with the uncommitted literal-oracle rework and fresh independent review still required before implementation commit
+- Status: resolved and implemented by `152a49b38` after focused 34/34, complete Harness and SQLite suites, root check, and fresh independent review PASS
 
 ### Context
 
