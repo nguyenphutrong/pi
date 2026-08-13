@@ -1141,3 +1141,24 @@ Caller UUID, shape, order, cursor, and filter defects remain reusable `invalid_q
 Focused gates cover roots and tips, divergence with and without compaction, compactions in older bases, exact junction ownership, parent-equals-compaction zero-copy, candidate agreement, same-transaction root/child/sibling projection, rollback and sequence reuse, nested-chain soundness, complete query semantics in both orders, payload/structure parity, corruption, reopen, FIFO/close/fault precedence, exact plans, atomic create/commit, and unchanged full Memory/SQLite Storage conformance.
 
 Explicit repair, Harness integration, FTS/search, forks, retired ranges and retention, JSONL, and subprocess crash matrices remain later ordered work. The corrected independent design review reports PASS with no §6 escalation.
+
+## D-040 — Enforce segment creation identity uniformly
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: confirmed by human after B-014 escalation
+- References: D-039; `packages/agent/docs/harness-v3.md` §2.6
+
+### Options
+
+1. Share one private assertion that validates `segment:{UUIDv7}` and point-checks the suffix creation entry's physical membership, using it from exact-tip and materialized-candidate paths.
+2. Materialize the exact-tip segment's complete closure before every append.
+3. Validate exact-tip format only and defer ownership checks to reads or repair.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+Format and ownership are one segment-identity invariant and must not depend on whether an append reaches the exact-tip fast path or divergence materialization. One point check keeps the hot append path bounded while rejecting malformed ids and a valid-shaped id whose creation entry is absent. Complete exact-tip materialization adds unnecessary work, while format-only validation permits the known-invalid cache transition that triggered B-014.

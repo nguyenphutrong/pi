@@ -2,7 +2,7 @@
 
 ## Current status
 
-Active blocker B-014. Phase 3.3e projection implementation remains uncommitted after repeated review rejection for the same segment-identity invariant.
+No active blocker. B-014 option 1 was selected; exact-tip segment ownership rework and fresh review are next.
 
 ## B-014 — Apply segment creation identity on the exact-tip path
 
@@ -10,7 +10,8 @@ Active blocker B-014. Phase 3.3e projection implementation remains uncommitted a
 - Phase: 3
 - Work item: 3.3e — segmented entry projection, divergence, and guarded branch scans
 - Trigger: two independent review-agent rejections for the same incomplete `segment:{creationEntryId}` validation boundary
-- Status: awaiting human selection; no flagged production or test code has been committed
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; recorded in D-040, implementation and fresh review pending
 
 ### Context
 
@@ -20,11 +21,9 @@ The current uncommitted implementation otherwise passes SQLite 120/120, package 
 
 ### Decision
 
-1. **Recommended:** extract one private segment-identity assertion that validates `segment:{UUIDv7}` and point-checks that the suffix entry is physically present in that segment. Use it from both exact-tip and materialized-candidate paths, add exact-tip malformed/missing-owner regressions, then run a fresh review. This is the smallest complete correction and keeps the fast path bounded.
+1. **Selected:** extract one private segment-identity assertion that validates `segment:{UUIDv7}` and point-checks that the suffix entry is physically present in that segment. Use it from both exact-tip and materialized-candidate paths, add exact-tip malformed/missing-owner regressions, then run a fresh review. This is the smallest complete correction and keeps the fast path bounded.
 2. Materialize and validate the exact-tip segment's complete closure before every append. This also closes the gap but adds unnecessary full-chain work to the hot append path.
 3. Accept format-only validation on exact-tip and defer suffix ownership to reads/repair. This permits a known-invalid cache transition and violates D-039; not recommended.
-
-Reply with `1`, `2`, or `3`.
 
 ## B-013 — Choose the runtime-safe SQLite callback capability
 

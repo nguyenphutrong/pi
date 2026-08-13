@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3e — Segmented entry projection, divergence, and guarded branch scans
-- Status: blocked at B-014 after two review rejections for incomplete segment-identity validation; implementation remains uncommitted
+- Status: B-014 option 1 selected; shared exact-tip and divergence segment-identity assertion is next
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
