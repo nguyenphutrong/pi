@@ -1071,3 +1071,34 @@ The low-level metadata contract is exactly id, creation time, current storage ve
 Focused tests must prove initialization-first ordering, cross-handle/repository FIFO order, producer reservation races, producer cancellation before SQL, atomic creation, lease and fence boundaries, delete in both orderings, commit/heartbeat fencing, fault provenance and precedence, transient heartbeat retry, idempotent close, release-before-connection-close, initialization failure cleanup, and absence of public exports. The corrected independent design review reports PASS with no §6 escalation.
 
 Commit `a470d2bb5` implements D-037. The package passes 71/71 tests, its package build, `npm run check`, and `git diff --check`. Coverage includes synchronous rejected-Promise validation, producer and delete orderings, cross-handle FIFO traces, real-file competing repositories, exact expiry takeover and deletion, atomic-create rollback, heartbeat retry and fence loss, per-handle persisted-corruption isolation, and cleanup/error precedence. A fresh independent final review reports PASS. Ordinary reads and shared backend conformance remain the next unit.
+
+## D-038 — Add ordinary SQLite reads without exposing a partial Storage
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-004–D-005, D-032–D-037; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.5–2.8, 8 slice 14, 9.1–9.3
+
+### Options
+
+1. Put validation, SQL, decoding, and lifecycle arbitration directly in every `SqliteStorageHandle` read method.
+2. Keep admission and faults in the handle, put only concrete synchronous queries and decoded-envelope validation in one private read module, and share seeded ordinary-read test vectors between Memory and SQLite.
+3. Make the handle implement `Storage` now by enabling entry commits with an empty projector or placeholder branch methods, then run the existing full conformance suite.
+
+### Choice
+
+Option 2. The production handle gains only the six branch-independent Storage reads: exact entries, exact usage rows, one register, registers in one namespace, session-wide entry scan, and stats. It remains private and structurally incomplete until segmented projection and branch scans land. The existing full `createStorageConformance()` remains unchanged and continues to mean complete Storage conformance.
+
+### Rationale
+
+Every public-shaped read validates and detaches caller input synchronously before taking a position on D-037's one file FIFO. The handle owns open/closed admission, admitted-versus-late behavior, terminal latching, and close ordering. A private reader owns only fixed SQL operations scoped by exact session id and conversion of SQLite rows to domain-neutral envelopes. It exports no generic query callback or database capability. Reads admitted before close drain before fenced release; reads after the synchronous seal receive a fresh `StorageError("closed")`. If a prior handle fault exists, already-admitted reads receive that original fault.
+
+Caller defects remain reusable `invalid_query`: exact id arrays are dense, unique UUIDv7 lists; register namespace/key text follows the existing empty/NUL rules; entry scans use the existing exact object validator plus safe bounds, type/custom-type compatibility, direction, and positive limit checks. Inputs are detached before queue admission so later mutation cannot alter SQL. An empty exact-id list returns an empty `ReadonlyMap` without SQL. Non-empty exact reads use fixed-size placeholder chunks below SQLite's portable variable limit, perform only primary-key lookups, and reconstruct the final map strictly in caller order; no valid list length is rejected merely because one SQL statement cannot bind it. Register lists use the `(session_id, namespace, key)` primary-key range and sort decoded rows by safe sequence; entry inventory is constrained by `session_id` and driven in sequence order through `ix_entry_seq`. No query reads branch tables, scans register namespaces globally, scans the usage ledger, interpolates caller values into SQL, or opens a transaction.
+
+Each row is reconstructed with exact optional-field semantics before the existing complete `assertEntry`, `assertUsageRow`, or `assertRegister` validator runs. SQL `NULL` means an omitted optional field while stored JSON text `"null"` decodes to JSON null. Stats require one canonical row, a safe non-negative message count, and a complete finite `Usage` payload. A private persisted-corruption marker shared with the transaction engine converts missing canonical session/stats rows, malformed persisted JSON, invalid SQLite scalar/boolean domains, duplicate or impossible exact rows, and failed envelope/stats validation into marked `StorageError("corruption")`. Genuine adapter or SQL failures preserve their original error identity. Either class seals only the affected handle; caller validation happens before FIFO admission and never seals. The shared marker keeps commit-side provenance exact so deterministic caller `corruption` errors remain reusable.
+
+The shared testing subpath gains a narrowly named ordinary-read case factory and fixture type whose storage surface is a `Pick<Storage, ...reads | "close">` plus a setup-only `seed(Transaction)` capability. Memory seeds through its ordinary commit path. SQLite tests seed complete canonical rows through the already-tested private ordered engine with a recording-only projection callback; this is fixture setup, not a production entry-capable handle or a no-op runtime projector. The same vectors then verify empty, missing, ordered, and multi-chunk exact lookups; register semantics; entry-scan filters/ranges/order/limit; stats; detached results and admitted queries; invalid-query classification; reads admitted before close; and closed rejection on both backends. SQLite-specific tests additionally prove primary-key and `ix_entry_seq` plans, no branch access, FIFO order with commit/heartbeat/close, persisted-corruption isolation, reopen, every optional JSON column's malformed-text handling, and exact SQL `NULL` versus JSON text `"null"` decoding.
+
+This testing export is additive only under `@nguyenphutrong/pi-session-storage/testing`; it does not change the production `Storage` contract or weaken the meaning of full conformance. Entry-capable production commits, branch projection and scans, repair, Harness integration, subprocess crash gates, and public SQLite exports remain deferred to their ordered units. Option 3 is rejected because an empty projection creates known-invalid durable cache state and placeholder branch methods falsely claim a complete backend.
+
+The corrected independent design review reports PASS with no §6 escalation.

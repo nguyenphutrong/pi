@@ -4,14 +4,14 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3d — Ordinary bounded reads and shared backend conformance
-- Status: 3.3c repository/lifecycle implementation passed final independent review in `a470d2bb5`; ordinary read/conformance design is next
+- Status: D-038 passed corrected independent design review; ordinary-read implementation is next
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design ordinary exact-entry, register, usage, stats, and sequence reads plus the shared conformance integration boundary without exposing incomplete branch scans.
-2. Implement and test ordinary reads and pass the branch-independent shared backend vectors.
+1. Implement the D-038 private read engine, handle admission, and shared seeded ordinary-read vectors.
+2. Run complete Storage/SQLite tests, build, root check, and independent final review without claiming full Storage conformance.
 3. Implement segmented entry projection, divergence, and guarded branch scans.
 4. Add explicit repair and `SqliteSessionRepo` Harness integration.
 5. Add storage, creation, and RuntimeShell subprocess crash matrices, then run whole-Phase-3 review and Recovery/QA.
