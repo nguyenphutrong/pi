@@ -2,7 +2,31 @@
 
 ## Current status
 
-No active blockers. D-050 increment 4.2c is complete; active write admission and atomic placement are next.
+Blocked at B-017. Phase 4.2d production passes full verification, but its required Tier C evidence cannot be accepted until the repeated dual-owner fixture finding is resolved.
+
+## B-017 — Choose how to replace the unlawful D-052 placement fixture
+
+- Date: 2026-08-13
+- Phase: 4
+- Work item: 4.2d — active write admission and atomic placement
+- Trigger: two independent implementation reviews rejected the same test-ownership boundary; §6 requires human resolution after repeated rejection
+- Status: active; production and tests remain uncommitted
+
+### Context
+
+The implementation admits active façade writes and provides the private exact-FIFO placement transition. Full Harness tests pass 695/695, `npm run check` passes, and `git diff --check` passes. Review found no production or spec defect.
+
+The shared D-052 `placementFixture()` is not lawful evidence: `active(delegate)` attaches one `StoredSession`, then the fixture wraps that same Storage object and attaches a second `StoredSession`. Those sessions have independent mutation lines. Although the tests pass, placement-versus-cancel, abort, and close therefore do not prove the required single-owner serialization. Replacing only the later-admission race did not fix the shared fixture, causing the repeated rejection.
+
+### Decision needed
+
+1. **Recommended:** rebuild the entire D-052 placement fixture around one instrumented Storage, one `StoredSession`, and one `RuntimeOwner` obtained through `claimRuntime`; perform setup, placement, cancellation, abort, admission, and close through that one owner/mutation line. Keep the exact current test matrix and production diff.
+2. Split setup from execution by closing the setup owner, reopening one fresh instrumented owner, and run every placement/race assertion solely through the fresh owner. This is lawful but adds reopen machinery and makes in-process race evidence less direct.
+3. Accept the current dual-owner fixtures because calls happen sequentially. This does not prove the specified ownership boundary and violates the review guardrail; not recommended.
+
+### Resume point
+
+Do not commit the uncommitted production or test files. After selecting option 1 or 2, replace every D-052 placement fixture—not just one race—then run the focused tests, full Harness suite, `npm run check`, and `git diff --check`. Obtain a fresh independent PASS before committing Phase 4.2d.
 
 ## B-016 — Choose the custom-entry projector timing contract
 

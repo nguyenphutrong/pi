@@ -4,17 +4,17 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.2d — Active write admission and atomic placement
-- Status: durable typed pending-write ownership is complete at `89b694f95`; add façade admission and one atomic FIFO placement transition without projector/planner integration yet
+- Status: blocked at B-017 after two independent reviews rejected the same dual-owner placement-test fixture; production and 695/695 Harness tests remain uncommitted
 - Done bar: active façade writes reserve an id and atomically persist pending content plus total `op.state`, idle writes retain their existing direct path, placement commits entries/deletes/leaf/total state in one transaction after exact authority recheck, stale placement writes nothing, and cancel/abort races produce one of the two serialized valid outcomes
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Add active write admission and atomic placement.
-2. Add projector/context and planner actions with stale/fault/close coverage.
-3. Add representative SQLite deferred-write crash evidence.
-4. Add `waitForIdle` and `runWhenIdle`.
-5. Complete whole-Phase-4 acceptance and independent done-bar review.
+1. Resolve B-017 and replace all D-052 placement fixtures with one lawful owner/mutation line.
+2. Re-run full verification and obtain a fresh independent Phase 4.2d PASS.
+3. Add projector/context and planner actions with stale/fault/close coverage.
+4. Add representative SQLite deferred-write crash evidence.
+5. Add `waitForIdle` and `runWhenIdle`.
 
 ## Phase order
 
