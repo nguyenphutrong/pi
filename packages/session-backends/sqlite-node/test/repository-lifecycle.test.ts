@@ -3,7 +3,7 @@ import { mkdtemp, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { JsonValue, Transaction } from "@nguyenphutrong/pi-session-storage";
+import { type JsonValue, StorageError, type Transaction } from "@nguyenphutrong/pi-session-storage";
 import { describe, expect, it } from "vitest";
 import {
 	createNodeSqliteFactory,
@@ -19,15 +19,30 @@ import { type SqliteRepositoryError, SqliteStorageRepository } from "../src/sqli
 import {
 	acquireSqliteLease,
 	createSqliteSession,
+	isPersistedSqliteCorruption,
 	releaseSqliteLease,
 	renewSqliteLease,
 } from "../src/sqlite/storage/transaction-engine.ts";
 
 const id1 = "018f0000-0000-7000-8000-000000000001";
 const id2 = "018f0000-0001-7000-8000-000000000002";
+const id3 = "018f0000-0002-7000-8000-000000000003";
+const id4 = "018f0000-0003-7000-8000-000000000004";
 const register = (key: string, value: JsonValue = key): Transaction => ({
 	writes: [{ kind: "register", op: "set", namespace: "test", key, value }],
 });
+const invalidParentCases: readonly [string, Transaction][] = [
+	["missing", { writes: [{ kind: "entry", entry: { id: id3, parentId: id4, type: "message", payload: {} } }] }],
+	[
+		"forward",
+		{
+			writes: [
+				{ kind: "entry", entry: { id: id3, parentId: id4, type: "message", payload: {} } },
+				{ kind: "entry", entry: { id: id4, parentId: null, type: "message", payload: {} } },
+			],
+		},
+	],
+];
 
 class FakeTimers implements TimerFactory {
 	readonly pending = new Set<{ callback: () => void; delay: number; unref(): void }>();
@@ -256,7 +271,7 @@ describe("SQLite repository lifecycle", () => {
 		await repo.close();
 	});
 
-	it("rejects entry transactions before clock, SQL, or FIFO admission", async () => {
+	it("accepts entry transactions through atomic create and handle commit", async () => {
 		let clocks = 0;
 		const { repo, db } = await capturedRepository({
 			now: () => {
@@ -267,16 +282,132 @@ describe("SQLite repository lifecycle", () => {
 		const entry: Transaction = {
 			writes: [{ kind: "entry", entry: { id: id2, parentId: null, type: "message", payload: {} } }],
 		};
-		await expect(repo.create({ id: id1, initialTransaction: entry })).rejects.toMatchObject({ code: "validation" });
-		expect(clocks).toBe(0);
-		expect(db.prepare("SELECT count(*) AS count FROM sessions").get()).toEqual({ count: 0 });
-		const handle = await repo.create({ id: id1 });
-		const before = clocks;
-		await expect(handle.commit(entry)).rejects.toMatchObject({ code: "invalid_transaction" });
-		expect(clocks).toBe(before);
-		expect(db.prepare("SELECT next_seq FROM session_sequences").get()).toEqual({ next_seq: 1 });
+		const handle = await repo.create({ id: id1, initialTransaction: entry });
+		expect(clocks).toBe(1);
+		expect(db.prepare("SELECT id, seq FROM entries").all()).toEqual([{ id: id2, seq: 1 }]);
+		expect(db.prepare("SELECT branch_id, entry_id, entry_seq FROM branch_entries").all()).toEqual([
+			{ branch_id: `segment:${id2}`, entry_id: id2, entry_seq: 1 },
+		]);
+		await expect(
+			handle.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: { id: "018f0000-0002-7000-8000-000000000003", parentId: id2, type: "message", payload: {} },
+					},
+				],
+			}),
+		).resolves.toMatchObject({ seqs: [2] });
+		expect(db.prepare("SELECT next_seq FROM session_sequences").get()).toEqual({ next_seq: 3 });
 		await handle.close();
 		await repo.close();
+	});
+
+	it("rejects missing segment creation membership on the exact-tip path, rolls back, and seals its handle", async () => {
+		let owner = 0;
+		const { repo, db } = await capturedRepository({ ownerId: () => `owner-${owner++}` });
+		let affected: SqliteStorageHandle | undefined;
+		let sibling: SqliteStorageHandle | undefined;
+		try {
+			affected = await repo.create({ id: id1 });
+			sibling = await repo.create({ id: id2 });
+			await affected.commit({
+				writes: [{ kind: "entry", entry: { id: id3, parentId: null, type: "message", payload: {} } }],
+			});
+			db.exec("PRAGMA foreign_keys=OFF");
+			db.prepare("UPDATE branch_meta SET branch_id = ? WHERE session_id = ?").run(`segment:${id4}`, id1);
+			db.prepare("UPDATE branch_entries SET branch_id = ? WHERE session_id = ?").run(`segment:${id4}`, id1);
+			db.exec("PRAGMA foreign_keys=ON");
+			expect(
+				db.prepare("SELECT branch_id, tip_entry_id, tip_seq FROM branch_meta WHERE session_id = ?").get(id1),
+			).toEqual({ branch_id: `segment:${id4}`, tip_entry_id: id3, tip_seq: 1 });
+			expect(
+				db
+					.prepare("SELECT entry_id FROM branch_entries WHERE session_id = ? AND branch_id = ? AND entry_id = ?")
+					.get(id1, `segment:${id4}`, id4),
+			).toBeUndefined();
+			const before = Object.fromEntries(
+				["entries", "branch_meta", "branch_entries", "session_stats", "session_sequences", "writer_leases"].map(
+					(table) => [table, db.prepare(`SELECT * FROM ${table} WHERE session_id = ?`).all(id1)],
+				),
+			);
+			let failure: unknown;
+			try {
+				await affected.commit({
+					writes: [{ kind: "entry", entry: { id: id4, parentId: id3, type: "message", payload: {} } }],
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toMatchObject({ code: "corruption" });
+			expect(isPersistedSqliteCorruption(failure)).toBe(true);
+			for (const [table, rows] of Object.entries(before))
+				expect(db.prepare(`SELECT * FROM ${table} WHERE session_id = ?`).all(id1), table).toEqual(rows);
+			await expect(affected.commit(register("late"))).rejects.toMatchObject({ code: "closed" });
+			await expect(sibling.commit(register("healthy"))).resolves.toMatchObject({ seqs: [1] });
+		} finally {
+			await affected?.close().catch(() => undefined);
+			await sibling?.close().catch(() => undefined);
+			await repo.close().catch(() => undefined);
+		}
+	});
+
+	it.each(invalidParentCases)("keeps a handle reusable after an invalid %s parent", async (_kind, invalid) => {
+		const { repo } = await capturedRepository();
+		const handle = await repo.create({ id: id1 });
+		try {
+			let failure: unknown;
+			try {
+				await handle.commit(invalid);
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toMatchObject({ code: "invalid_transaction" });
+			expect(isPersistedSqliteCorruption(failure)).toBe(false);
+			await expect(
+				handle.commit({
+					writes: [{ kind: "entry", entry: { id: id2, parentId: null, type: "message", payload: {} } }],
+				}),
+			).resolves.toMatchObject({ seqs: [1] });
+		} finally {
+			await handle.close();
+			await repo.close();
+		}
+	});
+
+	it("rolls back and seals on a one-shot SQL failure during a later projected entry", async () => {
+		const { repo, db } = await capturedRepository();
+		const handle = await repo.create({ id: id1 });
+		try {
+			const before = Object.fromEntries(
+				["entries", "branch_meta", "branch_entries", "session_stats", "session_sequences", "writer_leases"].map(
+					(table) => [table, db.prepare(`SELECT * FROM ${table} WHERE session_id = ?`).all(id1)],
+				),
+			);
+			db.exec(
+				`CREATE TEMP TRIGGER fail_later_projection BEFORE INSERT ON branch_entries WHEN NEW.entry_id = '${id4}' BEGIN SELECT RAISE(ABORT, 'injected projection failure'); END`,
+			);
+			let failure: unknown;
+			try {
+				await handle.commit({
+					writes: [
+						{ kind: "entry", entry: { id: id3, parentId: null, type: "message", payload: {} } },
+						{ kind: "entry", entry: { id: id4, parentId: id3, type: "message", payload: {} } },
+					],
+				});
+			} catch (error) {
+				failure = error;
+			}
+			expect(failure).toBeInstanceOf(Error);
+			expect(failure).not.toBeInstanceOf(StorageError);
+			expect((failure as Error).message).toContain("injected projection failure");
+			for (const [table, rows] of Object.entries(before))
+				expect(db.prepare(`SELECT * FROM ${table} WHERE session_id = ?`).all(id1), table).toEqual(rows);
+			await expect(handle.commit(register("late"))).rejects.toMatchObject({ code: "closed" });
+		} finally {
+			await handle.close().catch(() => undefined);
+			await repo.close().catch(() => undefined);
+		}
 	});
 
 	it("keeps producer reservations visible and cancels queued producers on repository close", async () => {

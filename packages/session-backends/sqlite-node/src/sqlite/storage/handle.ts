@@ -23,7 +23,7 @@ import {
 	readStats,
 	readUsageRows,
 } from "./ordinary-reader.ts";
-import { hasPreparedEntries, prepareTransaction } from "./prepared-transaction.ts";
+import { prepareTransaction } from "./prepared-transaction.ts";
 import {
 	commitSqliteTransaction,
 	isPersistedSqliteCorruption,
@@ -70,8 +70,6 @@ export class SqliteStorageHandle {
 		try {
 			this.#assertOpen();
 			const prepared = prepareTransaction(transaction);
-			if (hasPreparedEntries(prepared))
-				throw new StorageError("invalid_transaction", "Entry writes require branch projection");
 			return this.#options.queue.enqueue(() => {
 				if (this.#terminal) throw this.#terminal;
 				try {

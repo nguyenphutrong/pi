@@ -6,6 +6,7 @@ import {
 	type UsageRow,
 } from "@nguyenphutrong/pi-session-storage";
 import type { SqliteDatabase } from "../types.ts";
+import { projectSqliteEntry } from "./branch-projection.ts";
 import { throwPersistedCorruption } from "./persisted-corruption.ts";
 import type { PreparedTransaction } from "./prepared-transaction.ts";
 
@@ -408,8 +409,6 @@ export function commitSqliteTransaction(
 	ttlMs: number,
 ): CommitResult {
 	assertLeaseInput(lease.sessionId, lease.ownerId, ttlMs, lease.fence);
-	if (transaction.writes.some((write) => write.kind === "entry"))
-		throw new StorageError("invalid_transaction", "Entry projection is not available");
 	return runImmediate(
 		db,
 		(context) => {
@@ -422,9 +421,7 @@ export function commitSqliteTransaction(
 					.changes !== 1
 			)
 				throw new StorageError("closed", "SQLite writer lease was lost");
-			return applyPreparedInCurrentTransaction(db, lease.sessionId, transaction, context, () => {
-				throw new Error("Unexpected entry projection");
-			});
+			return applyPreparedInCurrentTransaction(db, lease.sessionId, transaction, context, projectSqliteEntry);
 		},
 		lease.sessionId,
 		now,
@@ -449,8 +446,6 @@ export function createSqliteSession(
 	initial?: PreparedTransaction,
 ): { readonly metadata: SessionMetadataRow; readonly fence: number } {
 	assertLeaseInput(metadata.id, ownerId, ttlMs);
-	if (initial?.writes.some((write) => write.kind === "entry"))
-		throw new StorageError("invalid_transaction", "Entry projection is not available");
 	const fence = 1;
 	return runImmediate(
 		db,
@@ -475,9 +470,7 @@ export function createSqliteSession(
 				.prepare("INSERT INTO writer_leases (session_id, owner_id, fence, expires_at_ms) VALUES (?, ?, 1, ?)")
 				.run(metadata.id, ownerId, expiry(context.timestamp, ttlMs));
 			if (initial && initial.writes.length > 0) {
-				applyPreparedInCurrentTransaction(db, metadata.id, initial, context, () => {
-					throw new Error("Unexpected entry projection");
-				});
+				applyPreparedInCurrentTransaction(db, metadata.id, initial, context, projectSqliteEntry);
 			}
 			return {
 				metadata: Object.freeze({ ...metadata, createdAt: context.timestamp }),

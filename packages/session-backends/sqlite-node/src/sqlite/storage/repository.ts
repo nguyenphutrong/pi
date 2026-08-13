@@ -4,7 +4,7 @@ import type { SqliteDatabase, SqliteDatabaseFactory } from "../types.ts";
 import { SqliteFileQueue } from "./file-queue.ts";
 import { type SqliteHandleMetadata, SqliteStorageHandle } from "./handle.ts";
 import { nativeTimerFactory, type TimerFactory } from "./lifecycle.ts";
-import { hasPreparedEntries, type PreparedTransaction, prepareTransaction } from "./prepared-transaction.ts";
+import { type PreparedTransaction, prepareTransaction } from "./prepared-transaction.ts";
 import {
 	acquireSqliteSession,
 	createSqliteSession,
@@ -153,8 +153,6 @@ export class SqliteStorageRepository {
 				input.initialTransaction === undefined
 					? undefined
 					: prepareTransaction(input.initialTransaction as Transaction);
-			if (initial && hasPreparedEntries(initial))
-				throw new SqliteRepositoryError("validation", "Initial entry writes require branch projection");
 			this.#reserve(id);
 			return this.#queue
 				.enqueue(() => {
