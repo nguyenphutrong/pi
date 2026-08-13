@@ -1261,3 +1261,24 @@ The Phase 2 formulas remain authoritative. Assistant effects are uncertain after
 The converged state must contain the exact provider responses, the real or policy-required interrupted tool result, exact usage associations, terminal lane result and cleanup, and an idle lane. After all owners close, a read-only complete SQLite snapshot is captured. A third fresh Session/RuntimeShell with independent spies must expose no action, effect, or durable write, and the post-close snapshot must match exactly, including sequence high-water and absent writer lease.
 
 This is a controlled-close commit-prefix audit, not an OS process-crash test. Storage/creation and RuntimeShell subprocess kill matrices remain required before the Phase 3 done bar. No production, Storage, schema, public API, repair, history-fold, or compatibility change is approved. Independent design review reports PASS with no §6 escalation.
+
+## D-044 — Complete the literal SQLite commit-boundary oracle
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: confirmed by human after B-015 escalation
+- References: D-043; `packages/agent/docs/harness-v3.md` §§1.7, 3.2–3.4, 4.4–4.7, 9.1–9.3
+
+### Options
+
+1. Assert every provider context exactly, require UUIDv7 usage ids, and tie every usage sequence to its assistant entry's exact settlement position.
+2. Treat semantic usage association, payload, uniqueness, and monotonic order as sufficient while adding only complete provider-context assertions.
+3. Accept the current matrix despite the repeated independent review failure.
+
+### Choice
+
+Option 1.
+
+### Rationale
+
+The audit claims exact recovery at every commit boundary, so first/last provider samples and merely increasing usage rows leave observable recovery and transaction-order gaps. Every normal run has exactly `[user]` then `[user, assistant tool-call, toolResult]`; cuts 3 and 4 repeat the first context before the tool-result context, while cuts 13 and 14 repeat the tool-result context. Each assistant settlement writes `entry → lane.leaf → usage → op.state`, so its usage row sequence must equal the associated assistant entry sequence plus two. Usage identities must satisfy the same UUIDv7 durable identity contract as the production writer and remain unique and disjoint from entry ids. This is test-only and changes no production or public contract.

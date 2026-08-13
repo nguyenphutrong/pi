@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
-- Status: blocked by B-015 after repeated review rejection of the exact test-oracle boundary; uncommitted matrix passes 34/34 but cannot be committed pending the human choice
+- Status: B-015 resolved by selecting the literal oracle; rework all provider contexts plus exact UUIDv7 usage identities and settlement sequences, then rerun verification and fresh independent review
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

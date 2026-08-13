@@ -2,7 +2,7 @@
 
 ## Current status
 
-Active blocker: B-015 requires a human choice after repeated review rejection of the Phase 3.4a exact test-oracle boundary.
+No active blockers. B-015 is resolved; Phase 3.4a literal-oracle rework is in progress.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 
@@ -10,7 +10,8 @@ Active blocker: B-015 requires a human choice after repeated review rejection of
 - Phase: 3
 - Work item: 3.4a — RuntimeShell SQLite commit-boundary audit
 - Trigger: two independent implementation reviews rejected the same work item for incomplete exact durable/effect evidence; usage-ledger exactness remains the repeated underlying reason
-- Status: active; the uncommitted test passes 34/34 and root check passes, but guardrails prohibit committing it
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; recorded in D-044, with the uncommitted literal-oracle rework and fresh independent review still required before implementation commit
 
 ### Context
 
@@ -18,9 +19,9 @@ The test-only matrix covers all 17 prefixes of the Phase 2 sequential-tool trace
 
 The first implementation review rejected weak action identities, an incomplete nine-table snapshot, incomplete usage fields, and incomplete terminal cleanup. Those were corrected. The second fresh review confirms those findings are closed but still rejects the oracle because assistant-retry contexts are checked only at the first and last call, and usage rows are checked for type/order/association rather than the exact UUIDv7 identity contract and exact settlement sequence relationship. This repeats the usage-ledger exact-evidence boundary, so §6 requires escalation rather than another unilateral test expansion.
 
-### Decision needed
+### Decision
 
-1. **Recommended:** finish the literal oracle. Assert every provider context for normal and uncertain cuts; require each usage id to be UUIDv7; and require each usage sequence to equal its assistant entry sequence plus two, matching the settled response transaction's exact `entry → lane.leaf → usage → op.state` order. Rerun focused/full verification and a fresh independent review.
+1. **Selected:** finish the literal oracle. Assert every provider context for normal and uncertain cuts; require each usage id to be UUIDv7; and require each usage sequence to equal its assistant entry sequence plus two, matching the settled response transaction's exact `entry → lane.leaf → usage → op.state` order. Rerun focused/full verification and a fresh independent review.
 2. Narrow D-043 to semantic ledger equivalence: exact response association, payload, adjustment/details, uniqueness/disjointness, and increasing order are sufficient; add only the missing complete provider-context assertions, then review against the narrowed decision.
 3. Accept the current 34/34 matrix despite the repeated review failure. This violates the guardrail and is not recommended.
 
