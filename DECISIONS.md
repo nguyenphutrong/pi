@@ -976,3 +976,38 @@ Option 1.
 Names and `user_version` do not prove that a current-version object still has its canonical constraints, indexes, `WITHOUT ROWID`, or trigger body. Substring comparison is also insufficient because a damaged table missing a trailing clause can remain a prefix of the canonical definition. Exact per-object equality closes both gaps while retaining one executable schema source of truth. Normalization ignores whitespace and a trailing statement terminator only; any other textual definition drift is rejected. Regressions cover extra objects, a changed same-name index, and a same-name table missing `WITHOUT ROWID`.
 
 Commit `2cf987b40` implements D-034 together with the Phase 3.3a private SQLite adapter/schema foundation. The complete package passes 17/17 tests, `npm run check` and `git diff --check` pass, and the final independent review reports PASS.
+
+## D-035 — Let one private engine own every ordered SQLite write transaction
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-032–D-034; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.6, 2.8, 8 slice 14, 9.3
+
+### Options
+
+1. Put bootstrap, lease lifecycle, ordered writes, and branch policy in one mode-switching engine.
+2. Let each caller open its own SQL transaction around a shared write helper.
+3. Let one private engine own `SqliteDatabase.transaction()`, with mandatory synchronous transaction-prologue and per-entry projection capabilities supplied by its internal callers.
+
+### Choice
+
+Option 3.
+
+### Rationale
+
+After one-time schema initialization, only the engine opens session/catalog/lease/storage write transactions, so one invocation cannot accidentally nest or split `BEGIN IMMEDIATE`. `initializeSqliteSchema()` remains the sole infrastructure exception and owns only creation of an empty database's canonical schema. A raw transaction is synchronously validated, detached, and JSON-serialized before queue or SQL admission. The engine receives only that prepared value, one session id, one injected clock, a mandatory `beforeWrites` callback, and a mandatory `projectInsertedEntry` callback. These types remain private to `src/sqlite/storage`; the package root exposes no partial Storage or repository.
+
+Inside one transaction the engine takes one timestamp, runs `beforeWrites`, reads one current sequence and stats row, preflights durable ids and entry references in caller order, allocates one safe consecutive range, and computes the complete resulting stats projection before mutating rows. It preserves every required and optional `Usage` field and rejects a non-finite usage/cost sum or unsafe message count with `StorageError("invalid_transaction")`; `JSON.stringify` and SQLite constraints are not the detector. It then applies every write in caller order, invokes projection as `insert entry → project that exact complete Entry with assigned seq/timestamp → next caller write`, persists the precomputed stats, advances `next_seq`, and returns the ordinary `CommitResult`. A failed prologue, preflight, write, projection, stats update, or sequence update rolls everything back.
+
+Sequence exhaustion is also deterministic `StorageError("invalid_transaction")`, raised before writes when `writeCount > Number.MAX_SAFE_INTEGER - nextSeq`. Assigned sequences therefore never exceed `Number.MAX_SAFE_INTEGER - 1`; `Number.MAX_SAFE_INTEGER` remains only the stored exhaustion sentinel, so the database never needs to represent `next_seq = Number.MAX_SAFE_INTEGER + 1`.
+
+The callback boundary composes two already-required future paths without implementing them early. Ordinary commits supply exact unexpired owner/fence renewal as `beforeWrites`; atomic creation supplies catalog, sequence, zero stats, and initial lease insertion there. Both then run the same prepared initial transaction with no bootstrap format or second commit. The mandatory projection callback later becomes the segmented branch implementation. Until that exists, only focused engine tests supply a recording projection; no production entry-capable Storage path is exposed and no parent walk or empty projection is introduced.
+
+Deterministic caller failures use existing `StorageError` codes: malformed ids and JSON retain their validator codes; missing or forward references, safe-range exhaustion, and accumulated-stats overflow are `invalid_transaction`; duplicate durable ids are `corruption`. Missing canonical session/sequence/stats rows are corruption; lease loss is `closed`; unexpected SQLite faults retain their original error. Fault latching belongs to the next handle-lifecycle unit, not this synchronous engine.
+
+Focused tests use real in-memory SQLite plus counting wrappers to prove one transaction, one timestamp, exact sequence/write/projection order, committed and earlier-in-transaction references, cross-kind id collisions, register replacement/deletion, complete optional-field stats and overflow rejection, rollback, caller-error reuse, safe exhaustion, projection failure rollback, and bootstrap setup plus initial writes in the same transaction. FIFO, real lease lifecycle, ordinary reads/conformance, segmented branches, repair, and subprocess crash gates remain subsequent units.
+
+Phase 3 assumes SQLite's retired-range inventory is empty. This engine therefore treats missing committed references by the ordinary transaction rules and does not claim support for imported truncated sessions. Retired-range storage, boundary-aware writes/scans, and inherited fork ranges remain the later retention scaffold; no hidden retention semantics enter the nine-table Phase 3 schema.
+
+The corrected independent design review reports PASS with no §6 escalation.
