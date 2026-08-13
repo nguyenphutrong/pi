@@ -8,7 +8,8 @@ export function classifyAssistantSettlement(
 	control: "running" | "cancel_requested",
 ): AssistantSettlementClassification {
 	const hasToolCall = message.content.some((content) => content.type === "toolCall");
-	if (message.stopReason === "aborted") return control === "running" ? "corruption" : "unsupported";
+	if (control === "cancel_requested") return "commit_success";
+	if (message.stopReason === "aborted") return "corruption";
 	if (message.stopReason === "error" || message.deferred !== undefined) return "unsupported";
 	if (message.stopReason === "length" && message.usage.output < intendedOutputLimit) return "unsupported";
 	if (hasToolCall) return "commit_tools";

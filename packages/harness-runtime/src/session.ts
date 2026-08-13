@@ -348,6 +348,14 @@ async function hydrateCurrentState(
 			) {
 				if (trigger.message.role !== "assistant" || trigger.parentId !== expectedParent)
 					throw new SessionError("corruption", "Finished generation has an invalid assistant closure");
+				if (
+					trigger.message.stopReason === "aborted" &&
+					(state.control.status !== "cancel_requested" ||
+						typeof trigger.message.errorMessage !== "string" ||
+						state.latestAssistantEntryId !== triggerEntryId ||
+						mainLeaf.value !== triggerEntryId)
+				)
+					throw new SessionError("corruption", "Aborted generation has an invalid assistant closure");
 			} else if (state.latestAssistantEntryId === triggerEntryId || trigger.message.role !== "toolResult")
 				throw new SessionError("corruption", "Post-tool trigger must contain a tool result after its assistant");
 		} else if (mainLeaf.value !== triggerEntryId || triggerEntryId !== expectedParent) {
@@ -499,9 +507,47 @@ export type FinishRunResult =
 	| {
 			readonly status: "committed";
 			readonly attachment: RuntimeAttachment;
-			readonly result: FinishedRunResult | FailedRunResult;
+			readonly result: FinishedRunResult | FailedRunResult | AbortedRunResult;
 	  }
 	| { readonly status: "obsolete"; readonly attachment: RuntimeAttachment; readonly result?: undefined };
+
+export interface AbortedRunResult {
+	readonly operationId: string;
+	readonly kind: "aborted";
+	readonly leafId: string;
+	readonly finalEntryId?: string;
+	readonly finalMessage?: AssistantMessage;
+}
+
+export type AbortRequestResult =
+	| {
+			readonly status: "committed" | "already_requested";
+			readonly operationId: string;
+			readonly attachment: RuntimeAttachment;
+	  }
+	| { readonly status: "no_active"; readonly attachment: RuntimeAttachment };
+
+export type EffectStartResult = {
+	readonly status: "started" | "not_started" | "obsolete";
+	readonly attachment: RuntimeAttachment;
+};
+
+export interface AssistantEffectStartTransition {
+	readonly operationId: string;
+	readonly stepId: string;
+	readonly attempt: number;
+	readonly responseEntryId: string;
+	readonly usageId: string;
+}
+
+export interface ToolEffectStartTransition {
+	readonly operationId: string;
+	readonly assistantEntryId: string;
+	readonly turnId: string;
+	readonly sourceIndex: number;
+	readonly resultEntryId: string;
+	readonly replay: "never" | "safe";
+}
 
 export interface PrepareAssistantEffectTransition {
 	readonly operationId: string;
@@ -845,6 +891,136 @@ export class MemorySession implements Session {
 		});
 	}
 
+	requestAbort(onCommitted: (attachment: RuntimeAttachment) => void): Promise<AbortRequestResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			const operationId = attachment.laneState.value.currentOperationId;
+			if (operationId === null || !attachment.runState)
+				return Object.freeze({ status: "no_active" as const, attachment });
+			if (attachment.runState.value.control.status === "cancel_requested")
+				return Object.freeze({ status: "already_requested" as const, operationId, attachment });
+			const nextState: RunState = {
+				...attachment.runState.value,
+				control: { status: "cancel_requested", requestedAt: Date.now(), drainedSteer: [], drainedFollowUp: [] },
+			};
+			const committed = await this.#storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: operationId,
+						value: encodeRunState(nextState, operationId),
+					},
+				],
+			});
+			const nextAttachment = Object.freeze({
+				...attachment,
+				runState: Object.freeze({ seq: committed.seqs[0], value: structuredClone(nextState) }),
+			});
+			onCommitted(nextAttachment);
+			return Object.freeze({ status: "committed" as const, operationId, attachment: nextAttachment });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	async #loadRuntimeAttachment(): Promise<RuntimeAttachment> {
+		const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+			this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+			this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+			this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+		]);
+		if (!configurationCandidate || !laneStateCandidate)
+			throw new SessionError("corruption", "Main lane registers are missing");
+		const laneConfiguration = decodeConfigurationRegister(configurationCandidate);
+		const laneState = decodeLaneStateRegister(laneStateCandidate);
+		const mainLeaf = decodeMainLeafRegister(leafCandidate);
+		let runOperation: CurrentRegister<RunOperation> | undefined;
+		let runState: CurrentRegister<RunState> | undefined;
+		if (laneState.value.currentOperationId !== null) {
+			const operationId = laneState.value.currentOperationId;
+			const [meta, state] = await Promise.all([
+				this.#storage.getRegister("op.meta", operationId),
+				this.#storage.getRegister("op.state", operationId),
+			]);
+			if (!meta || !state) throw new SessionError("corruption", "Open operation registers are missing");
+			runOperation = decodeRunOperationRegister(meta, operationId);
+			runState = decodeRunStateRegister(state, operationId);
+		}
+		return Object.freeze({
+			laneConfiguration,
+			laneState,
+			mainLeaf,
+			runOperation,
+			runState,
+			...(await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState)),
+		});
+	}
+
+	startAssistantEffect(transition: AssistantEffectStartTransition, start: () => void): Promise<EffectStartResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			const phase = attachment.runState?.value.phase;
+			const generation = phase?.kind === "assistant" ? phase.generation : undefined;
+			if (
+				attachment.runOperation?.value.operationId !== transition.operationId ||
+				generation?.status !== "effect_pending" ||
+				generation.context.stepId !== transition.stepId ||
+				generation.attempt !== transition.attempt ||
+				generation.responseEntryId !== transition.responseEntryId ||
+				generation.usageId !== transition.usageId
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+			if (attachment.runState?.value.control.status !== "running")
+				return Object.freeze({ status: "not_started" as const, attachment });
+			start();
+			return Object.freeze({ status: "started" as const, attachment });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
+	startToolEffect(transition: ToolEffectStartTransition, start: () => void): Promise<EffectStartResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			const phase = attachment.runState?.value.phase;
+			const batch = phase?.kind === "tools" ? phase.batch : undefined;
+			const call = batch?.calls[transition.sourceIndex];
+			const firstUnfinished = batch?.calls.findIndex((candidate) => candidate.status !== "completed");
+			if (
+				attachment.runOperation?.value.operationId !== transition.operationId ||
+				batch?.assistantEntryId !== transition.assistantEntryId ||
+				batch.turnId !== transition.turnId ||
+				firstUnfinished !== transition.sourceIndex ||
+				call?.status !== "effect_pending" ||
+				call.resultEntryId !== transition.resultEntryId ||
+				call.replay !== transition.replay
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+			if (attachment.runState?.value.control.status !== "running")
+				return Object.freeze({ status: "not_started" as const, attachment });
+			start();
+			return Object.freeze({ status: "started" as const, attachment });
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation;
+	}
+
 	startAssistantStep(transition: StartAssistantStepTransition): Promise<RuntimeTransitionResult> {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
 		const operation = this.#mutationLine.then(async () => {
@@ -1132,7 +1308,10 @@ export class MemorySession implements Session {
 				throw new SessionError("corruption", "Pending recovery no longer closes the current leaf");
 			const capturedNow = Date.now();
 			let nextState: RunState;
-			if (generation.attempt < generation.context.retryPolicy.maxAttempts) {
+			if (
+				runState.value.control.status === "running" &&
+				generation.attempt < generation.context.retryPolicy.maxAttempts
+			) {
 				const exponent = generation.attempt - 1;
 				const multiplier = exponent >= 53 ? Number.MAX_SAFE_INTEGER : 2 ** exponent;
 				const delay = Math.min(Number.MAX_SAFE_INTEGER, generation.context.retryPolicy.baseDelayMs * multiplier);
@@ -1169,6 +1348,7 @@ export class MemorySession implements Session {
 					}),
 				});
 			}
+			const cancelled = runState.value.control.status === "cancel_requested";
 			const error = { code: "provider_interrupted", message: "Provider outcome unknown after interruption" };
 			const usage = {
 				input: 0,
@@ -1185,18 +1365,24 @@ export class MemorySession implements Session {
 				provider: generation.context.configuration.model.provider,
 				model: generation.context.configuration.model.modelId,
 				usage,
-				stopReason: "error",
-				errorMessage: error.message,
+				stopReason: cancelled ? "aborted" : "error",
+				errorMessage: cancelled ? "Operation aborted" : error.message,
 				timestamp: capturedNow,
 			};
 			nextState = {
 				...runState.value,
 				latestAssistantEntryId: transition.responseEntryId,
-				phase: {
-					kind: "failure_drain",
-					error,
-					provenance: { kind: "response", entryId: transition.responseEntryId },
-				},
+				phase: cancelled
+					? {
+							kind: "checkpoint",
+							continuation: { kind: "may_finish", includeFinalAssistant: true },
+							triggerEntryId: transition.responseEntryId,
+						}
+					: {
+							kind: "failure_drain",
+							error,
+							provenance: { kind: "response", entryId: transition.responseEntryId },
+						},
 			};
 			const committed = await this.#storage.commit({
 				writes: [
@@ -1407,6 +1593,14 @@ export class MemorySession implements Session {
 			if (mainLeaf.value !== transition.triggerEntryId)
 				throw new SessionError("corruption", "Pending assistant effect no longer closes the current leaf");
 
+			const settledMessage: AssistantMessage =
+				runState.value.control.status === "cancel_requested"
+					? {
+							...structuredClone(transition.message),
+							stopReason: "aborted",
+							errorMessage: transition.message.errorMessage ?? "Operation aborted",
+						}
+					: transition.message;
 			const response = hydrated.entries.get(transition.responseEntryId);
 			const usage = hydrated.usageRows.get(transition.usageId);
 			if (response || usage) {
@@ -1414,10 +1608,10 @@ export class MemorySession implements Session {
 					throw new SessionError("corruption", "Assistant settlement reservations materialized partially");
 				if (
 					response.parentId !== transition.triggerEntryId ||
-					!isDeepStrictEqual(response.message, transition.message) ||
+					!isDeepStrictEqual(response.message, settledMessage) ||
 					usage.entryId !== transition.responseEntryId ||
 					usage.adjustment ||
-					!isDeepStrictEqual(usage.usage, transition.message.usage)
+					!isDeepStrictEqual(usage.usage, settledMessage.usage)
 				)
 					throw new SessionError(
 						"corruption",
@@ -1436,9 +1630,9 @@ export class MemorySession implements Session {
 			if (classification === "unsupported")
 				return Object.freeze({ status: "unsupported" as const, classification, attachment });
 
-			const toolCalls = transition.message.content.filter((content) => content.type === "toolCall");
+			const toolCalls = settledMessage.content.filter((content) => content.type === "toolCall");
 			const resultEntryIds =
-				classification === "commit_tools"
+				classification === "commit_tools" && runState.value.control.status === "running"
 					? toolCalls.map(() => createFollowerId(transition.responseEntryId, this.idGenerator))
 					: [];
 			if (classification === "commit_tools") {
@@ -1473,7 +1667,7 @@ export class MemorySession implements Session {
 				...runState.value,
 				latestAssistantEntryId: transition.responseEntryId,
 				phase:
-					classification === "commit_tools"
+					classification === "commit_tools" && runState.value.control.status === "running"
 						? {
 								kind: "tools",
 								batch: {
@@ -1501,7 +1695,7 @@ export class MemorySession implements Session {
 							id: transition.responseEntryId,
 							parentId: transition.triggerEntryId,
 							type: "message",
-							payload: encodeMessage(transition.message),
+							payload: encodeMessage(settledMessage),
 						},
 					},
 					{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: transition.responseEntryId },
@@ -1510,7 +1704,7 @@ export class MemorySession implements Session {
 						row: {
 							id: transition.usageId,
 							entryId: transition.responseEntryId,
-							usage: structuredClone(transition.message.usage),
+							usage: structuredClone(settledMessage.usage),
 							adjustment: false,
 						},
 					},
@@ -1532,7 +1726,7 @@ export class MemorySession implements Session {
 					seq: committed.seqs[0],
 					timestamp: committed.timestamp,
 					type: "message" as const,
-					message: structuredClone(transition.message),
+					message: structuredClone(settledMessage),
 				}),
 			);
 			const usageRows = new Map(hydrated.usageRows);
@@ -1542,7 +1736,7 @@ export class MemorySession implements Session {
 					id: transition.usageId,
 					seq: committed.seqs[2],
 					entryId: transition.responseEntryId,
-					usage: structuredClone(transition.message.usage),
+					usage: structuredClone(settledMessage.usage),
 					adjustment: false,
 				}),
 			);
@@ -1695,16 +1889,17 @@ export class MemorySession implements Session {
 					: candidate,
 			);
 			const final = transition.sourceIndex === batch.calls.length - 1;
+			const cancelled = runState.value.control.status === "cancel_requested";
 			const nextState: RunState = {
 				...runState.value,
 				phase: final
 					? {
 							kind: "checkpoint",
-							continuation: completedCalls.every(
-								(candidate) => candidate.status === "completed" && candidate.terminate,
-							)
-								? { kind: "may_finish", includeFinalAssistant: false }
-								: { kind: "need_assistant", overflowRecoveryUsed: false },
+							continuation:
+								cancelled ||
+								completedCalls.every((candidate) => candidate.status === "completed" && candidate.terminate)
+									? { kind: "may_finish", includeFinalAssistant: false }
+									: { kind: "need_assistant", overflowRecoveryUsed: false },
 							triggerEntryId: transition.resultEntryId,
 						}
 					: { kind: "tools", batch: { ...batch, calls: completedCalls } },
@@ -1967,16 +2162,17 @@ export class MemorySession implements Session {
 					: candidate,
 			);
 			const final = transition.sourceIndex === batch.calls.length - 1;
+			const cancelled = runState.value.control.status === "cancel_requested";
 			const nextState: RunState = {
 				...runState.value,
 				phase: final
 					? {
 							kind: "checkpoint",
-							continuation: completedCalls.every(
-								(candidate) => candidate.status === "completed" && candidate.terminate,
-							)
-								? { kind: "may_finish", includeFinalAssistant: false }
-								: { kind: "need_assistant", overflowRecoveryUsed: false },
+							continuation:
+								cancelled ||
+								completedCalls.every((candidate) => candidate.status === "completed" && candidate.terminate)
+									? { kind: "may_finish", includeFinalAssistant: false }
+									: { kind: "need_assistant", overflowRecoveryUsed: false },
 							triggerEntryId: transition.resultEntryId,
 						}
 					: { kind: "tools", batch: { ...batch, calls: completedCalls } },
@@ -2123,13 +2319,18 @@ export class MemorySession implements Session {
 			if (!runOperation || !runState)
 				throw new SessionError("corruption", "Validated finish authority changed inside the mutation line");
 			const phase = runState.value.phase;
+			const cancelled = runState.value.control.status === "cancel_requested";
 			const completed = phase.kind === "checkpoint" && phase.continuation.kind === "may_finish";
 			const failed = phase.kind === "failure_drain";
+			const cancelledBoundary =
+				phase.kind === "checkpoint" ||
+				phase.kind === "failure_drain" ||
+				(phase.kind === "assistant" && phase.generation.status !== "effect_pending") ||
+				(phase.kind === "tools" && phase.batch.calls.every((call) => call.status === "completed"));
 			if (
 				runOperation.value.operationId !== transition.operationId ||
 				runOperation.value.lane !== MAIN ||
-				runState.value.control.status !== "running" ||
-				(!completed && !failed) ||
+				(cancelled ? !cancelledBoundary : !completed && !failed) ||
 				runState.value.inbox.steer.length !== 0 ||
 				runState.value.inbox.followUp.length !== 0 ||
 				runState.value.inbox.writes.length !== 0 ||
@@ -2141,16 +2342,23 @@ export class MemorySession implements Session {
 					phase.continuation.kind === "may_finish" &&
 					phase.continuation.includeFinalAssistant &&
 					mainLeaf.value !== runState.value.latestAssistantEntryId) ||
-				runState.value.latestAssistantEntryId === null
+				(!cancelled && runState.value.latestAssistantEntryId === null)
 			)
 				throw new SessionError("corruption", "Run is not at a valid finish boundary");
 			const finalEntry = hydrated.entries.get(mainLeaf.value);
+			const latestEntry =
+				runState.value.latestAssistantEntryId === null
+					? undefined
+					: hydrated.entries.get(runState.value.latestAssistantEntryId);
+			if (runState.value.latestAssistantEntryId !== null && latestEntry?.message.role !== "assistant")
+				throw new SessionError("corruption", "Latest assistant entry is missing or invalid");
+			if (!finalEntry) throw new SessionError("corruption", "Final entry is missing or invalid");
 			const includeFinalAssistant =
 				phase.kind !== "checkpoint" ||
 				phase.continuation.kind !== "may_finish" ||
 				phase.continuation.includeFinalAssistant;
 			if (
-				!finalEntry ||
+				!cancelled &&
 				(includeFinalAssistant ? finalEntry.message.role !== "assistant" : finalEntry.message.role !== "toolResult")
 			)
 				throw new SessionError("corruption", "Final entry is missing or invalid");
@@ -2180,8 +2388,26 @@ export class MemorySession implements Session {
 					.sort((left, right) => left.key.localeCompare(right.key)),
 			];
 			let durableResult: JsonValue;
-			let result: FinishedRunResult | FailedRunResult;
-			if (phase.kind === "failure_drain") {
+			let result: FinishedRunResult | FailedRunResult | AbortedRunResult;
+			if (cancelled) {
+				durableResult = encodeLaneLastResult({
+					operationId: transition.operationId,
+					kind: "run",
+					outcome: "aborted",
+					leafId: mainLeaf.value,
+					...(runState.value.latestAssistantEntryId === null
+						? {}
+						: { finalAssistantEntryId: runState.value.latestAssistantEntryId }),
+				});
+				result = Object.freeze({
+					operationId: transition.operationId,
+					kind: "aborted",
+					leafId: mainLeaf.value,
+					...(latestEntry?.message.role === "assistant"
+						? { finalEntryId: latestEntry.id, finalMessage: structuredClone(latestEntry.message) }
+						: {}),
+				});
+			} else if (phase.kind === "failure_drain") {
 				durableResult = encodeLaneLastResult({
 					operationId: transition.operationId,
 					kind: "run",
@@ -2212,7 +2438,7 @@ export class MemorySession implements Session {
 						kind: "completed",
 						leafId: mainLeaf.value,
 						finalEntryId: mainLeaf.value,
-						finalMessage: structuredClone(finalEntry.message) as AssistantMessage,
+						finalMessage: structuredClone(finalEntry!.message) as AssistantMessage,
 					});
 				} else {
 					durableResult = encodeLaneLastResult({

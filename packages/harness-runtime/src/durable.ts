@@ -26,6 +26,10 @@ export interface OperationError {
 	message: string;
 }
 
+export type Control =
+	| { status: "running" }
+	| { status: "cancel_requested"; requestedAt: number; drainedSteer: []; drainedFollowUp: [] };
+
 export type LaneLastResult = {
 	operationId: string;
 	kind: "run";
@@ -34,6 +38,7 @@ export type LaneLastResult = {
 	| { outcome: "completed"; runCompletion: "assistant"; finalAssistantEntryId: string }
 	| { outcome: "completed"; runCompletion: "terminated_tools"; finalAssistantEntryId?: never }
 	| { outcome: "failed"; error: OperationError; finalAssistantEntryId: string; runCompletion?: never }
+	| { outcome: "aborted"; finalAssistantEntryId?: string; runCompletion?: never }
 );
 
 export interface RunOperation {
@@ -128,7 +133,7 @@ type ToolsPhase = { kind: "tools"; batch: ToolBatch };
 
 export interface RunState {
 	kind: "run";
-	control: { status: "running" };
+	control: Control;
 	settings: {
 		compaction: { enabled: boolean; reserveTokens: number; keepRecentTokens: number };
 		steeringMode: "all" | "one-at-a-time";
@@ -280,11 +285,18 @@ export function decodeLaneLastResult(value: unknown): LaneLastResult {
 						: ["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "runCompletion"],
 					"lane last result",
 				)
-			: object(
-					candidate,
-					["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "error"],
-					"lane last result",
-				);
+			: candidate.outcome === "aborted"
+				? optionalObject(
+						candidate,
+						["operationId", "kind", "outcome", "leafId"],
+						["finalAssistantEntryId"],
+						"lane last result",
+					)
+				: object(
+						candidate,
+						["operationId", "kind", "outcome", "leafId", "finalAssistantEntryId", "error"],
+						"lane last result",
+					);
 	uuid(result.operationId, "lane last result operationId");
 	uuid(result.leafId, "lane last result leafId");
 	if (result.kind !== "run") fail("Unsupported lane last result kind");
@@ -296,8 +308,15 @@ export function decodeLaneLastResult(value: unknown): LaneLastResult {
 	} else if (result.outcome === "failed") {
 		uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
 		decodeOperationError(result.error, "lane last result error");
+	} else if (result.outcome === "aborted") {
+		if (result.finalAssistantEntryId !== undefined)
+			uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
 	} else fail("Unsupported lane last result outcome");
-	if (result.runCompletion !== "terminated_tools" && result.leafId !== result.finalAssistantEntryId)
+	if (
+		result.outcome !== "aborted" &&
+		result.runCompletion !== "terminated_tools" &&
+		result.leafId !== result.finalAssistantEntryId
+	)
 		fail("Assistant lane last result leaf must equal its final assistant");
 	return result as unknown as LaneLastResult;
 }
@@ -449,8 +468,18 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 			"run state",
 		);
 		if (state.kind !== "run") fail("Only run state is supported");
-		if (object(state.control, ["status"], "run control").status !== "running")
-			fail("Only running control is supported");
+		const controlCandidate = semanticObject(state.control, "run control");
+		if (controlCandidate.status === "running") object(controlCandidate, ["status"], "run control");
+		else if (controlCandidate.status === "cancel_requested") {
+			const control = object(
+				controlCandidate,
+				["status", "requestedAt", "drainedSteer", "drainedFollowUp"],
+				"run control",
+			);
+			safe(control.requestedAt, "requestedAt");
+			emptyArray(control.drainedSteer, "drainedSteer");
+			emptyArray(control.drainedFollowUp, "drainedFollowUp");
+		} else fail("Unsupported run control");
 		const settings = object(
 			state.settings,
 			["compaction", "steeringMode", "followUpMode", "toolExecution"],

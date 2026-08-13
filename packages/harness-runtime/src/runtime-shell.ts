@@ -35,9 +35,12 @@ import {
 	recoverAssistantEffect,
 	refreshRuntimeAttachment,
 	releaseAssistantRetry,
+	requestAbort,
 	settleAssistantEffect,
 	settleToolCall,
+	startAssistantEffect,
 	startAssistantStep,
+	startToolEffect,
 } from "./runtime-port.ts";
 import { RuntimeSettingsOwner } from "./runtime-settings.ts";
 import type { ClearToolCallOutcome, RuntimeAttachment } from "./session.ts";
@@ -142,6 +145,11 @@ type ToolEffectState =
 			readonly controller: AbortController;
 			readonly outcome: ExecutedToolCallOutcome;
 	  }
+	| {
+			readonly status: "finalizing";
+			readonly plan: ToolEffectPlan;
+			readonly finalizing: Promise<FinalizedToolCallOutcome>;
+	  }
 	| { readonly status: "finalized"; readonly plan: ToolEffectPlan; readonly finalized: FinalizedToolCallOutcome };
 
 function bindRuntimeTool<TContext extends object | undefined, TParameters extends TSchema, TDetails>(
@@ -245,10 +253,23 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		});
 	}
 
+	#publish(attachment: RuntimeAttachment): void {
+		const highWaterMark = (candidate: RuntimeAttachment): number =>
+			Math.max(
+				candidate.laneConfiguration.seq,
+				candidate.laneState.seq,
+				candidate.mainLeaf.seq,
+				candidate.runOperation?.seq ?? 0,
+				candidate.runState?.seq ?? 0,
+				...Array.from(candidate.entries.values(), (entry) => entry.seq),
+				...Array.from(candidate.usageRows.values(), (usage) => usage.seq),
+			);
+		if (highWaterMark(attachment) >= highWaterMark(this.#current)) this.#current = attachment;
+	}
+
 	#abortRunningEffects(): void {
 		for (const effect of this.#assistantEffects.values()) if (effect.status === "running") effect.controller.abort();
-		for (const effect of this.#toolEffects.values())
-			if (effect.status === "running" || effect.status === "raw") effect.controller.abort();
+		for (const effect of this.#toolEffects.values()) if (effect.status === "running") effect.controller.abort();
 	}
 
 	#faultShell(effectKey: string | undefined, cause: unknown, message: string): RuntimeShellError {
@@ -308,6 +329,65 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "cancel_planned_tool") {
+				const info = action.info;
+				const assistant = this.#current.entries.get(info.assistantEntryId);
+				const source =
+					assistant?.message.role === "assistant"
+						? assistant.message.content.filter((content) => content.type === "toolCall")[info.sourceIndex]
+						: undefined;
+				if (!source) throw this.#faultShell(undefined, undefined, "Cancelled tool source is missing");
+				const result = await clearToolCall(this.#session, {
+					operationId: info.operationId,
+					assistantEntryId: info.assistantEntryId,
+					turnId: info.turnId,
+					sourceIndex: info.sourceIndex,
+					resultEntryId: info.resultEntryId,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLaneStateSeq: action.expected.laneStateSeq,
+					expectedLeafSeq: this.#current.mainLeaf.seq,
+					expectedLeafId: this.#current.mainLeaf.value,
+					outcome: {
+						kind: "immediate",
+						toolCall: structuredClone(source),
+						result: { content: [{ type: "text", text: "Operation aborted" }], details: {} },
+						isError: true,
+						terminate: false,
+					},
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#publish(result.attachment);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Cancelled tool is obsolete");
+				return info;
+			}
+			if (action.info.kind === "cancel_tool_effect") {
+				const effectKey = action.info.effectKey;
+				const effect = this.#toolEffects.get(effectKey);
+				if (effect?.status !== "planned") throw new RuntimeShellError("stale", "Tool effect is no longer planned");
+				const plan = effect.plan;
+				const result = await settleToolCall(this.#session, {
+					operationId: plan.operationId,
+					assistantEntryId: plan.assistantEntryId,
+					turnId: plan.turnId,
+					sourceIndex: plan.sourceIndex,
+					resultEntryId: plan.resultEntryId,
+					replay: plan.prepared.replay,
+					toolCall: structuredClone(plan.prepared.toolCall),
+					args: structuredClone(plan.prepared.args) as Record<string, JsonValue>,
+					content: [{ type: "text", text: "Operation aborted" }],
+					details: {},
+					isError: true,
+					terminate: false,
+				}).catch((cause: unknown) => {
+					throw this.#toolFailure(effectKey, cause);
+				});
+				this.#publish(result.attachment);
+				this.#toolEffects.delete(effectKey);
+				this.#preparedTools.delete(`${plan.assistantEntryId}:${plan.sourceIndex}`);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Cancelled tool is obsolete");
+				return action.info;
+			}
 			if (action.info.kind === "prepare_tool_call") {
 				const info = action.info;
 				const phase = this.#current.runState?.value.phase;
@@ -386,7 +466,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Tool clearance is no longer authoritative");
 				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
@@ -439,7 +519,12 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					);
 				const definition = call.replay === "safe" ? this.#toolDefinitions.get(source.name) : undefined;
 				const currentReplay = definition?.replay ?? "never";
-				if (call.replay === "safe" && definition && currentReplay === "safe") {
+				if (
+					this.#current.runState?.value.control.status === "running" &&
+					call.replay === "safe" &&
+					definition &&
+					currentReplay === "safe"
+				) {
 					let context: TContext;
 					try {
 						context =
@@ -452,7 +537,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					const refreshed = await refreshRuntimeAttachment(this.#session).catch((cause: unknown) => {
 						throw this.#transitionFailure(cause);
 					});
-					this.#current = refreshed;
+					this.#publish(refreshed);
 					if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
 					const currentPhase = refreshed.runState?.value.phase;
 					const currentCall =
@@ -520,7 +605,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#toolFailure(toolEffectKey(info.operationId, info.turnId, info.sourceIndex), cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Tool effect is no longer authoritative");
 				return info;
@@ -549,26 +634,32 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const observed = new Promise<ObservedToolResult>((resolve) => {
 					observe = resolve;
 				});
-				this.#toolEffects.set(effectKey, {
-					status: "running",
-					plan: effect.plan,
-					controller,
-					observed,
-				});
-				this.#preparedTools.delete(preparedKey);
-				try {
-					Promise.resolve(executeToolCall(effect.plan.prepared, controller.signal)).then(
-						(outcome) => observe({ status: "fulfilled", outcome }),
-						(cause) => observe({ status: "rejected", error: this.#toolFailure(effectKey, cause) }),
-					);
-				} catch (cause) {
-					controller.abort();
+				const result = await startToolEffect(
+					this.#session,
+					{ ...effect.plan, replay: effect.plan.prepared.replay },
+					() => {
+						this.#toolEffects.set(effectKey, { status: "running", plan: effect.plan, controller, observed });
+						this.#preparedTools.delete(preparedKey);
+						Promise.resolve(executeToolCall(effect.plan.prepared, controller.signal)).then(
+							(outcome) => observe({ status: "fulfilled", outcome }),
+							(cause) => observe({ status: "rejected", error: this.#toolFailure(effectKey, cause) }),
+						);
+					},
+				).catch((cause: unknown) => {
 					throw this.#toolFailure(effectKey, cause);
-				}
+				});
+				this.#publish(result.attachment);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Tool effect is obsolete");
+				if (result.status === "not_started") return action.info;
 				return action.info;
 			}
 			if (action.info.kind === "await_tool_effect") {
 				const effect = this.#toolEffects.get(action.info.effectKey);
+				if (effect?.status === "finalizing") {
+					const finalized = await effect.finalizing;
+					this.#toolEffects.set(action.info.effectKey, { status: "finalized", plan: effect.plan, finalized });
+					return action.info;
+				}
 				if (effect?.status !== "running") throw new RuntimeShellError("stale", "Tool effect is no longer running");
 				const observed = await Promise.race([effect.observed, this.#shutdownNotice.then(() => undefined)]);
 				if (this.#fault) throw this.#fault;
@@ -584,22 +675,34 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				return action.info;
 			}
 			if (action.info.kind === "finalize_tool_effect") {
-				const effect = this.#toolEffects.get(action.info.effectKey);
+				const effectKey = action.info.effectKey;
+				const effect = this.#toolEffects.get(effectKey);
 				if (effect?.status !== "raw") throw new RuntimeShellError("stale", "Tool effect has no raw result");
-				let finalized: FinalizedToolCallOutcome;
-				try {
-					finalized = await finalizeToolCall(
-						effect.plan.prepared,
-						effect.outcome,
-						this.#afterToolCall,
-						effect.controller.signal,
-					);
-				} catch (cause) {
-					throw this.#toolFailure(action.info.effectKey, cause);
-				}
+				let finalizing: Promise<FinalizedToolCallOutcome> | undefined;
+				const result = await startToolEffect(
+					this.#session,
+					{ ...effect.plan, replay: effect.plan.prepared.replay },
+					() => {
+						finalizing = finalizeToolCall(
+							effect.plan.prepared,
+							effect.outcome,
+							this.#afterToolCall,
+							effect.controller.signal,
+						);
+						this.#toolEffects.set(effectKey, { status: "finalizing", plan: effect.plan, finalizing });
+					},
+				).catch((cause: unknown) => {
+					throw this.#toolFailure(effectKey, cause);
+				});
+				this.#publish(result.attachment);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Tool finalization is obsolete");
+				const finalized =
+					result.status === "started" && finalizing
+						? await finalizing
+						: { ...(await finalizeToolCall(effect.plan.prepared, effect.outcome)), terminate: false };
 				if (this.#fault) throw this.#fault;
 				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
-				this.#toolEffects.set(action.info.effectKey, { status: "finalized", plan: effect.plan, finalized });
+				this.#toolEffects.set(effectKey, { status: "finalized", plan: effect.plan, finalized });
 				return action.info;
 			}
 			if (action.info.kind === "settle_tool_effect") {
@@ -634,7 +737,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const result = await settleToolCall(this.#session, detached).catch((cause: unknown) => {
 					throw this.#toolFailure(effectKey, cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				this.#toolEffects.delete(effectKey);
 				this.#preparedTools.delete(`${effect.plan.assistantEntryId}:${effect.plan.sourceIndex}`);
 				if (result.status === "obsolete")
@@ -679,7 +782,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				this.#retryElapsed.delete(proof);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Assistant retry wait is no longer authoritative");
@@ -702,7 +805,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
+				this.#assistantEffects.delete(assistantEffectKey(info.operationId, info.stepId, info.attempt));
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
 				return info;
@@ -718,13 +822,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const observed = new Promise<ObservedAssistantResult>((resolve) => {
 					observe = resolve;
 				});
-				this.#assistantEffects.set(effectKey, {
-					status: "running",
-					plan: effect.plan,
-					controller,
-					observed,
-				});
-				try {
+				const result = await startAssistantEffect(this.#session, effect.plan, () => {
+					this.#assistantEffects.set(effectKey, { status: "running", plan: effect.plan, controller, observed });
 					const stream = effect.plan.lease.streamSimple(effect.plan.context, {
 						...effect.plan.options,
 						signal: controller.signal,
@@ -735,10 +834,11 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 							observe({ status: "rejected", error: this.#assistantFailure(effectKey, cause) });
 						},
 					);
-				} catch (cause) {
-					controller.abort();
+				}).catch((cause: unknown) => {
 					throw this.#assistantFailure(effectKey, cause);
-				}
+				});
+				this.#publish(result.attachment);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Assistant effect is obsolete");
 				return action.info;
 			}
 			if (action.info.kind === "await_assistant_effect") {
@@ -792,7 +892,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#assistantFailure(effectKey, cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (result.status === "unsupported")
 					throw new RuntimeShellError(
 						"unavailable",
@@ -803,7 +903,11 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
 				return action.info;
 			}
-			if (action.info.kind === "finish_run" || action.info.kind === "finish_failed_run") {
+			if (
+				action.info.kind === "finish_run" ||
+				action.info.kind === "finish_failed_run" ||
+				action.info.kind === "finish_aborted_run"
+			) {
 				const result = await finishRun(this.#session, {
 					operationId: action.info.operationId,
 					expectedOperationStateSeq: action.expected.operationStateSeq,
@@ -811,7 +915,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Run finish is no longer authoritative");
 				return action.info;
@@ -880,7 +984,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 						intendedOutputLimit,
 						contextWindow,
 					});
-					this.#current = result.attachment;
+					this.#publish(result.attachment);
 					if (!result.committed) throw new RuntimeShellError("stale", "Action no longer matches durable state");
 					const key = assistantEffectKey(info.operationId, info.stepId, info.nextAttempt);
 					this.#assistantEffects.set(key, {
@@ -913,11 +1017,33 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					streamOptions: settings.streamOptions,
 					retryPolicy: settings.retryPolicy,
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (!result.committed) throw new RuntimeShellError("stale", "Action no longer matches durable state");
 				return info;
 			});
 		});
+	}
+
+	abort(): Promise<{ readonly operationId: string; readonly drainedSteer: []; readonly drainedFollowUp: [] }> {
+		if (this.#fault) return Promise.reject(this.#fault);
+		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
+		return requestAbort(this.#session, (attachment) => {
+			this.#publish(attachment);
+			this.#abortRunningEffects();
+		}).then(
+			(result) => {
+				this.#publish(result.attachment);
+				if (result.status === "no_active") throw new RuntimeShellError("unavailable", "No active operation");
+				return Object.freeze({
+					operationId: result.operationId,
+					drainedSteer: [] as [],
+					drainedFollowUp: [] as [],
+				});
+			},
+			(cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			},
+		);
 	}
 
 	prompt(input: Message | readonly Message[]): Promise<RuntimeAttachment> {
@@ -955,7 +1081,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					expectedModelId: expected.laneConfiguration.value.model.modelId,
 					identityAvailable,
 				});
-				this.#current = result.attachment;
+				this.#publish(result.attachment);
 				if (result.status === "stale") throw new RuntimeShellError("stale", "Prompt attachment is stale");
 				if (result.status === "busy") throw new RuntimeShellError("busy", "Main lane is busy");
 				if (result.status === "unavailable")

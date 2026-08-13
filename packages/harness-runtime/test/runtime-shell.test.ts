@@ -4101,12 +4101,11 @@ describe("Phase 1 runtime shell", () => {
 				resultEntryId: calls[0].resultEntryId,
 			});
 			await shell.executeAction();
-			expect(reads.filter((read) => read === argsRead)).toHaveLength(1);
 			for (const kind of ["dispatch_tool_effect", "await_tool_effect", "finalize_tool_effect"] as const) {
 				expect(await shell.peekAction()).toMatchObject({ kind });
 				await shell.executeAction();
 			}
-			expect(reads.filter((read) => read === argsRead)).toHaveLength(1);
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(3);
 			expect(await shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
 			await shell.executeAction();
 			expect(pending.prepareArguments).not.toHaveBeenCalled();
@@ -4115,7 +4114,7 @@ describe("Phase 1 runtime shell", () => {
 			expect(execute).toHaveBeenCalledTimes(1);
 			expect(afterToolCall).toHaveBeenCalledTimes(1);
 			expect(order).toEqual(["execute", "after"]);
-			expect(reads.filter((read) => read === argsRead)).toHaveLength(2);
+			expect(reads.filter((read) => read === argsRead)).toHaveLength(4);
 			const result = (await storage.getEntries([calls[0].resultEntryId])).get(calls[0].resultEntryId);
 			expect(result).toMatchObject({
 				id: calls[0].resultEntryId,
@@ -5094,5 +5093,756 @@ describe("Phase 1 runtime shell", () => {
 		await expect(shell.executeAction()).rejects.toMatchObject({ code: "closed" });
 		await expect(shell.prompt(user("too late"))).rejects.toMatchObject({ code: "closed" });
 		expect(instrumented.committedTransactions).toHaveLength(0);
+	});
+
+	describe("D-030 durable abort", () => {
+		it("commits one durable marker, repeats write-free, reopens, and finishes with complete cleanup", async () => {
+			const clock = vi.spyOn(Date, "now").mockReturnValue(2_100_000_000_000);
+			const state = new MemoryStorageState();
+			const fixture = await rooted("need", state.createStorage());
+			const storage = instrumentStorage(fixture.storage);
+			const shell = await createRuntimeShell(session(storage), config());
+
+			const first = await shell.abort();
+			expect(first).toEqual({ operationId: fixture.operationId, drainedSteer: [], drainedFollowUp: [] });
+			expect(storage.committedTransactions).toHaveLength(1);
+			expect(storage.committedTransactions[0].writes).toEqual([
+				expect.objectContaining({
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: fixture.operationId,
+					value: expect.objectContaining({
+						control: {
+							status: "cancel_requested",
+							requestedAt: 2_100_000_000_000,
+							drainedSteer: [],
+							drainedFollowUp: [],
+						},
+					}),
+				}),
+			]);
+			expect(await shell.abort()).toEqual(first);
+			expect(storage.committedTransactions).toHaveLength(1);
+			await shell.close();
+
+			const reopenedStorage = instrumentStorage(state.createStorage());
+			const reopened = await createRuntimeShell(session(reopenedStorage), config());
+			expect(await reopened.peekAction()).toEqual({ kind: "finish_aborted_run", operationId: fixture.operationId });
+			await reopened.executeAction();
+			expect(await reopened.peekAction()).toBeUndefined();
+			expect(await reopenedStorage.getRegister("op.meta", fixture.operationId)).toBeUndefined();
+			expect(await reopenedStorage.getRegister("op.state", fixture.operationId)).toBeUndefined();
+			expect(await reopenedStorage.getRegister("lane.lastResult", "main")).toMatchObject({
+				value: { operationId: fixture.operationId, kind: "run", outcome: "aborted", leafId: fixture.prompt },
+			});
+			expect(await reopenedStorage.getRegister("lane.state", "main")).toMatchObject({
+				value: { currentOperationId: null, pendingNextRun: [] },
+			});
+			await expect(reopened.abort()).rejects.toMatchObject({ code: "unavailable" });
+			await reopened.close();
+			const idle = await createRuntimeShell(session(state.createStorage()), config());
+			expect(await idle.peekAction()).toBeUndefined();
+			await idle.close();
+			clock.mockRestore();
+		});
+
+		it("settles a restored pending assistant synthetically under reserved IDs with no provider or hook", async () => {
+			const state = new MemoryStorageState();
+			const fixture = await rooted("pending", state.createStorage());
+			const first = await createRuntimeShell(session(fixture.storage), config());
+			await first.abort();
+			await first.close();
+			const storage = instrumentStorage(state.createStorage());
+			const { models, lease } = availableModels();
+			const reopened = await createRuntimeShell(session(storage), config(), { models });
+			expect(await reopened.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
+			await reopened.executeAction();
+			expectLeaseUnused(lease);
+			const response = (await storage.getEntries([fixture.reservedResponse])).get(fixture.reservedResponse);
+			expect(response).toMatchObject({
+				id: fixture.reservedResponse,
+				parentId: fixture.prompt,
+				payload: {
+					role: "assistant",
+					content: [],
+					api: "harness",
+					provider: "test",
+					model: "current",
+					usage: ZERO_USAGE,
+					stopReason: "aborted",
+					errorMessage: "Operation aborted",
+					timestamp: expect.any(Number),
+				},
+			});
+			expect((await storage.getUsageRows([fixture.reservedUsage])).get(fixture.reservedUsage)).toMatchObject({
+				id: fixture.reservedUsage,
+				entryId: fixture.reservedResponse,
+				usage: ZERO_USAGE,
+				adjustment: false,
+			});
+			expect(await reopened.peekAction()).toMatchObject({ kind: "finish_aborted_run" });
+			await reopened.close();
+		});
+
+		it("cancels every planned tool in source order under reserved IDs without effects, hooks, or usage", async () => {
+			const execute = vi.fn();
+			const context = vi.fn(() => ({ batch: "unused" }));
+			const beforeToolCall = vi.fn();
+			const afterToolCall = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{ tools: [runtimeTool({ execute })], toolContext: context, beforeToolCall, afterToolCall },
+				["echo"],
+			);
+			const durable = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+			const { assistantEntryId, calls } = durable.phase.batch;
+			await prepared.shell.abort();
+			for (const call of calls) {
+				expect(await prepared.shell.peekAction()).toMatchObject({
+					kind: "cancel_planned_tool",
+					sourceIndex: call.sourceIndex,
+					resultEntryId: call.resultEntryId,
+				});
+				await prepared.shell.executeAction();
+				if (call.sourceIndex === 0) {
+					const partiallyCompleted = (await prepared.fixture.storage.getRegister(
+						"op.state",
+						prepared.fixture.operationId,
+					))!.value as unknown as RunState;
+					if (partiallyCompleted.phase.kind !== "tools") throw new Error("tool batch missing");
+					expect(partiallyCompleted.phase.batch.calls[0]).toMatchObject({ status: "completed", terminate: false });
+				}
+			}
+			expect(execute).not.toHaveBeenCalled();
+			expect(context).not.toHaveBeenCalled();
+			expect(beforeToolCall).not.toHaveBeenCalled();
+			expect(afterToolCall).not.toHaveBeenCalled();
+			const entries = await prepared.fixture.storage.getEntries(calls.map((call) => call.resultEntryId));
+			for (const [index, call] of calls.entries()) {
+				expect(entries.get(call.resultEntryId)).toMatchObject({
+					parentId: index === 0 ? assistantEntryId : calls[index - 1].resultEntryId,
+					payload: {
+						role: "toolResult",
+						toolCallId: `call-${index === 0 ? "a" : "b"}`,
+						toolName: "echo",
+						content: [{ type: "text", text: "Operation aborted" }],
+						details: {},
+						isError: true,
+						timestamp: expect.any(Number),
+					},
+				});
+			}
+			expect(
+				prepared.instrumented.committedTransactions.flatMap(({ writes }) => writes).some((w) => w.kind === "usage"),
+			).toBe(true);
+			const postAbortWrites = prepared.instrumented.committedTransactions
+				.slice(-calls.length)
+				.flatMap(({ writes }) => writes);
+			expect(postAbortWrites.some((write) => write.kind === "usage")).toBe(false);
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finish_aborted_run" });
+			await prepared.shell.close();
+		});
+
+		it("never safe-replays a restored pending tool after abort and preserves D-029 interruption", async () => {
+			const execute = vi.fn();
+			const context = vi.fn(() => ({ batch: "unused" }));
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "initial" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.abort();
+			await prepared.shell.close();
+			const storage = prepared.state.createStorage();
+			const reopened = await createRuntimeShell(session(storage), config(), {
+				tools: [runtimeTool({ replay: "safe", execute })],
+				toolContext: context,
+			});
+			const durable = (await storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+			const call = durable.phase.batch.calls[0];
+			await reopened.executeAction();
+			expect(execute).not.toHaveBeenCalled();
+			expect(context).not.toHaveBeenCalled();
+			expect((await storage.getEntries([call.resultEntryId])).get(call.resultEntryId)?.payload).toMatchObject({
+				content: [{ type: "text", text: "Tool outcome unknown after interruption" }],
+				isError: true,
+			});
+			await reopened.close();
+		});
+
+		it("cancels a prepared tool before dispatch without executing either hook", async () => {
+			const execute = vi.fn();
+			const afterToolCall = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" }, afterToolCall },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "dispatch_tool_effect" });
+			await prepared.shell.abort();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "cancel_tool_effect" });
+			await prepared.shell.executeAction();
+			expect(execute).not.toHaveBeenCalled();
+			expect(afterToolCall).not.toHaveBeenCalled();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+			const call = state.phase.batch.calls[0];
+			expect(call).toMatchObject({ status: "completed", terminate: false });
+			expect(
+				(await prepared.fixture.storage.getEntries([call.resultEntryId])).get(call.resultEntryId)?.payload,
+			).toEqual({
+				role: "toolResult",
+				toolCallId: "call-a",
+				toolName: "echo",
+				content: [{ type: "text", text: "Operation aborted" }],
+				details: {},
+				isError: true,
+				timestamp: expect.any(Number),
+			});
+			await prepared.shell.close();
+		});
+
+		it("preserves an observed raw tool result on abort, skips after_tool, and clears termination", async () => {
+			const usage = { ...ZERO_USAGE, input: 3, output: 4, totalTokens: 7 };
+			const afterToolCall = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{
+					tools: [
+						runtimeTool({
+							execute: async () => ({
+								content: [{ type: "text", text: "raw" }],
+								details: { raw: true },
+								usage,
+								addedToolNames: ["new-tool"],
+								terminate: true,
+							}),
+						}),
+					],
+					toolContext: { batch: "static" },
+					afterToolCall,
+				},
+				["echo"],
+			);
+			for (const kind of ["prepare_tool_call", "dispatch_tool_effect", "await_tool_effect"] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+				await prepared.shell.executeAction();
+			}
+			await prepared.shell.abort();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finalize_tool_effect" });
+			await prepared.shell.executeAction();
+			expect(afterToolCall).not.toHaveBeenCalled();
+			await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+			const call = state.phase.batch.calls[0];
+			expect(call).toMatchObject({ status: "completed", terminate: false });
+			expect(
+				(await prepared.fixture.storage.getEntries([call.resultEntryId])).get(call.resultEntryId)?.payload,
+			).toMatchObject({
+				content: [{ type: "text", text: "raw" }],
+				details: { raw: true },
+				usage,
+				addedToolNames: ["new-tool"],
+				isError: false,
+			});
+			await prepared.shell.close();
+		});
+
+		it("preserves finalized transformed output and termination when abort loses settlement authority", async () => {
+			const afterToolCall = vi.fn(() => ({
+				content: [{ type: "text" as const, text: "transformed" }],
+				details: { transformed: true },
+				terminate: true,
+			}));
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{ tools: [runtimeTool()], toolContext: { batch: "static" }, afterToolCall },
+				["echo"],
+			);
+			for (const kind of [
+				"prepare_tool_call",
+				"dispatch_tool_effect",
+				"await_tool_effect",
+				"finalize_tool_effect",
+			] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+				await prepared.shell.executeAction();
+			}
+			await prepared.shell.abort();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+			await prepared.shell.executeAction();
+			expect(afterToolCall).toHaveBeenCalledTimes(1);
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+			const call = state.phase.batch.calls[0];
+			expect(call).toMatchObject({ status: "completed", terminate: true });
+			expect(
+				(await prepared.fixture.storage.getEntries([call.resultEntryId])).get(call.resultEntryId)?.payload,
+			).toMatchObject({
+				content: [{ type: "text", text: "transformed" }],
+				details: { transformed: true },
+			});
+			await prepared.shell.close();
+		});
+
+		it("lets after_tool started first finish un-signalled and settle under cancelled control", async () => {
+			const usage = { ...ZERO_USAGE, input: 2, output: 3, totalTokens: 5 };
+			let releaseAfter!: () => void;
+			let enteredAfter!: () => void;
+			const entered = new Promise<void>((resolve) => {
+				enteredAfter = resolve;
+			});
+			const blocked = new Promise<void>((resolve) => {
+				releaseAfter = resolve;
+			});
+			let callbackSignal!: AbortSignal;
+			let abortEvents = 0;
+			const afterToolCall = vi.fn(async (_input, signal) => {
+				callbackSignal = signal!;
+				expect(callbackSignal.aborted).toBe(false);
+				callbackSignal.addEventListener("abort", () => abortEvents++);
+				enteredAfter();
+				await blocked;
+				return {
+					content: [{ type: "text" as const, text: "transformed" }],
+					details: { transformed: true },
+					usage,
+					terminate: true,
+				};
+			});
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool()], toolContext: { batch: "static" }, afterToolCall },
+				["echo"],
+			);
+			const planned = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (planned.phase.kind !== "tools") throw new Error("tool batch missing");
+			const resultEntryId = planned.phase.batch.calls[0].resultEntryId;
+			for (const kind of ["prepare_tool_call", "dispatch_tool_effect", "await_tool_effect"] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+				await prepared.shell.executeAction();
+			}
+			const finalization = prepared.shell.executeAction();
+			await entered;
+			const cancellation = await prepared.shell.abort();
+			expect(cancellation.operationId).toBe(prepared.fixture.operationId);
+			expect(callbackSignal.aborted).toBe(false);
+			expect(abortEvents).toBe(0);
+			releaseAfter();
+			await expect(finalization).resolves.toMatchObject({ kind: "finalize_tool_effect" });
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+			await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.control.status).toBe("cancel_requested");
+			expect(state.phase).toMatchObject({ kind: "checkpoint", continuation: { kind: "may_finish" } });
+			expect((await prepared.fixture.storage.getEntries([resultEntryId])).get(resultEntryId)?.payload).toMatchObject(
+				{
+					content: [{ type: "text", text: "transformed" }],
+					details: { transformed: true },
+					usage,
+				},
+			);
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finish_aborted_run" });
+			await prepared.shell.close();
+		});
+
+		it("commits tool cancellation before one signal and reconciles cooperative raw resolution", async () => {
+			let resolveTool!: (value: {
+				content: [{ type: "text"; text: string }];
+				details: { cooperative: boolean };
+			}) => void;
+			let enteredExecute!: () => void;
+			const entered = new Promise<void>((resolve) => {
+				enteredExecute = resolve;
+			});
+			const observedControls: string[] = [];
+			let abortEvents = 0;
+			const execute = vi.fn((_callId, _args, signal) => {
+				signal!.addEventListener("abort", () => {
+					abortEvents++;
+					const write = prepared.instrumented.committedTransactions.at(-1)?.writes[0];
+					if (write?.kind === "register" && write.op === "set")
+						observedControls.push((write.value as unknown as RunState).control.status);
+				});
+				enteredExecute();
+				return new Promise<{ content: [{ type: "text"; text: string }]; details: { cooperative: boolean } }>(
+					(resolve) => {
+						resolveTool = resolve;
+					},
+				);
+			});
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			const planned = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (planned.phase.kind !== "tools") throw new Error("tool batch missing");
+			const resultEntryId = planned.phase.batch.calls[0].resultEntryId;
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			await entered;
+			const before = prepared.instrumented.committedTransactions.length;
+			const first = await prepared.shell.abort();
+			expect(observedControls).toEqual(["cancel_requested"]);
+			expect(abortEvents).toBe(1);
+			expect(await prepared.shell.abort()).toEqual(first);
+			expect(abortEvents).toBe(1);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+			resolveTool({ content: [{ type: "text", text: "cooperative" }], details: { cooperative: true } });
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.control.status).toBe("cancel_requested");
+			expect(state.phase).toMatchObject({ kind: "checkpoint", continuation: { kind: "may_finish" } });
+			expect((await prepared.fixture.storage.getEntries([resultEntryId])).get(resultEntryId)?.payload).toMatchObject(
+				{
+					content: [{ type: "text", text: "cooperative" }],
+					details: { cooperative: true },
+				},
+			);
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finish_aborted_run" });
+			await prepared.shell.close();
+		});
+
+		it("keeps provider rejection after the cancellation signal as the shell fault", async () => {
+			let reject!: (cause: unknown) => void;
+			const prepared = await preparedShell(
+				() =>
+					new Promise<AssistantMessage>((_resolve, fail) => {
+						reject = fail;
+					}),
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.abort();
+			const providerFailure = new Error("provider failed after cancellation");
+			reject(providerFailure);
+			const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+			expect(fault).toMatchObject({ code: "fault", cause: providerFailure });
+			await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+			await prepared.shell.close();
+		});
+
+		it("normalizes a non-aborted provider response after cancellation with the fallback error", async () => {
+			let resolve!: (message: AssistantMessage) => void;
+			const prepared = await preparedShell(
+				() =>
+					new Promise<AssistantMessage>((done) => {
+						resolve = done;
+					}),
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.abort();
+			resolve(terminal("stop"));
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			const entry = (await prepared.fixture.storage.getEntries([state.latestAssistantEntryId!])).get(
+				state.latestAssistantEntryId!,
+			);
+			expect(entry?.payload).toMatchObject({ stopReason: "aborted", errorMessage: "Operation aborted" });
+			await prepared.shell.close();
+		});
+
+		it("wins the assistant abort-first gate without starting or signalling the provider", async () => {
+			const prepared = await preparedShell(() => terminal());
+			await prepared.shell.abort();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
+			await prepared.shell.executeAction();
+			expectLeaseUnused(prepared.lease);
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(
+				(await prepared.fixture.storage.getEntries([state.latestAssistantEntryId!])).get(
+					state.latestAssistantEntryId!,
+				)?.payload,
+			).toMatchObject({ stopReason: "aborted", errorMessage: "Operation aborted" });
+			await prepared.shell.close();
+		});
+
+		it("commits cancellation before signalling and normalizes a resolved live assistant", async () => {
+			let resolve!: (message: AssistantMessage) => void;
+			let suppliedSignal!: AbortSignal;
+			const prepared = await preparedShell(
+				() =>
+					new Promise<AssistantMessage>((done) => {
+						resolve = done;
+					}),
+			);
+			vi.mocked(prepared.lease.streamSimple).mockImplementation((_context, options) => {
+				if (!options?.signal) throw new Error("assistant signal missing");
+				suppliedSignal = options.signal;
+				return {
+					result: () =>
+						new Promise<AssistantMessage>((done) => {
+							resolve = done;
+						}),
+				} as ReturnType<ModelRequestLease["streamSimple"]>;
+			});
+			await prepared.shell.executeAction();
+			await prepared.shell.abort();
+			expect(suppliedSignal.aborted).toBe(true);
+			const marker = prepared.instrumented.committedTransactions.at(-1)!.writes[0];
+			expect(marker).toMatchObject({ kind: "register", value: { control: { status: "cancel_requested" } } });
+			resolve({ ...terminal("aborted"), errorMessage: "cooperative cancellation" });
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			const entryId = state.latestAssistantEntryId!;
+			expect((await prepared.fixture.storage.getEntries([entryId])).get(entryId)?.payload).toMatchObject({
+				stopReason: "aborted",
+				errorMessage: "cooperative cancellation",
+			});
+			await prepared.shell.close();
+		});
+
+		it.each([
+			["marker committed before reconciliation", "marker"],
+			["synthetic assistant response and usage committed", "assistant"],
+			["planned batch after call 0 synthetic result", "planned-tool"],
+			["restored effect_pending interruption committed", "restored-tool"],
+			["live raw result settled with hook skipped", "raw-tool"],
+			["finalized transformed result settled", "finalized-tool"],
+			["immediately before aborted terminal cleanup", "before-cleanup"],
+			["immediately after aborted terminal cleanup", "after-cleanup"],
+		] as const)("reopens and converges exactly at the %s cut", async (_label, cut) => {
+			const toolUsage = { ...ZERO_USAGE, input: 5, output: 8, totalTokens: 13 };
+			const execute = vi.fn(async () => ({
+				content: [{ type: "text" as const, text: "raw" }],
+				details: { raw: true },
+				usage: toolUsage,
+				terminate: true,
+			}));
+			const beforeToolCall = vi.fn();
+			const afterToolCall = vi.fn((input) => ({
+				...input.result,
+				content: [{ type: "text" as const, text: "transformed" }],
+				details: { transformed: true },
+				terminate: true,
+			}));
+			let state: MemoryStorageState;
+			let active: Awaited<ReturnType<typeof createRuntimeShell>>;
+			let operationId: string;
+			let expectedLeaf: string;
+			let finalAssistantEntryId: string | undefined;
+			let reservedEntryIds: string[] = [];
+			let reservedUsageIds: string[] = [];
+			let expectedActions: Array<Record<string, unknown>>;
+			let interruptedResult: JsonValue | undefined;
+			const priorTransactions: Write[][] = [];
+			let priorStorage: InstrumentedStorage | undefined;
+
+			if (cut === "marker" || cut === "before-cleanup" || cut === "after-cleanup") {
+				state = new MemoryStorageState();
+				const fixture = await rooted("need", state.createStorage());
+				operationId = fixture.operationId;
+				expectedLeaf = fixture.prompt;
+				active = await createRuntimeShell(session(state.createStorage()), config());
+				await active.abort();
+				if (cut === "after-cleanup") await active.executeAction();
+				expectedActions =
+					cut === "after-cleanup" ? [] : [{ kind: "finish_aborted_run", operationId: fixture.operationId }];
+			} else if (cut === "assistant") {
+				state = new MemoryStorageState();
+				const fixture = await rooted("pending", state.createStorage());
+				operationId = fixture.operationId;
+				expectedLeaf = fixture.reservedResponse;
+				finalAssistantEntryId = fixture.reservedResponse;
+				reservedEntryIds = [fixture.reservedResponse];
+				reservedUsageIds = [fixture.reservedUsage];
+				const initialStorage = instrumentStorage(state.createStorage());
+				priorStorage = initialStorage;
+				active = await createRuntimeShell(session(initialStorage), config());
+				await active.abort();
+				await active.executeAction();
+				expectedActions = [{ kind: "finish_aborted_run", operationId: fixture.operationId }];
+			} else {
+				const prepared = await settledToolBatch(
+					toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+					{
+						tools: [runtimeTool({ execute, replay: "safe" })],
+						toolContext: { batch: "static" },
+						beforeToolCall,
+						afterToolCall,
+					},
+					["echo"],
+				);
+				state = prepared.state;
+				active = prepared.shell;
+				priorStorage = prepared.instrumented;
+				operationId = prepared.fixture.operationId;
+				const planned = (await prepared.fixture.storage.getRegister("op.state", operationId))!
+					.value as unknown as RunState;
+				if (planned.phase.kind !== "tools") throw new Error("tool batch missing");
+				const calls = planned.phase.batch.calls;
+				reservedEntryIds = calls.map((call) => call.resultEntryId);
+				reservedUsageIds = calls.flatMap((call) =>
+					"usageId" in call && typeof call.usageId === "string" ? [call.usageId] : [],
+				);
+				finalAssistantEntryId = planned.phase.batch.assistantEntryId;
+				if (cut === "planned-tool") {
+					await active.abort();
+					await active.executeAction();
+					expectedLeaf = calls[1].resultEntryId;
+					expectedActions = [
+						{ kind: "cancel_planned_tool", sourceIndex: 1, resultEntryId: calls[1].resultEntryId },
+						{ kind: "finish_aborted_run", operationId },
+					];
+				} else if (cut === "restored-tool") {
+					await active.executeAction();
+					await active.abort();
+					priorTransactions.push(...prepared.instrumented.committedTransactions.map(({ writes }) => [...writes]));
+					await active.close();
+					const restoredStorage = instrumentStorage(state.createStorage());
+					priorStorage = restoredStorage;
+					active = await createRuntimeShell(session(restoredStorage), config(["echo"]), {
+						tools: [runtimeTool({ execute, replay: "safe" })],
+						toolContext: { batch: "restored" },
+						beforeToolCall,
+						afterToolCall,
+					});
+					expect(await active.peekAction()).toMatchObject({
+						kind: "recover_tool_effect",
+						sourceIndex: 0,
+						resultEntryId: calls[0].resultEntryId,
+					});
+					await active.executeAction();
+					interruptedResult = (await restoredStorage.getEntries([calls[0].resultEntryId])).get(
+						calls[0].resultEntryId,
+					)?.payload;
+					expectedLeaf = calls[1].resultEntryId;
+					expectedActions = [
+						{ kind: "cancel_planned_tool", sourceIndex: 1, resultEntryId: calls[1].resultEntryId },
+						{ kind: "finish_aborted_run", operationId },
+					];
+				} else {
+					for (const kind of ["prepare_tool_call", "dispatch_tool_effect", "await_tool_effect"] as const) {
+						expect(await active.peekAction()).toMatchObject({ kind });
+						await active.executeAction();
+					}
+					if (cut === "raw-tool") {
+						await active.abort();
+						await active.executeAction();
+					} else {
+						await active.executeAction();
+						await active.abort();
+					}
+					await active.executeAction();
+					expectedLeaf = calls[1].resultEntryId;
+					expectedActions = [
+						{ kind: "cancel_planned_tool", sourceIndex: 1, resultEntryId: calls[1].resultEntryId },
+						{ kind: "finish_aborted_run", operationId },
+					];
+				}
+			}
+
+			const callsBeforeReopen = {
+				execute: execute.mock.calls.length,
+				before: beforeToolCall.mock.calls.length,
+				after: afterToolCall.mock.calls.length,
+			};
+			if (priorStorage !== undefined)
+				priorTransactions.push(...priorStorage.committedTransactions.map(({ writes }) => [...writes]));
+			await active.close();
+			const storage = instrumentStorage(state.createStorage());
+			const models = createModels();
+			const lease = vi.spyOn(models, "lease");
+			const reopened = await createRuntimeShell(session(storage), config(["echo"]), {
+				models,
+				tools: [runtimeTool({ execute, replay: "safe" })],
+				toolContext: { batch: "reopened" },
+				beforeToolCall,
+				afterToolCall,
+			});
+			for (const action of expectedActions) {
+				expect(await reopened.peekAction()).toMatchObject(action);
+				await reopened.executeAction();
+			}
+			expect(await reopened.peekAction()).toBeUndefined();
+			expect(lease).not.toHaveBeenCalled();
+			expect(execute).toHaveBeenCalledTimes(callsBeforeReopen.execute);
+			expect(beforeToolCall).toHaveBeenCalledTimes(callsBeforeReopen.before);
+			expect(afterToolCall).toHaveBeenCalledTimes(callsBeforeReopen.after);
+			expect(await storage.getRegister("lane.leaf", "main")).toMatchObject({ value: expectedLeaf });
+			expect(await storage.getRegister("lane.lastResult", "main")).toMatchObject({
+				value: {
+					operationId,
+					kind: "run",
+					outcome: "aborted",
+					leafId: expectedLeaf,
+					...(finalAssistantEntryId === undefined ? {} : { finalAssistantEntryId }),
+				},
+			});
+			expect(await storage.getRegister("op.meta", operationId)).toBeUndefined();
+			expect(await storage.getRegister("op.state", operationId)).toBeUndefined();
+			expect(
+				(await storage.listRegisters("op.tool_args")).filter(({ key }) => key.startsWith(`${operationId}:`)),
+			).toEqual([]);
+			const allWrites = [
+				...priorTransactions.flat(),
+				...storage.committedTransactions.flatMap(({ writes }) => writes),
+			];
+			for (const entryId of reservedEntryIds) {
+				expect((await storage.getEntries([entryId])).has(entryId)).toBe(true);
+				expect(allWrites.filter((write) => write.kind === "entry" && write.entry.id === entryId)).toHaveLength(1);
+			}
+			if (interruptedResult !== undefined) {
+				expect((await storage.getEntries([reservedEntryIds[0]])).get(reservedEntryIds[0])?.payload).toEqual(
+					interruptedResult,
+				);
+			}
+			for (const usageId of reservedUsageIds) {
+				const rows = await storage.getUsageRows([usageId]);
+				const writes = allWrites.filter((write) => write.kind === "usage" && write.row.id === usageId);
+				expect(writes).toHaveLength(rows.has(usageId) ? 1 : 0);
+			}
+			const toolUsageWrites = allWrites.filter(
+				(write) =>
+					write.kind === "usage" &&
+					typeof write.row.entryId === "string" &&
+					reservedEntryIds.includes(write.row.entryId),
+			);
+			if (cut === "raw-tool" || cut === "finalized-tool") {
+				expect(toolUsageWrites).toHaveLength(1);
+				const usageWrite = toolUsageWrites[0];
+				if (usageWrite.kind !== "usage") throw new Error("tool usage write missing");
+				expect(usageWrite.row).toMatchObject({
+					entryId: reservedEntryIds[0],
+					usage: toolUsage,
+					adjustment: false,
+				});
+				expect(isUuidV7(usageWrite.row.id)).toBe(true);
+				expect(
+					allWrites.filter((write) => write.kind === "usage" && write.row.id === usageWrite.row.id),
+				).toHaveLength(1);
+				expect((await storage.getUsageRows([usageWrite.row.id])).get(usageWrite.row.id)).toMatchObject(
+					usageWrite.row,
+				);
+			} else if (reservedEntryIds.length > 0 && cut !== "assistant") {
+				expect(toolUsageWrites).toEqual([]);
+			}
+			await reopened.close();
+			const idle = await createRuntimeShell(session(state.createStorage()), config());
+			expect(await idle.peekAction()).toBeUndefined();
+			await idle.close();
+		});
 	});
 });

@@ -22,6 +22,15 @@ export type ActionInfo =
 	| { kind: "finalize_tool_effect"; operationId: string; effectKey: string }
 	| { kind: "settle_tool_effect"; operationId: string; effectKey: string }
 	| {
+			kind: "cancel_planned_tool";
+			operationId: string;
+			assistantEntryId: string;
+			turnId: string;
+			sourceIndex: number;
+			resultEntryId: string;
+	  }
+	| { kind: "cancel_tool_effect"; operationId: string; effectKey: string }
+	| {
 			kind: "recover_tool_effect";
 			operationId: string;
 			assistantEntryId: string;
@@ -30,7 +39,8 @@ export type ActionInfo =
 			resultEntryId: string;
 	  }
 	| { kind: "finish_run"; operationId: string; triggerEntryId: string }
-	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string };
+	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string }
+	| { kind: "finish_aborted_run"; operationId: string };
 
 export interface PlannedAction {
 	readonly info: ActionInfo;
@@ -55,7 +65,9 @@ export function planAction(
 	inputs: {
 		readonly settingsRevision: number;
 		readonly assistantEffectStatus: (key: string) => "planned" | "running" | "settled" | undefined;
-		readonly toolEffectStatus?: (key: string) => "planned" | "running" | "raw" | "finalized" | undefined;
+		readonly toolEffectStatus?: (
+			key: string,
+		) => "planned" | "running" | "raw" | "finalizing" | "finalized" | undefined;
 		readonly retryElapsed?: (operationId: string, stepId: string, nextAttempt: number, notBefore: number) => boolean;
 	},
 ): PlannedAction | undefined {
@@ -70,6 +82,69 @@ export function planAction(
 	});
 	const phase = state.value.phase;
 	let info: ActionInfo;
+	if (state.value.control.status === "cancel_requested") {
+		if (phase.kind === "tools") {
+			const call = phase.batch.calls.find((candidate) => candidate.status !== "completed");
+			if (call) {
+				if (call.status === "planned")
+					info = {
+						kind: "cancel_planned_tool",
+						operationId: operation.value.operationId,
+						assistantEntryId: phase.batch.assistantEntryId,
+						turnId: phase.batch.turnId,
+						sourceIndex: call.sourceIndex,
+						resultEntryId: call.resultEntryId,
+					};
+				else {
+					const key = toolEffectKey(operation.value.operationId, phase.batch.turnId, call.sourceIndex);
+					const status = inputs.toolEffectStatus?.(key);
+					if (status === "planned")
+						info = { kind: "cancel_tool_effect", operationId: operation.value.operationId, effectKey: key };
+					else if (status === "running" || status === "finalizing")
+						info = { kind: "await_tool_effect", operationId: operation.value.operationId, effectKey: key };
+					else if (status === "raw")
+						info = { kind: "finalize_tool_effect", operationId: operation.value.operationId, effectKey: key };
+					else if (status === "finalized")
+						info = { kind: "settle_tool_effect", operationId: operation.value.operationId, effectKey: key };
+					else
+						info = {
+							kind: "recover_tool_effect",
+							operationId: operation.value.operationId,
+							assistantEntryId: phase.batch.assistantEntryId,
+							turnId: phase.batch.turnId,
+							sourceIndex: call.sourceIndex,
+							resultEntryId: call.resultEntryId,
+						};
+				}
+				return Object.freeze({ info: Object.freeze(info), expected });
+			}
+		} else if (phase.kind === "assistant" && phase.generation.status === "effect_pending") {
+			const generation = phase.generation;
+			const key = assistantEffectKey(operation.value.operationId, generation.context.stepId, generation.attempt);
+			const status = inputs.assistantEffectStatus(key);
+			if (attachment.entries.has(generation.responseEntryId) && attachment.usageRows.has(generation.usageId))
+				info = {
+					kind: "repair_materialized_assistant",
+					operationId: operation.value.operationId,
+					responseEntryId: generation.responseEntryId,
+					usageId: generation.usageId,
+				};
+			else if (status === "running")
+				info = { kind: "await_assistant_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (status === "settled")
+				info = { kind: "settle_assistant_effect", operationId: operation.value.operationId, effectKey: key };
+			else
+				info = {
+					kind: "recover_assistant_effect",
+					operationId: operation.value.operationId,
+					stepId: generation.context.stepId,
+					attempt: generation.attempt,
+				};
+			return Object.freeze({ info: Object.freeze(info), expected });
+		}
+		info = { kind: "finish_aborted_run", operationId: operation.value.operationId };
+		return Object.freeze({ info: Object.freeze(info), expected });
+	}
 	if (phase.kind === "failure_drain") {
 		info = {
 			kind: "finish_failed_run",

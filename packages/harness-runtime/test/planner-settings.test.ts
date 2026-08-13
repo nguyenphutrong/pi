@@ -174,6 +174,45 @@ describe("pure Phase 1 action planner", () => {
 		).toBe(kind);
 	});
 
+	it("repairs a materialized pending assistant before cancelled local recovery", () => {
+		const fixture = attachment("pending", true);
+		fixture.value.runState!.value.control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [],
+			drainedFollowUp: [],
+		};
+		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);
+		for (const status of ["planned", "running", "settled", undefined] as const)
+			expect(
+				planAction(fixture.value, {
+					settingsRevision: 0,
+					assistantEffectStatus: (candidate) => (candidate === key ? status : undefined),
+				})?.info,
+			).toEqual({
+				kind: "repair_materialized_assistant",
+				operationId: fixture.operationId,
+				responseEntryId: fixture.responseEntryId,
+				usageId: fixture.usageId,
+			});
+	});
+
+	it.each(["ready", "wait", "need", "finish"] as const)(
+		"finishes cancelled %s state without starting work",
+		(position) => {
+			const fixture = attachment(position);
+			fixture.value.runState!.value.control = {
+				status: "cancel_requested",
+				requestedAt: 1,
+				drainedSteer: [],
+				drainedFollowUp: [],
+			};
+			expect(
+				planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => "running" })?.info,
+			).toEqual({ kind: "finish_aborted_run", operationId: fixture.operationId });
+		},
+	);
+
 	it("uses only the exact deterministic effect key", () => {
 		const fixture = attachment("pending");
 		const key = assistantEffectKey(fixture.operationId, fixture.stepId, 1);

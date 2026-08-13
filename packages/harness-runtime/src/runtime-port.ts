@@ -1,9 +1,12 @@
 import type { LaneConfiguration } from "./durable.ts";
 import {
+	type AbortRequestResult,
 	type AcceptPromptResult,
 	type AcceptPromptTransition,
+	type AssistantEffectStartTransition,
 	type ClearToolCallResult,
 	type ClearToolCallTransition,
+	type EffectStartResult,
 	type FinishRunResult,
 	type FinishRunTransition,
 	MemorySession,
@@ -19,6 +22,7 @@ import {
 	type SettleToolCallResult,
 	type SettleToolCallTransition,
 	type StartAssistantStepTransition,
+	type ToolEffectStartTransition,
 } from "./session.ts";
 import type { Session } from "./types.ts";
 import { SessionError } from "./types.ts";
@@ -33,6 +37,35 @@ export function refreshRuntimeAttachment(session: Session): Promise<RuntimeAttac
 	if (!(session instanceof MemorySession))
 		return Promise.reject(new SessionError("storage", "Session does not support an internal runtime attachment"));
 	return session.refreshRuntimeAttachment();
+}
+
+export function requestAbort(
+	session: Session,
+	onCommitted: (attachment: RuntimeAttachment) => void,
+): Promise<AbortRequestResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.requestAbort(onCommitted);
+}
+
+export function startAssistantEffect(
+	session: Session,
+	transition: AssistantEffectStartTransition,
+	start: () => void,
+): Promise<EffectStartResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.startAssistantEffect(transition, start);
+}
+
+export function startToolEffect(
+	session: Session,
+	transition: ToolEffectStartTransition,
+	start: () => void,
+): Promise<EffectStartResult> {
+	if (!(session instanceof MemorySession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.startToolEffect(transition, start);
 }
 
 export function startAssistantStep(

@@ -208,6 +208,21 @@ describe("Phase 1 durable codecs", () => {
 		expect(() => decodeRunStateRegister(register("op.state", id(), value), OPERATION_ID)).toThrow();
 	});
 
+	it("round-trips exact cancel_requested control and rejects malformed variants", () => {
+		const control = { status: "cancel_requested", requestedAt: 123, drainedSteer: [], drainedFollowUp: [] } as const;
+		const value = { ...common(phases.ready), control };
+		expect(decodeState(value)).toEqual({ seq: 17, value });
+		for (const malformed of [
+			{ ...control, requestedAt: -1 },
+			{ ...control, requestedAt: 1.5 },
+			{ ...control, requestedAt: Number.MAX_SAFE_INTEGER + 1 },
+			{ ...control, drainedSteer: [TRIGGER_ID] },
+			{ ...control, drainedFollowUp: [TRIGGER_ID] },
+			{ ...control, extra: true },
+		])
+			expectCorruption(() => decodeState({ ...common(phases.ready), control: malformed }));
+	});
+
 	it.each([
 		["empty", {}],
 		["nested JSON-safe", { nested: [null, true, { n: 1 }] }],

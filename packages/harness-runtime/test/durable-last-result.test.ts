@@ -44,6 +44,36 @@ describe("LaneLastResult codec", () => {
 			expect(() => decodeLaneLastResult(invalid)).toThrowError(expect.objectContaining({ code: "corruption" }));
 	});
 
+	it.each([false, true])("round-trips aborted with final assistant present: %s", (withFinalAssistant) => {
+		const candidate: LaneLastResult = {
+			operationId: id(),
+			kind: "run",
+			outcome: "aborted",
+			leafId: id(),
+			...(withFinalAssistant ? { finalAssistantEntryId: id() } : {}),
+		};
+		expect(decodeLaneLastResult(encodeLaneLastResult(candidate))).toEqual(candidate);
+		if (withFinalAssistant) expect(candidate.leafId).not.toBe(candidate.finalAssistantEntryId);
+	});
+
+	it("rejects non-exact or invalid aborted results", () => {
+		const candidate = {
+			operationId: id(),
+			kind: "run",
+			outcome: "aborted",
+			leafId: id(),
+			finalAssistantEntryId: id(),
+		} as const;
+		for (const invalid of [
+			{ ...candidate, extra: true },
+			{ ...candidate, runCompletion: "assistant" },
+			{ ...candidate, operationId: "bad" },
+			{ ...candidate, leafId: "bad" },
+			{ ...candidate, finalAssistantEntryId: "bad" },
+		])
+			expect(() => decodeLaneLastResult(invalid)).toThrowError(expect.objectContaining({ code: "corruption" }));
+	});
+
 	it.each([
 		["extra field", (candidate: LaneLastResult) => ({ ...candidate, extra: true })],
 		["missing field", ({ runCompletion: _, ...candidate }: LaneLastResult) => candidate],
