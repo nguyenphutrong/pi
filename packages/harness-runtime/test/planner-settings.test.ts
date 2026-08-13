@@ -1,7 +1,7 @@
 import type { RetryPolicy } from "@earendil-works/pi-ai";
 import { describe, expect, it, vi } from "vitest";
 import type { RunState, StreamOptions } from "../src/durable.ts";
-import { assistantEffectKey, planAction } from "../src/planner.ts";
+import { assistantEffectKey, planAction, toolEffectKey } from "../src/planner.ts";
 import { RuntimeSettingsOwner } from "../src/runtime-settings.ts";
 import type { RuntimeAttachment } from "../src/session.ts";
 import { id } from "./fixtures.ts";
@@ -183,6 +183,51 @@ describe("pure Phase 1 action planner", () => {
 					assistantEffectStatus: (candidate) => (keys.has(candidate) ? "running" : undefined),
 				})?.info.kind,
 			).toBe("recover_assistant_effect");
+	});
+
+	it.each([
+		["planned", "dispatch_tool_effect"],
+		["running", "await_tool_effect"],
+		["raw", "finalize_tool_effect"],
+		["finalized", "settle_tool_effect"],
+	] as const)("maps pending tool local status %s to %s", (status, kind) => {
+		const fixture = attachment("need");
+		const turnId = id();
+		const assistantEntryId = id();
+		const resultEntryId = id();
+		fixture.value.runState!.value.phase = {
+			kind: "tools",
+			batch: {
+				assistantEntryId,
+				turnId,
+				configuration: fixture.value.laneConfiguration.value,
+				calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId, replay: "safe" }],
+			},
+		};
+		const key = toolEffectKey(fixture.operationId, turnId, 0);
+		expect(
+			planAction(fixture.value, {
+				settingsRevision: 4,
+				assistantEffectStatus: () => undefined,
+				toolEffectStatus: (candidate) => (candidate === key ? status : undefined),
+			})?.info,
+		).toEqual({ kind, operationId: fixture.operationId, effectKey: key });
+	});
+
+	it("parks a restored pending tool without an exact process-local effect", () => {
+		const fixture = attachment("need");
+		fixture.value.runState!.value.phase = {
+			kind: "tools",
+			batch: {
+				assistantEntryId: id(),
+				turnId: id(),
+				configuration: fixture.value.laneConfiguration.value,
+				calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId: id(), replay: "never" }],
+			},
+		};
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined }),
+		).toBeUndefined();
 	});
 
 	it("keeps retry waits stable without exact elapsed proof and releases only on an exact proof", () => {

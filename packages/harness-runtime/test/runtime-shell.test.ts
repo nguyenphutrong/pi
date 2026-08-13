@@ -2685,7 +2685,7 @@ describe("Phase 1 runtime shell", () => {
 				expect((await prepared.fixture.storage.getRegister("op.tool_args", argsKey))?.value).toEqual({
 					value: "effective",
 				});
-				expect(await prepared.shell.peekAction()).toBeUndefined();
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind: "dispatch_tool_effect" });
 				await prepared.shell.close();
 
 				const storage = instrumentStorage(prepared.state.createStorage());
@@ -3330,6 +3330,712 @@ describe("Phase 1 runtime shell", () => {
 			const idle = await createRuntimeShell(session(prepared.state.createStorage()), config());
 			expect(await idle.peekAction()).toBeUndefined();
 			await idle.close();
+		});
+	});
+
+	describe("D-028 live sequential tool effects", () => {
+		it("runs four stable stages after durable clearance and atomically settles the exact finalized result", async () => {
+			const order: string[] = [];
+			const usage = { ...ZERO_USAGE, input: 3, output: 2, totalTokens: 5 };
+			const context = { batch: "bound" };
+			const execute = vi.fn(async (callId, args, signal, onUpdate, receivedContext) => {
+				order.push("execute");
+				expect(callId).toBe("call-a");
+				expect(args).toEqual({ value: "effective" });
+				expect(signal).toBeInstanceOf(AbortSignal);
+				expect(signal?.aborted).toBe(false);
+				expect(receivedContext).toBe(context);
+				onUpdate?.({ content: [{ type: "text", text: "ignored update" }], details: { partial: true } });
+				return {
+					content: [{ type: "text" as const, text: "raw" }],
+					details: { raw: true },
+					usage,
+					addedToolNames: ["added"],
+				};
+			});
+			const afterToolCall = vi.fn((input, signal) => {
+				order.push("after");
+				expect(signal).toBeInstanceOf(AbortSignal);
+				expect(input).toEqual({
+					toolCall: { type: "toolCall", id: "call-a", name: "echo", arguments: { value: "raw" } },
+					args: { value: "effective" },
+					result: {
+						content: [{ type: "text", text: "raw" }],
+						details: { raw: true },
+						usage,
+						addedToolNames: ["added"],
+					},
+					isError: false,
+				});
+				return { content: [{ type: "text" as const, text: "final" }], details: { final: true } };
+			});
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a", arguments: { value: "raw" } }]),
+				{
+					tools: [runtimeTool({ replay: "safe", execute })],
+					toolContext: context,
+					beforeToolCall: () => ({ args: { value: "effective" } }),
+					afterToolCall,
+				},
+				["echo"],
+			);
+			const writesBeforeClearance = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.executeAction();
+			order.push("clearance committed");
+			expect(prepared.instrumented.committedTransactions).toHaveLength(writesBeforeClearance + 1);
+			const actions = [
+				"dispatch_tool_effect",
+				"await_tool_effect",
+				"finalize_tool_effect",
+				"settle_tool_effect",
+			] as const;
+			for (const kind of actions) {
+				const visible = await prepared.shell.peekAction();
+				expect(visible).toMatchObject({ kind });
+				expect(await prepared.shell.peekAction()).toEqual(visible);
+				await prepared.shell.executeAction();
+			}
+			expect(order).toEqual(["clearance committed", "execute", "after"]);
+			expect(execute).toHaveBeenCalledTimes(1);
+			expect(afterToolCall).toHaveBeenCalledTimes(1);
+
+			const clearanceState = prepared.instrumented.committedTransactions[writesBeforeClearance].writes.at(-1);
+			if (clearanceState?.kind !== "register" || clearanceState.op !== "set")
+				throw new Error("clearance state missing");
+			const phase = (clearanceState.value as unknown as RunState).phase;
+			if (phase.kind !== "tools") throw new Error("tool phase missing");
+			const resultId = phase.batch.calls[0].resultEntryId;
+			const settlement = prepared.instrumented.committedTransactions.at(-1)!;
+			expect(settlement.writes.map((write) => write.kind)).toEqual([
+				"entry",
+				"register",
+				"usage",
+				"register",
+				"register",
+			]);
+			expect(settlement.writes).toEqual([
+				expect.objectContaining({
+					kind: "entry",
+					entry: expect.objectContaining({
+						id: resultId,
+						parentId: phase.batch.assistantEntryId,
+						payload: expect.objectContaining({
+							role: "toolResult",
+							toolCallId: "call-a",
+							toolName: "echo",
+							content: [{ type: "text", text: "final" }],
+							details: { final: true },
+							addedToolNames: ["added"],
+							isError: false,
+						}),
+					}),
+				}),
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: resultId },
+				expect.objectContaining({
+					kind: "usage",
+					row: expect.objectContaining({ entryId: resultId, usage, adjustment: false }),
+				}),
+				{
+					kind: "register",
+					op: "delete",
+					namespace: "op.tool_args",
+					key: `${prepared.fixture.operationId}:${prepared.fixture.stepId}:0`,
+				},
+				expect.objectContaining({ kind: "register", op: "set", namespace: "op.state" }),
+			]);
+			const usageWrite = settlement.writes[2];
+			if (usageWrite.kind !== "usage") throw new Error("usage missing");
+			expect(usageWrite.row.id).not.toBe(resultId);
+			expect(isUuidV7(usageWrite.row.id)).toBe(true);
+			expect((await prepared.fixture.storage.getEntries([resultId])).get(resultId)?.payload).toMatchObject({
+				content: [{ type: "text", text: "final" }],
+				details: { final: true },
+				addedToolNames: ["added"],
+				isError: false,
+				usage,
+			});
+			const persisted = (await prepared.fixture.storage.getEntries([resultId])).get(resultId)?.payload as {
+				usage: typeof usage;
+			};
+			expect(persisted.usage).toEqual(usage);
+			expect(persisted.usage).not.toBe(usage);
+			expect(
+				(await prepared.fixture.storage.getUsageRows([usageWrite.row.id])).get(usageWrite.row.id),
+			).toMatchObject({
+				entryId: resultId,
+				usage,
+				adjustment: false,
+			});
+			await prepared.shell.close();
+		});
+
+		it("does not allocate usage and preserves the intent until no-usage final settlement", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool()], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			vi.mocked(prepared.runtimeSession.idGenerator.next).mockClear();
+			await prepared.shell.executeAction();
+			for (const kind of ["dispatch_tool_effect", "await_tool_effect", "finalize_tool_effect"] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+				await prepared.shell.executeAction();
+				expect(
+					await prepared.fixture.storage.getRegister(
+						"op.tool_args",
+						`${prepared.fixture.operationId}:${prepared.fixture.stepId}:0`,
+					),
+				).toBeDefined();
+			}
+			await prepared.shell.executeAction();
+			expect(prepared.runtimeSession.idGenerator.next).not.toHaveBeenCalled();
+			const settlement = prepared.instrumented.committedTransactions.at(-1)!;
+			expect(settlement.writes.some((write) => write.kind === "usage")).toBe(false);
+			const entryWrite = settlement.writes.find((write) => write.kind === "entry");
+			if (entryWrite?.kind !== "entry") throw new Error("tool result entry missing");
+			expect(Object.hasOwn(entryWrite.entry.payload as object, "usage")).toBe(false);
+			await prepared.shell.close();
+		});
+
+		it("enters may_finish without another assistant when every real result terminates", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{
+					tools: [
+						runtimeTool({
+							execute: async () => ({
+								content: [{ type: "text", text: "done" }],
+								details: null,
+								terminate: true,
+							}),
+						}),
+					],
+					toolContext: { batch: "static" },
+				},
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 4; stage++) await prepared.shell.executeAction();
+			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.phase).toMatchObject({
+				kind: "checkpoint",
+				continuation: { kind: "may_finish", includeFinalAssistant: false },
+			});
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finish_run" });
+			await prepared.shell.close();
+		});
+
+		it("serializes two real calls through settlement and cleans both argument registers only at the end", async () => {
+			const context = vi.fn(() => ({ batch: "shared" }));
+			const execute = vi.fn(async (callId: string) => ({
+				content: [{ type: "text" as const, text: callId }],
+				details: { callId },
+			}));
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{ tools: [runtimeTool({ replay: "safe", execute })], toolContext: context },
+				["echo"],
+			);
+			const initial = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (initial.phase.kind !== "tools") throw new Error("tool batch missing");
+			const { assistantEntryId, calls } = initial.phase.batch;
+			const keys = calls.map((_, index) => `${prepared.fixture.operationId}:${prepared.fixture.stepId}:${index}`);
+
+			await prepared.shell.executeAction();
+			for (const kind of ["dispatch_tool_effect", "await_tool_effect", "finalize_tool_effect"] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({
+					kind,
+					operationId: prepared.fixture.operationId,
+				});
+				await prepared.shell.executeAction();
+				expect(await prepared.shell.peekAction()).not.toMatchObject({
+					kind: expect.stringMatching(/prepare_tool_call|dispatch_tool_effect/),
+					sourceIndex: 1,
+				});
+			}
+			expect((await prepared.fixture.storage.getRegister("op.tool_args", keys[0]))?.value).toEqual({
+				value: "call-a",
+			});
+			await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "prepare_tool_call", sourceIndex: 1 });
+			expect(await prepared.fixture.storage.getRegister("op.tool_args", keys[0])).toBeDefined();
+
+			await prepared.shell.executeAction();
+			expect(await prepared.fixture.storage.getRegister("op.tool_args", keys[0])).toBeDefined();
+			expect(await prepared.fixture.storage.getRegister("op.tool_args", keys[1])).toBeDefined();
+			for (const kind of [
+				"dispatch_tool_effect",
+				"await_tool_effect",
+				"finalize_tool_effect",
+				"settle_tool_effect",
+			] as const) {
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+				await prepared.shell.executeAction();
+			}
+			expect(context).toHaveBeenCalledTimes(1);
+			expect(execute.mock.calls.map(([callId]) => callId)).toEqual(["call-a", "call-b"]);
+			expect(await prepared.fixture.storage.getRegister("op.tool_args", keys[0])).toBeUndefined();
+			expect(await prepared.fixture.storage.getRegister("op.tool_args", keys[1])).toBeUndefined();
+			const finalCommit = prepared.instrumented.committedTransactions.at(-1)!;
+			expect(
+				finalCommit.writes
+					.filter((write) => write.kind === "register" && write.op === "delete")
+					.map((write) => write.key),
+			).toEqual(keys);
+			const entries = await prepared.fixture.storage.getEntries(calls.map(({ resultEntryId }) => resultEntryId));
+			expect(entries.get(calls[0].resultEntryId)?.parentId).toBe(assistantEntryId);
+			expect(entries.get(calls[1].resultEntryId)?.parentId).toBe(calls[0].resultEntryId);
+			const finalState = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(finalState.phase).toEqual({
+				kind: "checkpoint",
+				continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+				triggerEntryId: calls[1].resultEntryId,
+			});
+			await prepared.shell.close();
+		});
+
+		it("reopens a two-call batch after the first real settlement from the completed prefix", async () => {
+			const tool = runtimeTool({ replay: "safe" });
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
+				{ tools: [tool], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			const planned = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (planned.phase.kind !== "tools") throw new Error("tool batch missing");
+			const { assistantEntryId, calls } = planned.phase.batch;
+			const firstArgsKey = `${prepared.fixture.operationId}:${prepared.fixture.stepId}:0`;
+			const nextArgsKey = `${prepared.fixture.operationId}:${prepared.fixture.stepId}:1`;
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 4; stage++) await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "prepare_tool_call", sourceIndex: 1 });
+			await prepared.shell.close();
+
+			const storage = instrumentStorage(prepared.state.createStorage());
+			storage.listRegisters = async () => {
+				throw new Error("register scan forbidden");
+			};
+			storage.scanEntries = async () => {
+				throw new Error("entry scan forbidden");
+			};
+			storage.scanBranch = async () => {
+				throw new Error("branch scan forbidden");
+			};
+			storage.scanBranchStructure = async () => {
+				throw new Error("branch structure scan forbidden");
+			};
+			const reopened = await createRuntimeShell(session(storage), config(), {
+				tools: [tool],
+				toolContext: { batch: "static" },
+			});
+			const restored = (await storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(restored.latestAssistantEntryId).toBe(assistantEntryId);
+			expect(restored.phase).toMatchObject({
+				kind: "tools",
+				batch: {
+					assistantEntryId,
+					calls: [
+						{ status: "completed", sourceIndex: 0, resultEntryId: calls[0].resultEntryId },
+						{ status: "planned", sourceIndex: 1, resultEntryId: calls[1].resultEntryId },
+					],
+				},
+			});
+			const firstResult = (await storage.getEntries([calls[0].resultEntryId])).get(calls[0].resultEntryId);
+			expect(firstResult).toMatchObject({
+				parentId: assistantEntryId,
+				payload: { toolCallId: "call-a", toolName: "echo" },
+			});
+			expect((await storage.getRegister("op.tool_args", firstArgsKey))?.value).toEqual({ value: "call-a" });
+			expect(await storage.getRegister("op.tool_args", nextArgsKey)).toBeUndefined();
+			expect(await reopened.peekAction()).toEqual({
+				kind: "prepare_tool_call",
+				operationId: prepared.fixture.operationId,
+				assistantEntryId,
+				sourceIndex: 1,
+				resultEntryId: calls[1].resultEntryId,
+			});
+			expect(storage.committedTransactions).toEqual([]);
+			await reopened.close();
+		});
+
+		it("settles from a semantically identical newer operation state and advances that latest state", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+			const current = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			await prepared.fixture.storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: prepared.fixture.operationId,
+						value: current.value,
+					},
+				],
+			});
+			const rewritten = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			expect(rewritten.seq).toBeGreaterThan(current.seq);
+			await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_tool_effect" });
+			const settled = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			expect(settled.seq).toBeGreaterThan(rewritten.seq);
+			expect((settled.value as unknown as RunState).phase).toMatchObject({ kind: "checkpoint" });
+			await prepared.shell.close();
+		});
+
+		it("discards an obsolete local tool settlement and follows an authoritative completed prefix", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+			const current = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			const state = structuredClone(current.value) as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+			const resultId = state.phase.batch.calls[0].resultEntryId;
+			state.phase = {
+				kind: "checkpoint",
+				continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+				triggerEntryId: resultId,
+			};
+			await prepared.fixture.storage.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: {
+							id: resultId,
+							parentId: state.latestAssistantEntryId,
+							type: "message",
+							payload: json({ ...toolResult(), toolCallId: "call-a", toolName: "echo" }),
+						},
+					},
+					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: resultId },
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: prepared.fixture.operationId,
+						value: json(state),
+					},
+				],
+			});
+			const before = prepared.instrumented.committedTransactions.length;
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			expect(await prepared.shell.peekAction()).toEqual({
+				kind: "start_assistant_step",
+				operationId: prepared.fixture.operationId,
+				triggerEntryId: resultId,
+			});
+			await prepared.shell.close();
+		});
+
+		it.each(["missing arguments", "mismatched arguments", "materialized result"] as const)(
+			"faults write-free when finalized tool settlement has %s",
+			async (kind) => {
+				const prepared = await settledToolBatch(
+					toolMessage([{ id: "call-a" }]),
+					{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+					["echo"],
+				);
+				await prepared.shell.executeAction();
+				for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+				const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+					.value as unknown as RunState;
+				if (state.phase.kind !== "tools") throw new Error("tool batch missing");
+				const argsKey = `${prepared.fixture.operationId}:${prepared.fixture.stepId}:0`;
+				const writes: Write[] =
+					kind === "materialized result"
+						? [
+								{
+									kind: "entry",
+									entry: {
+										id: state.phase.batch.calls[0].resultEntryId,
+										parentId: state.phase.batch.assistantEntryId,
+										type: "message",
+										payload: json({ ...toolResult(), toolCallId: "call-a", toolName: "echo" }),
+									},
+								},
+							]
+						: [
+								{
+									kind: "register",
+									op: kind === "missing arguments" ? "delete" : "set",
+									namespace: "op.tool_args",
+									key: argsKey,
+									...(kind === "mismatched arguments" ? { value: { value: "other" } } : {}),
+								} as Write,
+							];
+				await prepared.fixture.storage.commit({ writes });
+				const before = prepared.instrumented.committedTransactions.length;
+				const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+				expect(fault).toMatchObject({ code: "fault", cause: { code: "corruption" } });
+				expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+				await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+				await prepared.shell.close();
+			},
+		);
+
+		it.each([
+			[
+				"tool throw",
+				runtimeTool({
+					execute: async () => {
+						throw new Error("tool failed");
+					},
+				}),
+				undefined,
+				"tool failed",
+			],
+			[
+				"invalid raw",
+				runtimeTool({ execute: async () => ({ content: "bad", details: null }) as never }),
+				undefined,
+				"Invalid tool result",
+			],
+			[
+				"after throw",
+				runtimeTool(),
+				() => {
+					throw new Error("after failed");
+				},
+				"after failed",
+			],
+			["invalid after", runtimeTool(), () => 1 as never, "Invalid after tool callback output"],
+		] as const)(
+			"settles expected %s normalization in-band without fault",
+			async (_label, tool, afterToolCall, text) => {
+				const prepared = await settledToolBatch(
+					toolMessage([{ id: "call-a" }]),
+					{ tools: [tool], toolContext: { batch: "static" }, afterToolCall },
+					["echo"],
+				);
+				await prepared.shell.executeAction();
+				for (let stage = 0; stage < 4; stage++) await prepared.shell.executeAction();
+				const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+					.value as unknown as RunState;
+				if (state.phase.kind !== "checkpoint") throw new Error("checkpoint missing");
+				const result = (await prepared.fixture.storage.getEntries([state.phase.triggerEntryId])).get(
+					state.phase.triggerEntryId,
+				);
+				expect(result?.payload).toMatchObject({ isError: true });
+				expect((result?.payload as { content: Array<{ text: string }> }).content[0].text).toContain(text);
+				expect(await prepared.shell.peekAction()).toMatchObject({ kind: "start_assistant_step" });
+				await prepared.shell.close();
+			},
+		);
+
+		it("close before tool dispatch starts executes nothing and preserves the prepared durable prefix", async () => {
+			const execute = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe", execute })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "dispatch_tool_effect" });
+			const before = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.close();
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			expect(execute).not.toHaveBeenCalled();
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			const storage = prepared.state.createStorage();
+			const state = (await storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
+			await storage.close();
+		});
+
+		it("close after raw observation prevents the after callback and settlement writes", async () => {
+			const afterToolCall = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" }, afterToolCall },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "finalize_tool_effect" });
+			const before = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.close();
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			expect(afterToolCall).not.toHaveBeenCalled();
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		});
+
+		it("close after tool finalization prevents settlement", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+			const before = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.close();
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		});
+
+		it("allows an admitted tool settlement commit to stand before close", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+			const commit = prepared.instrumented.commit.bind(prepared.instrumented);
+			let release!: () => void;
+			let entered!: () => void;
+			const blocked = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const admitted = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			prepared.instrumented.commit = async (transaction) => {
+				if (transaction.writes.some((write) => write.kind === "entry")) {
+					entered();
+					await blocked;
+				}
+				return commit(transaction);
+			};
+			const before = prepared.instrumented.committedTransactions.length;
+			const settlement = prepared.shell.executeAction();
+			await admitted;
+			const close = prepared.shell.close();
+			release();
+			await expect(settlement).resolves.toMatchObject({ kind: "settle_tool_effect" });
+			await close;
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+		});
+
+		it.each([
+			["dispatch/running", 1],
+			["raw before finalize", 2],
+			["finalized before settlement", 3],
+		] as const)("preserves a fault that seals before close at %s", async (_boundary, processActions) => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < processActions; stage++) await prepared.shell.executeAction();
+			const durable = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
+			const resultEntryId = durable.phase.batch.calls[0].resultEntryId;
+			const settlementFailure = new Error(`settlement failed at ${_boundary}`);
+			prepared.instrumented.commit = vi.fn().mockRejectedValueOnce(settlementFailure);
+			while ((await prepared.shell.peekAction())?.kind !== "settle_tool_effect")
+				await prepared.shell.executeAction();
+			const before = prepared.instrumented.committedTransactions.length;
+			const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
+			expect(fault).toMatchObject({
+				code: "fault",
+				cause: { code: "storage", cause: settlementFailure },
+			});
+			await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+			await prepared.shell.close();
+			await expect(prepared.shell.executeAction()).rejects.toBe(fault);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			const storage = prepared.state.createStorage();
+			const state = (await storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
+			expect(await storage.getEntries([resultEntryId])).toEqual(new Map());
+			await storage.close();
+		});
+
+		it("preserves a rejected admitted settlement fault when close follows", async () => {
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
+			let rejectCommit!: (error: Error) => void;
+			let entered!: () => void;
+			const admitted = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			prepared.instrumented.commit = vi.fn((): Promise<never> => {
+				entered();
+				return new Promise<never>((_resolve, reject) => {
+					rejectCommit = reject;
+				});
+			});
+			const before = prepared.instrumented.committedTransactions.length;
+			const settlement = prepared.shell.executeAction();
+			await admitted;
+			const settlementFailure = new Error("admitted settlement failed");
+			rejectCommit(settlementFailure);
+			const fault = await settlement.catch((error: unknown) => error);
+			expect(fault).toMatchObject({
+				code: "fault",
+				cause: { code: "storage", cause: settlementFailure },
+			});
+			const close = prepared.shell.close();
+			await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+			await close;
+			await expect(prepared.shell.executeAction()).rejects.toBe(fault);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			const storage = prepared.state.createStorage();
+			const state = (await storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
+			await storage.close();
+		});
+
+		it("close after dispatch aborts the registered cooperative tool and leaves durable effect_pending", async () => {
+			let signal!: AbortSignal;
+			let started!: () => void;
+			const didStart = new Promise<void>((resolve) => {
+				started = resolve;
+			});
+			const execute = vi.fn((_callId, _args, suppliedSignal) => {
+				signal = suppliedSignal!;
+				started();
+				return new Promise<never>((_resolve, reject) =>
+					signal.addEventListener("abort", () => reject(new Error("aborted"))),
+				);
+			});
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			await prepared.shell.executeAction();
+			await prepared.shell.executeAction();
+			await didStart;
+			const before = prepared.instrumented.committedTransactions.length;
+			await prepared.shell.close();
+			expect(signal.aborted).toBe(true);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			const parkedStorage = prepared.state.createStorage();
+			const state = (await parkedStorage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			expect(state.phase).toMatchObject({ kind: "tools", batch: { calls: [{ status: "effect_pending" }] } });
+			await parkedStorage.close();
+			const reopened = await createRuntimeShell(session(prepared.state.createStorage()), config());
+			expect(await reopened.peekAction()).toBeUndefined();
+			await reopened.close();
 		});
 	});
 

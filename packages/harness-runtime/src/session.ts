@@ -1,5 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
-import type { AssistantMessage, Message, ToolCall, ToolResultMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Message, ToolCall, ToolResultMessage, Usage } from "@earendil-works/pi-ai";
 import {
 	assertJsonValue,
 	assertRegister,
@@ -565,6 +565,28 @@ export type ClearToolCallResult = {
 	readonly attachment: RuntimeAttachment;
 };
 
+export interface SettleToolCallTransition {
+	readonly operationId: string;
+	readonly assistantEntryId: string;
+	readonly turnId: string;
+	readonly sourceIndex: number;
+	readonly resultEntryId: string;
+	readonly replay: "never" | "safe";
+	readonly toolCall: ToolCall;
+	readonly args: { readonly [key: string]: JsonValue };
+	readonly content: ToolResultMessage["content"];
+	readonly details: JsonValue;
+	readonly usage?: Usage;
+	readonly addedToolNames?: string[];
+	readonly isError: boolean;
+	readonly terminate: boolean;
+}
+
+export type SettleToolCallResult = {
+	readonly status: "committed" | "obsolete";
+	readonly attachment: RuntimeAttachment;
+};
+
 const PREPARED_CLEARANCE_FIELDS = new Set(["kind", "toolCall", "args", "replay"]);
 const IMMEDIATE_CLEARANCE_FIELDS = new Set(["kind", "toolCall", "result", "isError", "terminate"]);
 const TOOL_CALL_FIELDS = new Set(["type", "id", "name", "arguments", "thoughtSignature", "namespace"]);
@@ -624,6 +646,56 @@ function validateClearToolCallOutcome(outcome: unknown): asserts outcome is Clea
 				!outcome.result.addedToolNames.every((name) => typeof name === "string")))
 	)
 		throw new SessionError("invalid_query", "Immediate tool clearance data is invalid");
+}
+
+const SETTLE_TOOL_FIELDS = new Set([
+	"operationId",
+	"assistantEntryId",
+	"turnId",
+	"sourceIndex",
+	"resultEntryId",
+	"replay",
+	"toolCall",
+	"args",
+	"content",
+	"details",
+	"usage",
+	"addedToolNames",
+	"isError",
+	"terminate",
+]);
+
+function validateSettleToolCallTransition(transition: unknown): asserts transition is SettleToolCallTransition {
+	try {
+		assertJsonValue(transition);
+	} catch (error) {
+		throw new SessionError("invalid_query", "Tool settlement must be detached JSON data", error);
+	}
+	if (!isExactDataObject(transition, SETTLE_TOOL_FIELDS))
+		throw new SessionError("invalid_query", "Tool settlement has unsupported fields");
+	for (const field of ["operationId", "assistantEntryId", "turnId", "resultEntryId"] as const)
+		if (typeof transition[field] !== "string" || !isUuidV7(transition[field]))
+			throw new SessionError("invalid_query", `Tool settlement ${field} must be a UUIDv7`);
+	if (!Number.isSafeInteger(transition.sourceIndex) || (transition.sourceIndex as number) < 0)
+		throw new SessionError("invalid_query", "Tool settlement sourceIndex is invalid");
+	if (transition.replay !== "never" && transition.replay !== "safe")
+		throw new SessionError("invalid_query", "Tool settlement replay is invalid");
+	validateClearToolCallOutcome({
+		kind: "prepared",
+		toolCall: transition.toolCall,
+		args: transition.args,
+		replay: transition.replay,
+	});
+	if (
+		!Array.isArray(transition.content) ||
+		!Object.hasOwn(transition, "details") ||
+		typeof transition.isError !== "boolean" ||
+		typeof transition.terminate !== "boolean" ||
+		(transition.addedToolNames !== undefined &&
+			(!Array.isArray(transition.addedToolNames) ||
+				!transition.addedToolNames.every((name) => typeof name === "string")))
+	)
+		throw new SessionError("invalid_query", "Tool settlement result is invalid");
 }
 
 export type SettleAssistantEffectResult =
@@ -1438,6 +1510,273 @@ export class MemorySession implements Session {
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.responseEntryId }),
 					runState: Object.freeze({ seq: committed.seqs[3], value: structuredClone(nextState) }),
+					entries,
+					usageRows,
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	settleToolCall(transition: SettleToolCallTransition): Promise<SettleToolCallResult> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		try {
+			validateSettleToolCallTransition(transition);
+		} catch (error) {
+			return Promise.reject(error);
+		}
+		const operation = this.#mutationLine.then(async () => {
+			const [configurationCandidate, laneStateCandidate, leafCandidate] = await Promise.all([
+				this.#storage.getRegister(CONFIG_NAMESPACE, MAIN),
+				this.#storage.getRegister(STATE_NAMESPACE, MAIN),
+				this.#storage.getRegister(LEAF_NAMESPACE, MAIN),
+			]);
+			if (!configurationCandidate || !laneStateCandidate)
+				throw new SessionError("corruption", "Main lane registers are missing");
+			const configuration = decodeConfigurationRegister(configurationCandidate);
+			const laneState = decodeLaneStateRegister(laneStateCandidate);
+			const mainLeaf = decodeMainLeafRegister(leafCandidate);
+			const currentOperationId = laneState.value.currentOperationId;
+			let runOperation: CurrentRegister<RunOperation> | undefined;
+			let runState: CurrentRegister<RunState> | undefined;
+			if (currentOperationId !== null) {
+				const [meta, state] = await Promise.all([
+					this.#storage.getRegister("op.meta", currentOperationId),
+					this.#storage.getRegister("op.state", currentOperationId),
+				]);
+				if (!meta || !state) throw new SessionError("corruption", "Open operation registers are missing");
+				runOperation = decodeRunOperationRegister(meta, currentOperationId);
+				runState = decodeRunStateRegister(state, currentOperationId);
+			}
+			const hydrated = await hydrateCurrentState(this.#storage, mainLeaf, runOperation, runState);
+			const attachment = Object.freeze({
+				laneConfiguration: configuration,
+				laneState,
+				mainLeaf,
+				runOperation,
+				runState,
+				...hydrated,
+			});
+			const phase = runState?.value.phase;
+			const batch = phase?.kind === "tools" ? phase.batch : undefined;
+			const call = batch?.calls[transition.sourceIndex];
+			const firstUnfinished = batch?.calls.findIndex((candidate) => candidate.status !== "completed");
+			if (
+				currentOperationId !== transition.operationId ||
+				!runOperation ||
+				!runState ||
+				batch?.assistantEntryId !== transition.assistantEntryId ||
+				batch.turnId !== transition.turnId ||
+				firstUnfinished !== transition.sourceIndex ||
+				call?.status !== "effect_pending" ||
+				call.sourceIndex !== transition.sourceIndex ||
+				call.resultEntryId !== transition.resultEntryId ||
+				call.replay !== transition.replay
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+
+			const assistant = hydrated.entries.get(batch.assistantEntryId);
+			const sourceCalls =
+				assistant?.message.role === "assistant"
+					? assistant.message.content.filter((content) => content.type === "toolCall")
+					: [];
+			const source = sourceCalls[transition.sourceIndex];
+			if (!source || !isDeepStrictEqual(source, transition.toolCall))
+				throw new SessionError("corruption", "Tool settlement source identity does not match the assistant entry");
+			const argsKey = `${transition.operationId}:${transition.turnId}:${transition.sourceIndex}`;
+			const argsRegister = await this.#storage.getRegister("op.tool_args", argsKey);
+			if (!argsRegister) throw new SessionError("corruption", "Tool settlement arguments register is missing");
+			try {
+				assertRegister(argsRegister);
+				assertJsonValue(argsRegister.value);
+			} catch (error) {
+				throw new SessionError("corruption", "Tool settlement arguments register is malformed", error);
+			}
+			if (
+				argsRegister.namespace !== "op.tool_args" ||
+				argsRegister.key !== argsKey ||
+				!isDeepStrictEqual(argsRegister.value, transition.args)
+			)
+				throw new SessionError("corruption", "Tool settlement arguments do not match the retained preparation");
+			const priorParent =
+				transition.sourceIndex === 0
+					? transition.assistantEntryId
+					: batch.calls[transition.sourceIndex - 1]?.status === "completed"
+						? batch.calls[transition.sourceIndex - 1].resultEntryId
+						: undefined;
+			if (priorParent === undefined || mainLeaf.value !== priorParent)
+				throw new SessionError("corruption", "Tool result parent does not close the completed prefix");
+			if (hydrated.entries.has(transition.resultEntryId) || hydrated.usageRows.has(transition.resultEntryId))
+				throw new SessionError("corruption", "Tool result reservation is already materialized");
+
+			let usageId: string | undefined;
+			if (transition.usage !== undefined) {
+				usageId = this.idGenerator.next();
+				const directlyKnown = new Set([
+					transition.operationId,
+					transition.assistantEntryId,
+					transition.turnId,
+					transition.resultEntryId,
+					source.id,
+					...batch.calls.map((candidate) => candidate.resultEntryId),
+					...runOperation.value.intent.promptEntryIds,
+					...(runOperation.value.sourceLeafId === null ? [] : [runOperation.value.sourceLeafId]),
+					...(runState.value.latestAssistantEntryId === null ? [] : [runState.value.latestAssistantEntryId]),
+				]);
+				if (directlyKnown.has(usageId)) throw new SessionError("storage", "Generated tool usage ID is not unique");
+				const [entries, usageRows, meta, state] = await Promise.all([
+					this.#storage.getEntries([usageId]),
+					this.#storage.getUsageRows([usageId]),
+					this.#storage.getRegister("op.meta", usageId),
+					this.#storage.getRegister("op.state", usageId),
+				]);
+				if (entries.size > 0 || usageRows.size > 0 || meta || state)
+					throw new SessionError("storage", "Generated tool usage ID is already occupied");
+			}
+
+			const message: ToolResultMessage = {
+				role: "toolResult",
+				toolCallId: source.id,
+				toolName: source.name,
+				content: structuredClone(transition.content),
+				details: structuredClone(transition.details),
+				...(transition.addedToolNames?.length
+					? { addedToolNames: structuredClone(transition.addedToolNames) }
+					: {}),
+				...(transition.usage === undefined ? {} : { usage: structuredClone(transition.usage) }),
+				isError: transition.isError,
+				timestamp: Date.now(),
+			};
+			const completedCalls = batch.calls.map((candidate, index) =>
+				index === transition.sourceIndex
+					? {
+							status: "completed" as const,
+							sourceIndex: candidate.sourceIndex,
+							resultEntryId: candidate.resultEntryId,
+							terminate: transition.terminate,
+						}
+					: candidate,
+			);
+			const final = transition.sourceIndex === batch.calls.length - 1;
+			const nextState: RunState = {
+				...runState.value,
+				phase: final
+					? {
+							kind: "checkpoint",
+							continuation: completedCalls.every(
+								(candidate) => candidate.status === "completed" && candidate.terminate,
+							)
+								? { kind: "may_finish", includeFinalAssistant: false }
+								: { kind: "need_assistant", overflowRecoveryUsed: false },
+							triggerEntryId: transition.resultEntryId,
+						}
+					: { kind: "tools", batch: { ...batch, calls: completedCalls } },
+			};
+			let cleanup: Register[] = [];
+			if (final) {
+				const listed = await this.#storage.listRegisters("op.tool_args");
+				for (const register of listed) {
+					try {
+						assertRegister(register);
+					} catch (error) {
+						throw new SessionError("corruption", "Malformed tool argument cleanup register", error);
+					}
+					if (register.namespace !== "op.tool_args")
+						throw new SessionError("corruption", "Tool argument cleanup register has the wrong namespace");
+				}
+				const prefix = `${transition.operationId}:${transition.turnId}:`;
+				cleanup = listed.filter(({ key }) => key.startsWith(prefix));
+				const seen = new Set<number>();
+				for (const register of cleanup) {
+					const suffix = register.key.slice(prefix.length);
+					const index = Number(suffix);
+					if (
+						!Number.isSafeInteger(index) ||
+						index < 0 ||
+						index >= batch.calls.length ||
+						String(index) !== suffix ||
+						seen.has(index)
+					)
+						throw new SessionError("corruption", "Tool argument cleanup key has an invalid source index");
+					seen.add(index);
+				}
+				cleanup.sort((left, right) => left.key.localeCompare(right.key));
+			}
+			const writes: Write[] = [
+				{
+					kind: "entry",
+					entry: {
+						id: transition.resultEntryId,
+						parentId: priorParent,
+						type: "message",
+						payload: encodeMessage(message),
+					},
+				},
+				{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: transition.resultEntryId },
+				...(usageId === undefined || transition.usage === undefined
+					? []
+					: [
+							{
+								kind: "usage" as const,
+								row: {
+									id: usageId,
+									entryId: transition.resultEntryId,
+									usage: structuredClone(transition.usage),
+									adjustment: false,
+								},
+							},
+						]),
+				...cleanup.map(({ key }) => ({
+					kind: "register" as const,
+					op: "delete" as const,
+					namespace: "op.tool_args" as const,
+					key,
+				})),
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: transition.operationId,
+					value: encodeRunState(nextState, transition.operationId),
+				},
+			];
+			const committed = await this.#storage.commit({ writes });
+			const entries = new Map(hydrated.entries);
+			entries.set(
+				transition.resultEntryId,
+				Object.freeze({
+					id: transition.resultEntryId,
+					parentId: priorParent,
+					seq: committed.seqs[0],
+					timestamp: committed.timestamp,
+					type: "message" as const,
+					message: structuredClone(message),
+				}),
+			);
+			const usageRows = new Map(hydrated.usageRows);
+			if (usageId !== undefined && transition.usage !== undefined)
+				usageRows.set(
+					usageId,
+					Object.freeze({
+						id: usageId,
+						seq: committed.seqs[2],
+						entryId: transition.resultEntryId,
+						usage: structuredClone(transition.usage),
+						adjustment: false,
+					}),
+				);
+			return Object.freeze({
+				status: "committed" as const,
+				attachment: Object.freeze({
+					...attachment,
+					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.resultEntryId }),
+					runState: Object.freeze({ seq: committed.seqs.at(-1)!, value: structuredClone(nextState) }),
 					entries,
 					usageRows,
 				}),

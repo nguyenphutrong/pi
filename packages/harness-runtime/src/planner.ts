@@ -17,6 +17,10 @@ export type ActionInfo =
 			sourceIndex: number;
 			resultEntryId: string;
 	  }
+	| { kind: "dispatch_tool_effect"; operationId: string; effectKey: string }
+	| { kind: "await_tool_effect"; operationId: string; effectKey: string }
+	| { kind: "finalize_tool_effect"; operationId: string; effectKey: string }
+	| { kind: "settle_tool_effect"; operationId: string; effectKey: string }
 	| { kind: "finish_run"; operationId: string; triggerEntryId: string }
 	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string };
 
@@ -34,11 +38,16 @@ export function assistantEffectKey(operationId: string, stepId: string, attempt:
 	return `assistant:${operationId}:${stepId}:${attempt}`;
 }
 
+export function toolEffectKey(operationId: string, turnId: string, sourceIndex: number): string {
+	return `tool:${operationId}:${turnId}:${sourceIndex}`;
+}
+
 export function planAction(
 	attachment: RuntimeAttachment,
 	inputs: {
 		readonly settingsRevision: number;
 		readonly assistantEffectStatus: (key: string) => "planned" | "running" | "settled" | undefined;
+		readonly toolEffectStatus?: (key: string) => "planned" | "running" | "raw" | "finalized" | undefined;
 		readonly retryElapsed?: (operationId: string, stepId: string, nextAttempt: number, notBefore: number) => boolean;
 	},
 ): PlannedAction | undefined {
@@ -71,14 +80,27 @@ export function planAction(
 	} else if (phase.kind === "tools") {
 		const call = phase.batch.calls.find((candidate) => candidate.status !== "completed");
 		if (!call) return undefined;
-		if (call.status !== "planned") return undefined;
-		info = {
-			kind: "prepare_tool_call",
-			operationId: operation.value.operationId,
-			assistantEntryId: phase.batch.assistantEntryId,
-			sourceIndex: call.sourceIndex,
-			resultEntryId: call.resultEntryId,
-		};
+		if (call.status === "planned")
+			info = {
+				kind: "prepare_tool_call",
+				operationId: operation.value.operationId,
+				assistantEntryId: phase.batch.assistantEntryId,
+				sourceIndex: call.sourceIndex,
+				resultEntryId: call.resultEntryId,
+			};
+		else {
+			const key = toolEffectKey(operation.value.operationId, phase.batch.turnId, call.sourceIndex);
+			const status = inputs.toolEffectStatus?.(key);
+			if (status === "planned")
+				info = { kind: "dispatch_tool_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (status === "running")
+				info = { kind: "await_tool_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (status === "raw")
+				info = { kind: "finalize_tool_effect", operationId: operation.value.operationId, effectKey: key };
+			else if (status === "finalized")
+				info = { kind: "settle_tool_effect", operationId: operation.value.operationId, effectKey: key };
+			else return undefined;
+		}
 	} else if (phase.generation.status === "ready") {
 		info = {
 			kind: "prepare_assistant_effect",
