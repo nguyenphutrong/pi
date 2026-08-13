@@ -1207,3 +1207,28 @@ Commit `8143f9d39` implements the repair core and repository operation. Repair r
 Commit `452fe721c` implements the additive private package seam. The package root preserves its adapter, schema, SQL, and type exports while adding the repository, repository errors/options, catalog metadata, and `SqliteStorageSession extends Storage`. Emitted `create` and `open` declarations return the complete structural interface; the concrete handle, transaction engine, callbacks, queues, and lifecycle internals remain outside the package root. Boundary tests use a real created handle rather than a cast or partial fake. The complete SQLite suite passes 214/214, the package build, `npm run check`, and `git diff --check` pass, and a fresh independent review reports PASS. Private Harness integration remains next.
 
 Commit `a381f5f30` implements the private Harness adapter. `SqliteSessionRepo` accepts only an exact nonempty path, owns the Node factory and low-level repository, and creates the initial leaf and idle state in the low-level creation transaction. Open validates exact metadata and directional versions, validates the bounded main-lane closure, and releases the acquired handle without replacing the original validation error. `StoredSession` owns and maps handle close; repository close owns the file connection. Contextual error mapping exposes only existing `SessionError` codes, and unsupported persisted catalog metadata is corruption rather than a migration fallback. A forced failure on the second initial register proves catalog, sequence, stats, lease, and first-register rollback. Harness passes 398/398, SQLite passes 214/214, `npm run check` and `git diff --check` pass, and a fresh independent review reports PASS. Real RuntimeShell SQLite acceptance remains next.
+
+## D-042 — Verify terminal SQLite restoration with separate fresh Session attachments
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after corrected independent design review
+- References: D-019, D-024, D-041; `packages/agent/docs/harness-v3.md` §§1.7, 2.8, 3.13, 4.2, 4.4–4.7, 9.1–9.3
+
+### Options
+
+1. Add the two RuntimeShell terminal scenarios to the existing SQLite repository contract test.
+2. Add one focused real-file acceptance suite with separate fresh Sessions for terminal attachment inspection and RuntimeShell no-op restoration.
+3. Parameterize the complete Phase 2 Memory crash-cut matrix over Memory and SQLite immediately.
+
+### Choice
+
+Option 2. One initial Session manually drives complete no-tool and sequential-tool runs through RuntimeShell. After shell and repository close, one fresh repository/Session performs a single write-free `attachRuntime` inspection, and another fresh repository/Session creates a RuntimeShell directly and proves idle driving performs no effects or durable writes.
+
+### Rationale
+
+The focused suite closes D-041's real SQLite composition gate without mixing RuntimeShell behavior into repository contract tests or pulling subprocess crash matrices into this increment. `attachRuntime` is intentionally single-use per `StoredSession`; inspecting an attachment and then calling `createRuntimeShell` on that same Session would double-attach and fail. Separate fresh opens model real process lifecycles and keep ownership explicit.
+
+The initial manual traces are exact: six actions for a no-tool response and sixteen for a one-tool sequential turn followed by a final response. Assertions cover ordered entry identities and parent chains, payloads, leaf, usage ledger totals, provider contexts, tool execution, terminal operation cleanup, and the exact `lane.lastResult`. Since the current incremental Session surface does not yet expose §5.1's `getLastResult`, a read-only exact SQLite query after all owners close supplies test evidence only; it does not drive, repair, fold, or bypass RuntimeShell state transitions. Fresh attachment and no-op RuntimeShell passes must preserve the database sequence, registers, tree, and stats and must invoke no provider or tool effect.
+
+Subprocess SQL, creation, and every Phase 2 crash cut remain separate queued work and are still required before the Phase 3 done bar. No Storage, durable-schema, production API, repair, or recovery change is approved by this decision. The corrected independent design review reports PASS with no §6 escalation.

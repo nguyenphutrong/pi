@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.3f-D — Real RuntimeShell SQLite acceptance
-- Status: private Harness SQLite repository completed by `a381f5f30`; atomic main-lane creation, exact lifecycle/error mapping, Harness 398/398, SQLite 214/214, and root check pass independent review
+- Status: D-042 accepted after independent design review; implement separate real-file no-tool/tool terminal runs, fresh attachment inspection, and fresh RuntimeShell no-op restore without double-attaching one Session
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
