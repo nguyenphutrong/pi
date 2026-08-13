@@ -4,7 +4,7 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.1c — Representative SQLite queue process-death cuts
-- Status: operation-owned steer/follow-up, durable drains, cancellation, abort retention, and terminal cleanup are implemented and independently reviewed at `2700b7a58`; design and prove representative real-process crash boundaries for the completed queue kernel
+- Status: D-049's five-prefix, ten-process SQLite queue crash matrix is independently approved; implement its exact test-only protocol and all-nine-table oracle
 - Done bar: real SQLite process death cross-cuts queue admission, placement/deletion, abort drain, and terminal cleanup; fresh reopen observes the exact pre-commit or complete post-commit state and never duplicates placement or cleanup
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

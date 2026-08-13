@@ -1404,3 +1404,36 @@ Option 3. A non-null source must have a lower storage sequence than the first ca
 `sourceLeafId` is the pre-operation leaf, while `intent.promptEntryIds` deliberately excludes captured `nextRun` entries and hook injections. Those valid placed entries may sit between the source and first caller prompt, so option 1 rejects legal runs. Option 2 violates the exact bounded-hydration contract and reintroduces history-derived recovery. The current named entries can still prove source-before-prompt ordering, the caller-only prompt chain, stale trigger rejection, latest-assistant ordering, exact assistant settlement parents while intent is open, and complete tool-result chains. Corruption hidden solely behind unnamed injected ancestry is intentionally outside current-state recovery validation.
 
 The implementation adds write-free source-order rejection and a no-scan regression proving an unnamed placed entry may legally bridge source to first prompt. Fresh independent review confirms the earlier trigger-closure and logical-reservation-collision findings are closed. This is a bounded validation correction inside D-047, not a durable contract, public API, or §6 architecture change.
+
+## D-049 — Prove queue crash durability with five semantic SQLite prefixes
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: accepted after corrected independent design review
+- References: D-045–D-048; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.2, 3.3–3.4, 3.11–3.13, 4.1, 4.4–4.7, 9.1–9.3
+
+### Options
+
+1. Run one real queue lifecycle at every durable prefix, so five cases cover the baseline plus the four queue commits.
+2. Run separate before/after cases for each queue commit, duplicating adjacent durable states across eight cases.
+3. Insert queue work into D-046's full 34-cut provider/tool matrix.
+
+### Choice
+
+Option 1. Five isolated SQLite files each run an initial child that self-terminates with `SIGKILL` at one prefix and a fresh recovery child that reopens at exact lease expiry, validates the opening state, and completes the remaining lifecycle. The trace starts with an open run at leaf P, pending follow-up F, and lane-owned next-run N, then performs `steer(S)`, selector-driven placement of S, `abort()`, and selector-driven aborted terminal cleanup. Prefixes S0 through S4 are respectively before admission, after admission, after placement, after abort, and after cleanup.
+
+### Rationale
+
+Each prefix is both the complete post-state of one transaction and the pre-state of the next, so five cases prove both sides of admission, placement/register deletion, abort drain, and terminal cleanup without eight redundant setups. D-045 already proves SQL-statement transaction atomicity and D-046 proves all provider/tool action boundaries; extending either matrix would conflate concerns without increasing queue evidence.
+
+The child protocol is versioned, exact, bounded NDJSON. Initial children fix the clock, create the real SQLite repository/session/runtime, and emit one `baseline` event carrying the public metadata plus P/O/F/N identities. Every S1–S4 initial child emits an `admitted` event carrying the exact public `steer()` return S before any action or crash marker. S0 has no S before death; its recovery child emits the same `admitted` event immediately after public admission and before any post-admission action. The parent requires exactly one such event across the two processes, validates every identity as unique/disjoint UUIDv7, and uses the public return—not a snapshot-derived key—as S authority thereafter. Initial children then complete only the selected prefix, synchronously emit the crash marker, and self-send `SIGKILL`. Recovery children fix the clock at the writer lease's exact expiry, acquire fresh fenced ownership, emit the opening action and all-nine-table snapshot, then use public RuntimeShell queue/abort/action methods to finish. A final fresh ownership lifecycle proves terminal `peekAction()` and drive are effect-free and write-free. Parent timeout kills, stderr, malformed or extra events, and any exit other than exact initial `SIGKILL` plus recovery zero fail.
+
+The independent parent oracle derives expectations from those public identities and known payloads. Baseline construction has exact writes: repository creation assigns leaf/state sequences 1–2, attachment assigns config 3, one-message prompt acceptance assigns P/leaf/meta/op-state/lane-state 4–8, F admission assigns pending/op-state 9–10, and N admission assigns pending/lane-state 11–12, leaving `next_seq=13`. S1 assigns pending S/op-state 13–14 (`next_seq=15`). S2 placement assigns entry S/delete-pending-S/leaf/op-state 15–18 (`next_seq=19`), where the deleted register consumes sequence 16 but has no live row. S3 assigns cancelled op-state 19 (`next_seq=20`). S4 cleanup assigns meta delete/state delete/F delete/last-result/lane-state 20–24 (`next_seq=25`); deleted objects consume sequences 20–22 and have no live rows. The oracle requires those exact live row sequences and exact `next_seq`, not merely monotonicity.
+
+Every S0/S1 opening has one message and S2–S4 have exactly two; every stats row has exact zero usage, and `usage_ledger` is empty. P is entry sequence 4; S, when placed, is entry and branch-entry sequence 15 with parent P. The one segment tip is P before placement and S afterward. Opening recovery lease is exactly fresh fence 2 expiring at recovery time plus 30 seconds; the lease is absent after normal terminal and idle closes. Initial baseline requires exactly one model lease for prompt identity resolution and zero provider/tool starts. Recovery and final idle lifecycles require zero model leases, provider starts, and tool starts. Thus an unintended write, generation start, duplicate placement, or cleanup side effect cannot hide behind a semantically plausible final tree.
+
+The oracle additionally checks entry/register exclusivity for S, F, and N; exact queue/control/phase values at each prefix; pending payload retention after abort; operation register and pending-payload cleanup at terminal; exact aborted `lane.lastResult`; idle lane state preserving `[N]` and pending N at its original sequence 11; and complete all-nine-table equality across the final idle no-op. S0 recovery performs all four operations after its explicit admission event, S1 does not repeat admission, S2 does not execute its initially planned assistant step and instead aborts, S3 does not repeat abort, and S4 performs no operation. No production seam, raw lease mutation, sleep, controlled-close substitute, provider/tool effect, Storage/schema change, or deferred-write work is allowed.
+
+Implementation stays in dedicated Harness SQLite queue process-crash test, child, and support files so D-046's provider/tool grammar remains unchanged. This is a test-evidence choice with no §6 ambiguity.
+
+Fresh independent design review verifies both earlier findings are closed and every production sequence assignment is exact. It confirms the five-prefix economy covers both sides of all four queue transactions, S0's public admission identity is non-circular, lease acquisition does not affect Harness sequences or stats, delete writes consume sequence numbers, S2 may abort without executing its planned generation, and no §6 escalation is needed.
