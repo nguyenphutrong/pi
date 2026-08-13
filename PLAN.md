@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.5b — Sequential tool dispatch, finalization, and durable real-result settlement
-- Status: D-028 four-stage live tool-effect design committed by `4f8f4c5cf` after corrected independent review; implementation is next
+- Work item: 2.6 — Restored tool-effect replay or synthetic interruption
+- Status: D-028 live sequential tool effects implemented by `711f5d97c` after full verification and corrected independent final review; unknown-effect recovery is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement four-stage sequential dispatch, raw await, and finalization through the retained prepared plan.
-2. Atomically settle a real durable tool result and advance the batch/checkpoint.
-3. Add Tier A/B/C dispatch, finalization, settlement, close, fault, and semantic-authority coverage.
-4. Independently review and rework the complete D-028 slice.
-5. Add replay/interrupted recovery, abort, and the Phase 2 crash matrix.
+1. Re-read restored-tool recovery and replay sections and design D-029.
+2. Implement safe replay only when persisted and current declarations are both `safe`.
+3. Synthetically settle `interrupted` under the reserved result id for every non-replay case.
+4. Add close/reopen, changed declaration, exact args, and replay-result Tier A/B/C coverage; independently review D-029.
+5. Implement abort reconciliation and the complete Phase 2 crash matrix.
 
 ## Phase order
 

@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blocker. D-028 sequential dispatch, finalization, and real-result settlement design is approved by `4f8f4c5cf`; implementation is next.
+No active blocker. D-028 live sequential tool effects are implemented by `711f5d97c`; D-029 restored tool-effect replay/interruption recovery is next.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 

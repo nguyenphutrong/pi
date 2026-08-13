@@ -754,7 +754,7 @@ Commit `be47c4560` implements the complete clearance boundary. The retained regi
 
 - Date: 2026-08-13
 - Phase: 2
-- Status: approved after corrected independent design review
+- Status: implemented by `711f5d97c` after corrected independent design and final reviews
 - References: D-024–D-027; `packages/agent/docs/harness-v3.md` §§1.2, 1.6, 3.2–3.3, 3.8, 3.13, 4.1–4.7, 5.7, 9.1–9.3
 
 ### Options
@@ -782,3 +782,5 @@ Close writes nothing, aborts registered tool controllers, prevents locally obser
 Tier A covers real success, tool/error normalization, `after_tool` patches and failures, usage/no-usage, termination, two-call source and parent order, exact retained args/identity, final cleanup, close/reopen, and completed reopen. Tier B proves `clearance commit → registered dispatch → raw result → finalization → one settlement transaction` and exact write order. Tier C covers both close/fault orders at dispatch, raw, finalization, and settlement boundaries, semantic settlement across unrelated sequence advancement, and obsolete local cleanup.
 
 Replay/interrupted recovery, public abort and cancelled-output reconciliation, parallel tools, full hooks/events, and genuine-length explanatory results remain later Phase 2 items. This changes no durable schema, Storage contract, public Harness API, `pi-ai`, provider adapter, legacy agent package, or forbidden record/history surface. The corrected independent design review reports PASS and requires no §6 escalation.
+
+Commit `711f5d97c` implements the complete live sequential-effect boundary. The planner exposes four stable process-local actions; RuntimeShell retains one context-bound prepared lease through registered execution and source-ordered finalization; Session semantically settles against the latest state in one result/leaf/optional-usage/cleanup/state transaction. Real result messages snapshot finalized usage while a fresh commit-time row records the same charge, and completed durable calls drop pending-only replay data. Harness runtime passes 341/341, `npm run check` and `git diff --check` pass, and the corrected independent final review reports PASS after close/fault and real-result reopen evidence closed its two test-only findings.
