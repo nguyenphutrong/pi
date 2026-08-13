@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.6 — Restored tool-effect replay or synthetic interruption
-- Status: D-029 design committed by `103401e70` after corrected independent design review; implementation and recovery tests are next
+- Work item: 2.7 — Durable abort and terminal reconciliation
+- Status: D-029 restored tool recovery implemented by `22d75bde0`; Harness 355/355, root check, diff check, and corrected independent final review PASS
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Hydrate exact pending tool arguments into the internal runtime attachment.
-2. Implement `recover_tool_effect`, safe replay, and synthetic interruption through ordinary settlement.
-3. Add declaration-matrix, exact-argument, writer-order, and fresh-reopen Tier A/B/C coverage.
-4. Run the full Harness suite and root check, then obtain an independent final D-029 review.
-5. Implement abort reconciliation and the complete Phase 2 crash matrix.
+1. Re-read abort control, reconciliation, and terminal transaction sections and design D-030.
+2. Implement the durable first-abort marker and idempotent repeated abort result.
+3. Reconcile planned, restored pending, and live tool outputs without starting forbidden effects.
+4. Add abort-versus-effect/settlement/close Tier A/B/C coverage and the complete Phase 2 crash matrix.
+5. Run the Phase 2 done-bar review and Recovery/QA gate.
 
 ## Phase order
 
