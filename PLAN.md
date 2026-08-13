@@ -2,17 +2,19 @@
 
 ## Current checkpoint
 
-- Phase: 3 — SQLite and production durability
-- Work item: Phase 3 final acceptance
-- Status: D-046 is implemented and independently reviewed at `6c0706d19`; run separate whole-phase Recovery/QA and acceptance review before advancing
-- Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
+- Phase: 4 — Queues and interactive control
+- Work item: 4.1 — Queue acceptance, cancellation, and drain design
+- Status: Phase 3 passed separate Recovery/QA and independent acceptance; design the first Phase 4 slice from the durable inbox and queue-control spec
+- Done bar: `steer`, `followUp`, `nextRun`, `cancelQueued`, deferred tree writes, one-at-a-time/all drain modes, `waitForIdle`, `runWhenIdle`, and full abort behavior are durable and verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Run whole-Phase-3 Recovery/QA against Memory, SQLite, Harness, and process-crash suites.
-2. Obtain an independent whole-Phase-3 done-bar review.
-3. Begin Phase 4 queue and interactive-control design only after both acceptance gates pass.
+1. Design durable `steer`, `followUp`, `nextRun`, and `cancelQueued` acceptance/cancellation/drain semantics.
+2. Implement and verify the smallest sequential queue slice with exact crash/race coverage.
+3. Design and implement deferred tree writes.
+4. Add one-at-a-time/all modes, `waitForIdle`, and `runWhenIdle`.
+5. Complete full abort composition and whole-Phase-4 acceptance.
 
 ## Phase order
 
