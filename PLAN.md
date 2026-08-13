@@ -3,17 +3,18 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.4b — SQLite storage and session-creation subprocess crash matrices
-- Status: design the exact kill/reopen matrix against D-032/D-033/D-041 and the Phase 3 process-crash done bar
+- Work item: 3.4b-A — SQLite ordinary-commit subprocess crash matrix
+- Status: D-045 accepted by independent design review; implement the test-only child protocol, semantic SQL cut catalog, and exact absent-or-complete oracle
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design and implement storage and creation subprocess crash matrices.
-2. Design and implement RuntimeShell subprocess crash matrices.
-3. Run whole-Phase-3 review and Recovery/QA.
-4. Begin Phase 4 queue and interactive-control design only after Phase 3 acceptance.
+1. Implement the ordinary-commit subprocess matrix and review it independently.
+2. Extend the same tested protocol with the atomic-session-creation matrix.
+3. Design and implement RuntimeShell subprocess crash matrices.
+4. Run whole-Phase-3 review and Recovery/QA.
+5. Begin Phase 4 queue and interactive-control design only after Phase 3 acceptance.
 
 ## Phase order
 

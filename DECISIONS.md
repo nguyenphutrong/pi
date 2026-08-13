@@ -1284,3 +1284,32 @@ Option 1.
 The audit claims exact recovery at every commit boundary, so first/last provider samples and merely increasing usage rows leave observable recovery and transaction-order gaps. Every normal run has exactly `[user]` then `[user, assistant tool-call, toolResult]`; cuts 3 and 4 repeat the first context before the tool-result context, while cuts 13 and 14 repeat the tool-result context. Each assistant settlement writes `entry → lane.leaf → usage → op.state`, so its usage row sequence must equal the associated assistant entry sequence plus two. Usage identities must satisfy the same UUIDv7 durable identity contract as the production writer and remain unique and disjoint from entry ids. This is test-only and changes no production or public contract.
 
 Commit `152a49b38` implements D-043/D-044. All 34 controlled-close prefixes pass with exact action identities, complete provider-context traces, replay/interruption counts, UUIDv7 usage identities, exact assistant-entry-plus-two usage sequences, all-nine-table snapshots, fresh terminal no-op proof, and terminal cleanup. Harness passes 434/434, SQLite passes 214/214, `npm run check` and `git diff --check` pass. A fresh independent review reports PASS and confirms both repeated findings are closed. Subprocess storage/creation and RuntimeShell process-crash matrices remain required.
+
+## D-045 — Prove SQLite transaction crash atomicity through semantic subprocess cuts
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after independent design review
+- References: D-032–D-041; `packages/agent/docs/harness-v3.md` §§1.4–1.7, 2.6, 2.8, 4.7, 9.1–9.3
+
+### Options
+
+1. Wrap the test-only `SqliteDatabaseFactory`, forward every operation to the production adapter, and let a real child process kill itself at a cataloged semantic SQL cut.
+2. Add crash hooks to the production transaction engine.
+3. Kill an uninstrumented child on randomized or timed delays and classify observed outcomes.
+
+### Choice
+
+Option 1, delivered in two increments: ordinary `Storage.commit()` first, then atomic repository creation through the same protocol and oracle.
+
+### Rationale
+
+Each case owns one real SQLite file and a Node strip-only TypeScript child. The parent spawns without a shell and accepts a cut only after exact versioned `armed` and `cut-reached` NDJSON markers plus child exit `{code:null, signal:"SIGKILL"}`; a timeout, protocol mismatch, duplicate marker, or parent-issued kill fails. The wrapper activates only after schema and baseline setup. It forwards the production adapter and wraps its real `transaction()` callback solely to cut after `BEGIN IMMEDIATE` but before the first operation, or after the adapter returns from `COMMIT`. Statement wrappers run the real mutation first and then cut. They never implement begin, commit, rollback, the ordered engine, or branch projection.
+
+A successful no-kill trace is the catalog authority. It classifies exact normalized SQL plus occurrence and parameters, requires every expected site exactly once, and rejects any unclassified mutating statement in the armed operation window. The ordinary transaction appends one exact-tip message and associated usage, sets a new register, overwrites and deletes existing registers, and deletes one absent register. Its catalog therefore covers lease renewal, entry and segmented-branch mutations, usage, each caller-ordered register operation, stats, sequence advancement, the before-first-operation cut, and post-commit uncertainty. Open/acquire completes before `armed`; its lifecycle transaction is not conflated with the tested commit.
+
+Creation uses the real low-level repository with D-032's exact initial transaction: `lane.leaf/main = null` followed by idle `lane.state/main`. Its catalog covers the session, sequence, stats, lease, both initial registers, final stats and sequence writes, before-first-operation, and after commit. An artificial initial entry is unnecessary because the ordinary matrix already exercises branch tables, and instrumenting `SqliteSessionRepo.create()` would require a new factory seam without increasing transaction-boundary evidence.
+
+The child uses fixed UUIDv7 ids, owner, clock, lease TTL, and non-firing timers. After confirmed process death, the parent first reads all nine tables with exact ordering, preserving WAL and shared-memory files. Ordinary state must equal the exact armed baseline or exact complete transaction with no per-table mixing. Creation must be absent from every table and list result, or be one exact complete valid session. The parent then opens through a fresh real repository exactly at lease expiry under a different owner, proving lawful takeover and fence advancement without raw lease deletion or bypass. Branch closure, stats, caller-order sequences, next-sequence allocation, metadata, normal close, and final absent lease are checked as applicable.
+
+All support stays test-only in the private SQLite package with no new dependency or public capability. The POSIX `SIGKILL` matrix is explicitly skipped on Windows; ordinary cross-platform conformance remains unchanged. RuntimeShell process recovery remains a separate next work item. Independent design review reports PASS.
