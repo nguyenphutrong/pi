@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. B-015 is resolved; Phase 3.4a literal-oracle rework is in progress.
+No active blockers. Phase 3.4c is complete; whole-Phase-3 Recovery/QA and acceptance review are in progress.
 
 ## B-015 — Choose the exact SQLite commit-boundary oracle bar
 

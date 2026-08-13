@@ -3,16 +3,16 @@
 ## Current checkpoint
 
 - Phase: 3 — SQLite and production durability
-- Work item: 3.4c — RuntimeShell SQLite subprocess crash matrix
-- Status: D-046 accepted by independent design review; implement the strict two-process safe/never matrix over all 17 action prefixes
+- Work item: Phase 3 final acceptance
+- Status: D-046 is implemented and independently reviewed at `6c0706d19`; run separate whole-phase Recovery/QA and acceptance review before advancing
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design and implement RuntimeShell subprocess crash matrices.
-2. Run whole-Phase-3 review and Recovery/QA.
-3. Begin Phase 4 queue and interactive-control design only after Phase 3 acceptance.
+1. Run whole-Phase-3 Recovery/QA against Memory, SQLite, Harness, and process-crash suites.
+2. Obtain an independent whole-Phase-3 done-bar review.
+3. Begin Phase 4 queue and interactive-control design only after both acceptance gates pass.
 
 ## Phase order
 
