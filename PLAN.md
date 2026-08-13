@@ -3,15 +3,15 @@
 ## Current checkpoint
 
 - Phase: 2 — Durable tools and abort
-- Work item: 2.3 — Generation unknown-effect recovery
-- Status: blocked at final review by B-011 after repeated exact-validation rejections; production and tests remain uncommitted
+- Work item: 2.4 — First complete durable tool-plan commit
+- Status: item 2.3 implemented by `e6e6b1cd0` after independent final review; tool-plan design is next
 - Done bar: `prompt → tool call → durable tool result → model → final response` survives a crash at every boundary, with durable abort and terminal reconciliation
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement generation unknown-effect recovery required by the Phase 2 crash done bar.
-2. Implement and test the first complete durable tool-plan commit before clearance or effects.
+1. Re-read the tool settlement/recovery sections and design the first atomic tool-batch plan boundary.
+2. Implement and test the complete durable tool-plan commit before clearance or effects.
 3. Add durable clearance, persisted effective arguments, replay policy, and sequential tool settlement.
 4. Add durable abort/reconciliation after sequential tool states are abort-ready.
 5. Add close/reopen crash matrices at every Phase 2 commit boundary and run the done-bar gate.
@@ -51,5 +51,5 @@
 - JSONL unless required for product export, debug, or import.
 - Postgres partitioning and retention daemon.
 - Precise rewrite and general settlement-kernel migrations.
-- Multi-lane, queues, tools, compaction, navigation, and serving concerns until their ordered phases.
+- Multi-lane, queues, compaction, navigation, and serving concerns until their ordered phases.
 - Canonical extensible `AgentMessage` ownership and custom-role schemas until before custom messages or the product shell.

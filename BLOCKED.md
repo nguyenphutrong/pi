@@ -2,7 +2,7 @@
 
 ## Current status
 
-Generation unknown-effect recovery is blocked by B-011. Production and tests are uncommitted; do not commit them until the durable validation boundary is confirmed and independent review passes.
+No active blocker. B-011 is resolved and generation unknown-effect recovery is implemented by `e6e6b1cd0`.
 
 ## B-011 — Decide whether failed-response identity remains self-authenticating
 
@@ -10,7 +10,8 @@ Generation unknown-effect recovery is blocked by B-011. Production and tests are
 - Phase: 2
 - Work item: 2.3 — generation unknown-effect recovery
 - Trigger: §6 repeated review-agent rejection for the same exact durable-validation boundary
-- Status: active; current production/test diff passes Harness 264/264 and root check but final review remains FAIL
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; recorded in D-025 and implemented by `e6e6b1cd0` after independent final review PASS
 
 ### Context
 
@@ -20,17 +21,15 @@ The third reviewer requires those three comparisons. Satisfying that literally r
 
 This follows two earlier review corrections on the same work item: exact response/error consistency and exact retry-wait diagnostics. Under §6, another unilateral schema choice is not allowed.
 
-### Decision needed
+### Decision
 
-1. **Recommended:** keep the canonical v3 `failure_drain` shape. Treat provider/model/timestamp as self-authenticating typed response fields after the writer transaction; restore validates every independently verifiable relationship but does not compare a value to itself. Record this boundary in D-025, obtain a fresh review against it, and commit only after PASS.
+1. **Selected:** keep the canonical v3 `failure_drain` shape. Treat provider/model/timestamp as self-authenticating typed response fields after the writer transaction; restore validates every independently verifiable relationship but does not compare a value to itself. Record this boundary in D-025, obtain a fresh review against it, and commit only after PASS.
 2. Extend `failure_drain` provenance with expected provider, model, and response timestamp so restore can compare them. This duplicates settled entry data, changes the durable state contract, and diverges from `harness-v3.md` §3.2.
 3. Compare provider/model to current `lane.config` and accept the false-corruption risk when configuration changes after generation start. Timestamp remains unverifiable. Not recommended.
 
-Reply with `1`, `2`, or `3`.
+### Outcome
 
-### Resume point
-
-After selection, update D-025 and B-011, make only the selected validation/test correction, rerun all nine explicit Harness test files plus `npm run check`, request a fresh independent implementation review, and commit only on PASS.
+The restore check now compares no entry-owned field to itself, while exact field-set and independently representable relationship checks remain. Sequence authority was added after the final review found a separate stale-action gap. Harness runtime passes 266/266, root check and diff check pass, and a fresh independent review reports PASS.
 
 ## B-010 — Choose how Harness distributes its private agent-loop dependency
 
