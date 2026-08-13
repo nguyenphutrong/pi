@@ -4,6 +4,7 @@ import {
 	isUuidV7,
 	type JsonValue,
 	type Register,
+	uuidV7Timestamp,
 } from "@nguyenphutrong/pi-session-storage";
 import { SessionError } from "./types.ts";
 
@@ -111,6 +112,20 @@ type FailureDrainPhase = {
 	provenance: { kind: "response"; entryId: string };
 };
 
+export interface ToolBatch {
+	assistantEntryId: string;
+	configuration: LaneConfiguration;
+	turnId: string;
+	calls: ToolCall[];
+}
+
+export type ToolCall =
+	| { status: "planned"; sourceIndex: number; resultEntryId: string }
+	| { status: "effect_pending"; sourceIndex: number; resultEntryId: string; replay: "never" | "safe" }
+	| { status: "completed"; sourceIndex: number; resultEntryId: string; terminate: boolean };
+
+type ToolsPhase = { kind: "tools"; batch: ToolBatch };
+
 export interface RunState {
 	kind: "run";
 	control: { status: "running" };
@@ -120,7 +135,7 @@ export interface RunState {
 		followUpMode: "all" | "one-at-a-time";
 		toolExecution: "sequential" | "parallel";
 	};
-	phase: CheckpointPhase | AssistantPhase | FailureDrainPhase;
+	phase: CheckpointPhase | AssistantPhase | ToolsPhase | FailureDrainPhase;
 	inbox: { steer: []; followUp: []; writes: [] };
 	latestAssistantEntryId: string | null;
 }
@@ -232,7 +247,8 @@ export function decodeLaneConfiguration(value: unknown): LaneConfiguration {
 	if (!["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(config.thinkingLevel as string))
 		fail("Unsupported thinking level");
 	strings(config.activeToolNames, "activeToolNames");
-	if (config.activeToolNames.length !== 0) fail("Phase 1 activeToolNames must be empty");
+	if (new Set(config.activeToolNames).size !== config.activeToolNames.length)
+		fail("activeToolNames must not contain duplicates");
 	return config as unknown as LaneConfiguration;
 }
 
@@ -518,6 +534,35 @@ export function decodeRunStateRegister(candidate: unknown, operationId: string):
 				safe(pending.contextWindow, "contextWindow");
 				if (state.latestAssistantEntryId !== null) fail("Pre-settlement latest assistant must be null");
 			} else fail("Unsupported assistant generation state");
+		} else if (phase.kind === "tools") {
+			const tools = object(phase, ["kind", "batch"], "tools phase");
+			const batch = object(tools.batch, ["assistantEntryId", "configuration", "turnId", "calls"], "tool batch");
+			uuid(batch.assistantEntryId, "tool batch assistantEntryId");
+			uuid(batch.turnId, "tool batch turnId");
+			decodeLaneConfiguration(batch.configuration);
+			if (state.latestAssistantEntryId !== batch.assistantEntryId)
+				fail("Tool batch assistant must equal latest assistant entry");
+			if (!Array.isArray(batch.calls) || batch.calls.length === 0) fail("Tool batch calls must be non-empty");
+			const resultIds = new Set<string>();
+			for (let index = 0; index < batch.calls.length; index++) {
+				const call = semanticObject(batch.calls[index], "tool call state");
+				if (call.status === "planned")
+					object(call, ["status", "sourceIndex", "resultEntryId"], "planned tool call");
+				else if (call.status === "effect_pending") {
+					object(call, ["status", "sourceIndex", "resultEntryId", "replay"], "pending tool call");
+					if (call.replay !== "never" && call.replay !== "safe") fail("Invalid tool replay declaration");
+				} else if (call.status === "completed") {
+					object(call, ["status", "sourceIndex", "resultEntryId", "terminate"], "completed tool call");
+					if (typeof call.terminate !== "boolean") fail("Completed tool terminate must be boolean");
+				} else fail("Unsupported tool call status");
+				safe(call.sourceIndex, "tool sourceIndex");
+				if (call.sourceIndex !== index) fail("Tool source indices must be complete and ordered");
+				uuid(call.resultEntryId, "tool resultEntryId");
+				if (uuidV7Timestamp(call.resultEntryId) !== uuidV7Timestamp(batch.assistantEntryId))
+					fail("Tool result entry must be a follower of the assistant entry");
+				if (resultIds.has(call.resultEntryId)) fail("Tool result IDs must be unique");
+				resultIds.add(call.resultEntryId);
+			}
 		} else if (phase.kind === "failure_drain") {
 			const drain = object(phase, ["kind", "error", "provenance"], "failure drain");
 			decodeOperationError(drain.error, "failure drain error");

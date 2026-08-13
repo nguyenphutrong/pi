@@ -10,6 +10,13 @@ export type ActionInfo =
 	| { kind: "wait_assistant_retry"; operationId: string; stepId: string; nextAttempt: number; notBefore: number }
 	| { kind: "release_assistant_retry"; operationId: string; stepId: string; nextAttempt: number; notBefore: number }
 	| { kind: "repair_materialized_assistant"; operationId: string; responseEntryId: string; usageId: string }
+	| {
+			kind: "prepare_tool_call";
+			operationId: string;
+			assistantEntryId: string;
+			sourceIndex: number;
+			resultEntryId: string;
+	  }
 	| { kind: "finish_run"; operationId: string; triggerEntryId: string }
 	| { kind: "finish_failed_run"; operationId: string; responseEntryId: string };
 
@@ -61,6 +68,17 @@ export function planAction(
 						triggerEntryId: phase.triggerEntryId,
 					}
 				: { kind: "finish_run", operationId: operation.value.operationId, triggerEntryId: phase.triggerEntryId };
+	} else if (phase.kind === "tools") {
+		const call = phase.batch.calls.find((candidate) => candidate.status !== "completed");
+		if (!call) return undefined;
+		if (call.status !== "planned") return undefined;
+		info = {
+			kind: "prepare_tool_call",
+			operationId: operation.value.operationId,
+			assistantEntryId: phase.batch.assistantEntryId,
+			sourceIndex: call.sourceIndex,
+			resultEntryId: call.resultEntryId,
+		};
 	} else if (phase.generation.status === "ready") {
 		info = {
 			kind: "prepare_assistant_effect",

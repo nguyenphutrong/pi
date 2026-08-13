@@ -13,6 +13,7 @@ const TRIGGER_ID = id();
 const STEP_ID = id();
 const RESPONSE_ID = id();
 const USAGE_ID = id();
+const RESULT_ID = id();
 
 function register(namespace: string, key: string, value: unknown, seq = 17): Register {
 	return { namespace, key, value: value as Register["value"], seq };
@@ -97,6 +98,15 @@ const phases = {
 		continuation: { kind: "may_finish", includeFinalAssistant: true },
 		triggerEntryId: TRIGGER_ID,
 	},
+	tools: {
+		kind: "tools",
+		batch: {
+			assistantEntryId: RESPONSE_ID,
+			configuration: { ...configuration(), activeToolNames: ["read"] },
+			turnId: STEP_ID,
+			calls: [{ status: "planned", sourceIndex: 0, resultEntryId: RESULT_ID }],
+		},
+	},
 } as const;
 
 function decodeState(value: unknown) {
@@ -115,10 +125,31 @@ describe("Phase 1 durable codecs", () => {
 		["assistant retry_wait", phases.retryWait, null],
 		["failure drain", phases.failureDrain, RESPONSE_ID],
 		["checkpoint may_finish", phases.mayFinish, TRIGGER_ID],
+		["all-planned tool batch", phases.tools, RESPONSE_ID],
 	] as const)("accepts the exact canonical %s fixture", (_label, phase, latest) => {
 		const decoded = decodeState(common(phase, latest));
 		expect(decoded).toEqual({ seq: 17, value: common(phase, latest) });
 		expect(decoded.value).not.toBe(common(phase, latest));
+	});
+
+	it("accepts active tools and rejects malformed tool plans", () => {
+		expect(decodeLaneConfiguration({ ...configuration(), activeToolNames: ["read", "write"] })).toEqual({
+			...configuration(),
+			activeToolNames: ["read", "write"],
+		});
+		for (const calls of [
+			[],
+			[{ status: "planned", sourceIndex: 1, resultEntryId: RESULT_ID }],
+			[
+				{ status: "planned", sourceIndex: 0, resultEntryId: RESULT_ID },
+				{ status: "planned", sourceIndex: 1, resultEntryId: RESULT_ID },
+			],
+			[{ status: "planned", sourceIndex: 0, resultEntryId: "bad" }],
+		])
+			expectCorruption(() =>
+				decodeState(common({ ...phases.tools, batch: { ...phases.tools.batch, calls } }, RESPONSE_ID)),
+			);
+		expectCorruption(() => decodeLaneConfiguration({ ...configuration(), activeToolNames: ["read", "read"] }));
 	});
 
 	it.each([1, 2, 3])("accepts ready and effect_pending attempt %i through the captured cap", (attempt) => {
@@ -281,7 +312,6 @@ describe("Phase 1 durable codecs", () => {
 			{ ...common(phases.ready), inbox: { steer: [TRIGGER_ID], followUp: [], writes: [] } },
 		];
 		for (const candidate of invalidStates) expectCorruption(() => decodeState(candidate));
-		expectCorruption(() => decodeLaneConfiguration({ ...configuration(), activeToolNames: ["read"] }));
 		expectCorruption(() =>
 			decodeLaneStateRegister(
 				register("lane.state", "main", { currentOperationId: null, pendingNextRun: [OPERATION_ID] }),

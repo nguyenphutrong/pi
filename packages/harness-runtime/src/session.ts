@@ -1,8 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
 import type { AssistantMessage, Message } from "@earendil-works/pi-ai";
 import {
+	assertJsonValue,
 	assertRegister,
 	assertUsageRow,
+	createFollowerId,
 	createIdGenerator,
 	type EntryScan,
 	type IdGenerator,
@@ -139,6 +141,7 @@ async function hydrateCurrentState(
 	let triggerEntryId: string | undefined;
 	let responseEntryId: string | undefined;
 	let usageId: string | undefined;
+	let toolBatch: Extract<RunState["phase"], { kind: "tools" }>["batch"] | undefined;
 	if (runOperation && runState) {
 		if (runOperation.value.sourceLeafId !== null) entryIds.add(runOperation.value.sourceLeafId);
 		for (const id of runOperation.value.intent.promptEntryIds) entryIds.add(id);
@@ -153,6 +156,15 @@ async function hydrateCurrentState(
 				usageIds.add(responseEntryId);
 				usageIds.add(usageId);
 			}
+		} else if (runState.value.phase.kind === "tools") {
+			toolBatch = runState.value.phase.batch;
+			triggerEntryId = toolBatch.assistantEntryId;
+			entryIds.add(toolBatch.assistantEntryId);
+			for (const call of toolBatch.calls) {
+				entryIds.add(call.resultEntryId);
+				usageIds.add(call.resultEntryId);
+				if (call.status === "completed") entryIds.add(call.resultEntryId);
+			}
 		} else {
 			triggerEntryId = runState.value.phase.provenance.entryId;
 		}
@@ -164,6 +176,19 @@ async function hydrateCurrentState(
 		storage.getEntries([...entryIds]),
 		storage.getUsageRows([...usageIds]),
 	]);
+	const toolArgumentRegisters =
+		runOperation && toolBatch
+			? await Promise.all(
+					toolBatch.calls.map((call) =>
+						call.status === "effect_pending"
+							? storage.getRegister(
+									"op.tool_args",
+									`${runOperation.value.operationId}:${toolBatch.turnId}:${call.sourceIndex}`,
+								)
+							: undefined,
+					),
+				)
+			: [];
 	const entries = new Map<string, MessageEntry>();
 	for (const [id, candidate] of storedEntries) {
 		const entry = decodeMessageEntry(candidate);
@@ -246,6 +271,68 @@ async function hydrateCurrentState(
 				trigger.message.errorMessage !== expectedError.message
 			)
 				throw new SessionError("corruption", "Failure drain has an invalid assistant closure");
+		} else if (state.phase.kind === "tools") {
+			const batch = state.phase.batch;
+			const assistant = requireEntry(batch.assistantEntryId, "Tool batch assistant");
+			const sourceCalls =
+				assistant.message.role === "assistant"
+					? assistant.message.content.filter((content) => content.type === "toolCall")
+					: [];
+			if (
+				state.latestAssistantEntryId !== batch.assistantEntryId ||
+				assistant.message.role !== "assistant" ||
+				assistant.parentId !== expectedParent ||
+				batch.calls.length !== sourceCalls.length
+			)
+				throw new SessionError("corruption", "Tool batch has an invalid assistant closure");
+			let expectedToolParent = batch.assistantEntryId;
+			let unfinishedSeen = false;
+			for (const call of batch.calls) {
+				const source = sourceCalls[call.sourceIndex];
+				if (!source) throw new SessionError("corruption", "Tool batch source mapping is incomplete");
+				const result = entries.get(call.resultEntryId);
+				const resultUsage = usageRows.get(call.resultEntryId);
+				if (call.status === "planned") {
+					unfinishedSeen = true;
+					if (result || resultUsage)
+						throw new SessionError("corruption", "Planned tool result reservation is already materialized");
+				} else if (call.status === "effect_pending") {
+					unfinishedSeen = true;
+					const args = toolArgumentRegisters[call.sourceIndex];
+					if (result || resultUsage || !args)
+						throw new SessionError(
+							"corruption",
+							"Pending tool call has invalid arguments or result reservations",
+						);
+					try {
+						assertRegister(args);
+						assertJsonValue(args.value);
+					} catch (error) {
+						throw new SessionError("corruption", "Pending tool arguments register is malformed", error);
+					}
+					if (
+						args.namespace !== "op.tool_args" ||
+						args.key !== `${operation.operationId}:${batch.turnId}:${call.sourceIndex}` ||
+						args.value === null ||
+						typeof args.value !== "object" ||
+						Array.isArray(args.value)
+					)
+						throw new SessionError("corruption", "Pending tool arguments register has invalid identity or value");
+				} else if (call.status === "completed") {
+					if (
+						unfinishedSeen ||
+						!result ||
+						result.parentId !== expectedToolParent ||
+						result.message.role !== "toolResult" ||
+						result.message.toolCallId !== source.id ||
+						result.message.toolName !== source.name
+					)
+						throw new SessionError("corruption", "Completed tool result does not match its source call");
+					expectedToolParent = call.resultEntryId;
+				}
+			}
+			if (mainLeaf.value !== expectedToolParent)
+				throw new SessionError("corruption", "Tool batch lane leaf does not close its completed result prefix");
 		} else if (state.phase.kind === "checkpoint" && state.phase.continuation.kind === "may_finish") {
 			if (
 				mainLeaf.value !== triggerEntryId ||
@@ -1129,14 +1216,62 @@ export class MemorySession implements Session {
 			if (classification === "unsupported")
 				return Object.freeze({ status: "unsupported" as const, classification, attachment });
 
+			const toolCalls = transition.message.content.filter((content) => content.type === "toolCall");
+			const resultEntryIds =
+				classification === "commit_tools"
+					? toolCalls.map(() => createFollowerId(transition.responseEntryId, this.idGenerator))
+					: [];
+			if (classification === "commit_tools") {
+				const directlyKnown = new Set([
+					transition.operationId,
+					transition.stepId,
+					transition.responseEntryId,
+					transition.usageId,
+					transition.triggerEntryId,
+					...(runOperation.value.sourceLeafId === null ? [] : [runOperation.value.sourceLeafId]),
+					...runOperation.value.intent.promptEntryIds,
+					...(runState.value.latestAssistantEntryId === null ? [] : [runState.value.latestAssistantEntryId]),
+				]);
+				if (
+					new Set(resultEntryIds).size !== resultEntryIds.length ||
+					resultEntryIds.some((id) => directlyKnown.has(id))
+				)
+					throw new SessionError("storage", "Generated tool result IDs are not unique");
+				const [occupiedEntries, occupiedUsageRows, ...occupiedRegisters] = await Promise.all([
+					this.#storage.getEntries(resultEntryIds),
+					this.#storage.getUsageRows(resultEntryIds),
+					...resultEntryIds.flatMap((id) => [
+						this.#storage.getRegister("op.meta", id),
+						this.#storage.getRegister("op.state", id),
+					]),
+				]);
+				if (occupiedEntries.size > 0 || occupiedUsageRows.size > 0 || occupiedRegisters.some(Boolean))
+					throw new SessionError("storage", "Generated tool result ID is already occupied");
+			}
+
 			const nextState: RunState = {
 				...runState.value,
 				latestAssistantEntryId: transition.responseEntryId,
-				phase: {
-					kind: "checkpoint",
-					continuation: { kind: "may_finish", includeFinalAssistant: true },
-					triggerEntryId: transition.responseEntryId,
-				},
+				phase:
+					classification === "commit_tools"
+						? {
+								kind: "tools",
+								batch: {
+									assistantEntryId: transition.responseEntryId,
+									configuration: structuredClone(generation.context.configuration),
+									turnId: generation.context.stepId,
+									calls: resultEntryIds.map((resultEntryId, sourceIndex) => ({
+										status: "planned" as const,
+										sourceIndex,
+										resultEntryId,
+									})),
+								},
+							}
+						: {
+								kind: "checkpoint",
+								continuation: { kind: "may_finish", includeFinalAssistant: true },
+								triggerEntryId: transition.responseEntryId,
+							},
 			};
 			const committed = await this.#storage.commit({
 				writes: [

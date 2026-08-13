@@ -1,10 +1,12 @@
 import { type AssistantMessage, type Context, createModels, type ModelRequestLease } from "@earendil-works/pi-ai";
 import {
+	createIdGenerator,
 	isUuidV7,
 	type JsonValue,
 	MemoryStorage,
 	MemoryStorageState,
 	type Storage,
+	uuidV7Timestamp,
 	type Write,
 } from "@nguyenphutrong/pi-session-storage";
 import { type InstrumentedStorage, instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
@@ -2356,6 +2358,294 @@ describe("Phase 1 runtime shell", () => {
 		expect(prepared.lease.fetchDeferred).not.toHaveBeenCalled();
 		expect(prepared.lease.cancelDeferred).not.toHaveBeenCalled();
 		await prepared.shell.close();
+	});
+
+	it.each([
+		["toolUse", 1],
+		["toolUse", 2],
+		["length", 1],
+	] as const)(
+		"atomically settles %s with %i ordered tool calls and parks at the first preparation",
+		async (stopReason, callCount) => {
+			const content: AssistantMessage["content"] = [
+				{ type: "thinking", thinking: "plan", redacted: false },
+				{ type: "toolCall", id: "call-a", name: "read", arguments: { path: "a" } },
+				{ type: "text", text: "between" },
+				...(callCount === 2
+					? [{ type: "toolCall" as const, id: "call-b", name: "write", arguments: { path: "b" } }]
+					: []),
+			];
+			const base = terminal(stopReason);
+			const message = {
+				...base,
+				content,
+				usage:
+					stopReason === "length"
+						? { ...base.usage, output: 4096, totalTokens: base.usage.input + 4096 }
+						: base.usage,
+			};
+			const prepared = await preparedShell(() => message);
+			vi.mocked(prepared.runtimeSession.idGenerator.next).mockRestore();
+			const stateBefore = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			const generation = (stateBefore.value as unknown as RunState).phase;
+			if (generation.kind !== "assistant" || generation.generation.status !== "effect_pending")
+				throw new Error("assistant reservation missing");
+			const responseEntryId = generation.generation.responseEntryId;
+			const usageId = generation.generation.usageId;
+			const before = prepared.instrumented.committedTransactions.length;
+			await settlePrepared(prepared);
+
+			const transaction = prepared.instrumented.committedTransactions.at(-1)!;
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+			expect(transaction.writes.map((write) => write.kind)).toEqual(["entry", "register", "usage", "register"]);
+			const responseWrite = transaction.writes[0];
+			const stateWrite = transaction.writes[3];
+			if (responseWrite.kind !== "entry" || stateWrite.kind !== "register" || stateWrite.op !== "set")
+				throw new Error("tool settlement writes malformed");
+			const state = stateWrite.value as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool plan missing");
+			const calls = state.phase.batch.calls;
+			expect(new Set(calls.map(({ resultEntryId }) => resultEntryId)).size).toBe(callCount);
+			for (const call of calls) {
+				expect(isUuidV7(call.resultEntryId)).toBe(true);
+				expect(uuidV7Timestamp(call.resultEntryId)).toBe(uuidV7Timestamp(responseEntryId));
+				expect(Reflect.ownKeys(call)).toEqual(["status", "sourceIndex", "resultEntryId"]);
+			}
+			const expectedState: RunState = {
+				...(stateBefore.value as unknown as RunState),
+				latestAssistantEntryId: responseEntryId,
+				phase: {
+					kind: "tools",
+					batch: {
+						assistantEntryId: responseEntryId,
+						configuration: config(),
+						turnId: prepared.fixture.stepId,
+						calls: calls.map(({ resultEntryId }, sourceIndex) => ({
+							status: "planned",
+							sourceIndex,
+							resultEntryId,
+						})),
+					},
+				},
+			};
+			expect(transaction.writes).toEqual([
+				{
+					kind: "entry",
+					entry: { id: responseEntryId, parentId: prepared.fixture.prompt, type: "message", payload: message },
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: responseEntryId },
+				{
+					kind: "usage",
+					row: { id: usageId, entryId: responseEntryId, usage: message.usage, adjustment: false },
+				},
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: prepared.fixture.operationId,
+					value: expectedState,
+				},
+			]);
+			expect(await prepared.fixture.storage.getRegister("lane.leaf", "main")).toMatchObject({
+				value: responseWrite.entry.id,
+			});
+			expect(await prepared.shell.peekAction()).toEqual({
+				kind: "prepare_tool_call",
+				operationId: prepared.fixture.operationId,
+				assistantEntryId: responseWrite.entry.id,
+				sourceIndex: 0,
+				resultEntryId: calls[0].resultEntryId,
+			});
+			expect(await prepared.fixture.storage.getEntries(calls.map(({ resultEntryId }) => resultEntryId))).toEqual(
+				new Map(),
+			);
+			expect(await prepared.fixture.storage.getRegister("lane.state", "main")).toMatchObject({
+				value: { currentOperationId: prepared.fixture.operationId },
+			});
+			expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
+			expect(prepared.lease.stream).not.toHaveBeenCalled();
+			const writesBeforeUnavailable = prepared.instrumented.committedTransactions.length;
+			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(writesBeforeUnavailable);
+			await prepared.shell.close();
+
+			const reopenedStorage = instrumentStorage(prepared.state.createStorage());
+			reopenedStorage.listRegisters = async () => {
+				throw new Error("register scan forbidden");
+			};
+			reopenedStorage.scanEntries = async () => {
+				throw new Error("entry scan forbidden");
+			};
+			reopenedStorage.scanBranch = async () => {
+				throw new Error("branch scan forbidden");
+			};
+			reopenedStorage.scanBranchStructure = async () => {
+				throw new Error("branch structure scan forbidden");
+			};
+			const models = createModels();
+			const lease = vi.spyOn(models, "lease");
+			const reopened = await createRuntimeShell(session(reopenedStorage), config(), { models });
+			expect(await reopened.peekAction()).toEqual({
+				kind: "prepare_tool_call",
+				operationId: prepared.fixture.operationId,
+				assistantEntryId: responseWrite.entry.id,
+				sourceIndex: 0,
+				resultEntryId: calls[0].resultEntryId,
+			});
+			expect(lease).not.toHaveBeenCalled();
+			expect(reopenedStorage.committedTransactions).toEqual([]);
+			await expect(reopened.executeAction()).rejects.toMatchObject({ code: "unavailable" });
+			expect(reopenedStorage.committedTransactions).toEqual([]);
+			await reopened.close();
+		},
+	);
+
+	it.each(["duplicate", "directly known", "occupied entry", "occupied usage"] as const)(
+		"does not write settlement when generated tool result IDs are %s",
+		async (kind) => {
+			const message = {
+				...terminal("toolUse"),
+				content: [
+					{ type: "toolCall" as const, id: "call-a", name: "read", arguments: { path: "a" } },
+					...(kind === "duplicate"
+						? [{ type: "toolCall" as const, id: "call-b", name: "read", arguments: { path: "b" } }]
+						: []),
+				],
+			};
+			const prepared = await preparedShell(() => message);
+			const stateRegister = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			const phase = (stateRegister.value as unknown as RunState).phase;
+			if (phase.kind !== "assistant" || phase.generation.status !== "effect_pending")
+				throw new Error("assistant reservation missing");
+			const timestamp = uuidV7Timestamp(phase.generation.responseEntryId);
+			const generated = createIdGenerator().next(timestamp);
+			const reserved = kind === "directly known" ? phase.generation.responseEntryId : generated;
+			vi.mocked(prepared.runtimeSession.idGenerator.next).mockImplementation((suppliedTimestamp) => {
+				expect(suppliedTimestamp).toBe(timestamp);
+				return reserved;
+			});
+			if (kind === "occupied entry")
+				await prepared.fixture.storage.commit({
+					writes: [
+						{
+							kind: "entry",
+							entry: { id: reserved, parentId: null, type: "message", payload: json(user("occupied")) },
+						},
+					],
+				});
+			if (kind === "occupied usage")
+				await prepared.fixture.storage.commit({
+					writes: [
+						{
+							kind: "usage",
+							row: { id: reserved, entryId: prepared.fixture.prompt, adjustment: false, usage: ZERO_USAGE },
+						},
+					],
+				});
+			const beforeSettlement = prepared.instrumented.committedTransactions.length;
+			const fault = await settlePrepared(prepared).catch((error: unknown) => error);
+			expect(fault).toMatchObject({ code: "fault", cause: { code: "storage" } });
+			expect(prepared.instrumented.committedTransactions).toHaveLength(beforeSettlement);
+			await prepared.shell.close();
+		},
+	);
+
+	it.each(["leaf mismatch", "latest mismatch", "planned entry occupied", "planned usage occupied"] as const)(
+		"rejects restored tool-plan corruption: %s",
+		async (kind) => {
+			const message = {
+				...terminal("toolUse"),
+				content: [{ type: "toolCall" as const, id: "call-a", name: "read", arguments: { path: "a" } }],
+			};
+			const prepared = await preparedShell(() => message);
+			vi.mocked(prepared.runtimeSession.idGenerator.next).mockRestore();
+			await settlePrepared(prepared);
+			const stateRegister = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+			const state = structuredClone(stateRegister.value) as unknown as RunState;
+			if (state.phase.kind !== "tools") throw new Error("tool plan missing");
+			const resultEntryId = state.phase.batch.calls[0].resultEntryId;
+			const writes: Write[] = [];
+			if (kind === "leaf mismatch")
+				writes.push({
+					kind: "register",
+					op: "set",
+					namespace: "lane.leaf",
+					key: "main",
+					value: prepared.fixture.prompt,
+				});
+			if (kind === "latest mismatch") {
+				state.latestAssistantEntryId = prepared.fixture.prompt;
+				writes.push({
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: prepared.fixture.operationId,
+					value: json(state),
+				});
+			}
+			if (kind === "planned entry occupied")
+				writes.push({
+					kind: "entry",
+					entry: {
+						id: resultEntryId,
+						parentId: state.phase.batch.assistantEntryId,
+						type: "message",
+						payload: json(toolResult()),
+					},
+				});
+			if (kind === "planned usage occupied")
+				writes.push({
+					kind: "usage",
+					row: {
+						id: resultEntryId,
+						entryId: state.phase.batch.assistantEntryId,
+						adjustment: false,
+						usage: ZERO_USAGE,
+					},
+				});
+			await prepared.fixture.storage.commit({ writes });
+			await prepared.shell.close();
+			const reopenedStorage = instrumentStorage(prepared.state.createStorage());
+			const before = reopenedStorage.committedTransactions.length;
+			await expect(createRuntimeShell(session(reopenedStorage), config())).rejects.toMatchObject({
+				code: "corruption",
+			});
+			expect(reopenedStorage.committedTransactions).toHaveLength(before);
+		},
+	);
+
+	it("rejects a restored tool result reservation with a timestamp that does not follow its assistant", async () => {
+		const message = {
+			...terminal("toolUse"),
+			content: [{ type: "toolCall" as const, id: "call-a", name: "read", arguments: { path: "a" } }],
+		};
+		const prepared = await preparedShell(() => message);
+		vi.mocked(prepared.runtimeSession.idGenerator.next).mockRestore();
+		await settlePrepared(prepared);
+		const stateRegister = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const state = structuredClone(stateRegister.value) as unknown as RunState;
+		if (state.phase.kind !== "tools") throw new Error("tool plan missing");
+		state.phase.batch.calls[0].resultEntryId = createIdGenerator().next(
+			uuidV7Timestamp(state.phase.batch.assistantEntryId) + 1,
+		);
+		await prepared.fixture.storage.commit({
+			writes: [
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: prepared.fixture.operationId,
+					value: json(state),
+				},
+			],
+		});
+		await prepared.shell.close();
+		const reopenedStorage = instrumentStorage(prepared.state.createStorage());
+		const before = reopenedStorage.committedTransactions.length;
+		await expect(createRuntimeShell(session(reopenedStorage), config())).rejects.toMatchObject({
+			code: "corruption",
+		});
+		expect(reopenedStorage.committedTransactions).toHaveLength(before);
 	});
 
 	it("settles against semantically current authoritative registers after their sequences advance", async () => {
