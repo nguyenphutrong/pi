@@ -4,7 +4,7 @@
 
 - Phase: 3 — SQLite and production durability
 - Work item: 3.4c — RuntimeShell SQLite subprocess crash matrix
-- Status: design real process kills over the Phase 2 safe/never action boundaries, with fresh-process recovery and terminal equivalence
+- Status: D-046 accepted by independent design review; implement the strict two-process safe/never matrix over all 17 action prefixes
 - Done bar: Memory and SQLite pass one shared storage conformance suite; each Harness commit is one SQLite transaction using `BEGIN IMMEDIATE`; writer lease/fencing, reopen, and process-crash recovery are verified
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 

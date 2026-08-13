@@ -1317,3 +1317,30 @@ All support stays test-only in the private SQLite package with no new dependency
 Commit `baab5f4f2` implements D-045's ordinary-commit increment. A real child runs one exact-tip entry, usage, register set/replace/delete/no-op-delete transaction through the production repository, adapter, transaction engine, and branch projector, then kills itself at 13 semantic sites from post-`BEGIN IMMEDIATE` through post-`COMMIT`. Every case exposes exact protocol and `SIGKILL` evidence, preserves SQLite recovery files, and yields one independently constructed all-nine-table baseline or complete snapshot before lawful expiry takeover. SQLite passes 215/215, `npm run check` and `git diff --check` pass, and fresh independent review reports PASS after exact protocol bounds and non-circular snapshot rework. Atomic repository creation remains the next D-045 increment.
 
 Commit `d265fcda4` completes D-045 with the atomic-creation increment. The same real child protocol kills repository creation at 10 semantic sites from post-`BEGIN IMMEDIATE` through post-`COMMIT`, using exactly the Harness leaf-null and idle-state initial transaction. Every pre-commit cut leaves all nine tables empty; the post-commit cut leaves the exact session, sequence, zero stats, two registers, and crashed writer lease with entry, usage, and branch tables empty. Fresh listing and expiry takeover validate metadata, fence two, production register decoding, sequence three, and final lease release. The 13-cut ordinary matrix remains green; SQLite passes 216/216, root check and diff check pass, and fresh independent review reports PASS. RuntimeShell subprocess recovery remains next.
+
+## D-046 — Lose process-local RuntimeShell state in a real process at every action boundary
+
+- Date: 2026-08-13
+- Phase: 3
+- Status: accepted after independent design review
+- References: D-024, D-029, D-032, D-041, D-043–D-045; `packages/agent/docs/harness-v3.md` §§0.3–0.6, 1.4–1.7, 3.2–3.8, 3.13, 4.1–4.7, 9.1–9.3
+
+### Options
+
+1. Give every replay policy and action prefix its own database, initial crash child, and fresh recovery child, with strict synchronous effect/action protocol evidence.
+2. Add a third child per case solely for terminal no-op inspection.
+3. Seed one database and copy it across cases to reduce creation work.
+
+### Choice
+
+Option 1. Run 34 isolated `(safe|never) × cuts 0..16` cases and 68 child processes. The recovery process closes its first complete ownership lifecycle before opening fresh repository, Session, and RuntimeShell objects for the terminal no-op proof; D-043 already proves the same ownership pattern under controlled close, so a third process adds no missing invariant.
+
+### Rationale
+
+The initial child fixes `Date.now` at one test timestamp before constructing `SqliteSessionRepo`, creates the real session, durably accepts the prompt, emits its metadata and operation identities, executes the exact action prefix manually, then synchronously emits its crash marker and self-sends `SIGKILL`. The recovery child fixes `Date.now` at exactly 30 seconds later, matching the private backend's captured default lease TTL, and reopens through the real fenced repository at the allowed expiry boundary. This uses no raw lease mutation, sleep, production seam, or disabled heartbeat. Real UUIDv7 generation remains active; tests assert identity form and relationships rather than random suffixes.
+
+The versioned NDJSON protocol has exact event-specific shapes for readiness, acceptance, full `ActionInfo`, provider/tool starts, crash, recovery readiness, terminal state, and completion. Synchronous bounded output occurs before an effect fixture returns and after an action executes. Parent timeouts, output overflow, malformed, duplicate, missing, trailing, or stderr events fail; only exact initial `{code:null,signal:"SIGKILL"}` and exact recovery exit zero pass. Effect markers establish invocation starts, not exactly-once external completion.
+
+The Phase 2 formulas remain unchanged. Assistant calls are uncertain after cuts 3, 4, 13, and 14. Tool intent is pending after cuts 6 through 9; safe calls replay only after 7 through 9, while never calls synthesize the exact no-usage unknown-outcome result. Provider totals are three only at uncertain assistant cuts, and tool-result-bearing contexts total two only at cuts 13 and 14. Cuts 2 and 12 prove durable assistant intent without a pre-crash provider start; their first recovery action is `recover_assistant_effect`. Other first recovery actions are enumerated from the durable state, including `recover_tool_effect` for cuts 6 through 9 and no action at terminal cut 16.
+
+The parent checks exact initial ActionInfo identities, combined provider contexts and effect starts across both processes, exact terminal messages and usage, lane result and idle state, complete operation/pending-register cleanup, and an all-nine-table semantic snapshot with one sound branch closure and no writer lease. The recovery process then performs a fresh terminal RuntimeShell no-op with no effects or writes. SQL-internal statement/commit cuts and atomic creation remain D-045's authority; this matrix owns loss of process-local plans, promises, controllers, and effect results at every RuntimeShell action boundary. Independent design review reports PASS with no §6 escalation.
