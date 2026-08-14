@@ -1579,3 +1579,7 @@ The first independent design review rejected ambiguity in the classification vec
 Option 1. Every D-052 placement fixture uses one instrumented Storage, one `StoredSession`, and one `RuntimeOwner` obtained through `claimRuntime`. Setup, placement, cancellation, abort, later admission, and close all serialize through that StoredSession's one mutation line. No second session or owner may share the Storage handle, even for sequential setup or observation.
 
 This replaces only invalid test ownership. The independently reviewed production contract and current test expectations remain unchanged. After the complete fixture replacement, full verification and a fresh independent review are required before the Phase 4.2d implementation can commit.
+
+### Outcome
+
+Commit `7b2266f0d` implements D-052 under the D-053 ownership rule. Every D-052 history bootstraps its valid structural state before creating its sole `StoredSession`, retains one `RuntimeOwner`, and performs every post-claim admission, placement, cancellation, abort, later admission, and close through that Session's mutation line. Matching-authority corruption tests use isolated read-fault injection rather than a competing durable mutation. Focused placement passes 99/99, complete Harness passes 695/695, root check and diff check pass, and a fresh independent review reports PASS with no production, spec, or package-boundary finding.

@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. B-017 option 1 was selected; its lawful single-owner fixture rework is in progress.
+No active blockers. B-017 option 1 was implemented by `7b2266f0d` and passed fresh independent review.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 
@@ -11,13 +11,13 @@ No active blockers. B-017 option 1 was selected; its lawful single-owner fixture
 - Work item: 4.2d — active write admission and atomic placement
 - Trigger: two independent implementation reviews rejected the same test-ownership boundary; §6 requires human resolution after repeated rejection
 - Resolved: 2026-08-13 — human selected option 1
-- Status: resolved; production and tests remain uncommitted pending fixture rework, verification, and fresh review
+- Status: resolved and implemented by `7b2266f0d`; focused 99/99, complete Harness 695/695, root check, diff check, and fresh independent review PASS
 
 ### Context
 
-The implementation admits active façade writes and provides the private exact-FIFO placement transition. Full Harness tests pass 695/695, `npm run check` passes, and `git diff --check` passes. Review found no production or spec defect.
+The committed implementation admits active façade writes and provides the private exact-FIFO placement transition. Every D-052 fixture now bootstraps structural state before creating its sole `StoredSession`, then retains one owner for all post-claim mutation histories. Corruption cases use isolated read-fault injection rather than competing durable commits. Full Harness tests pass 695/695, `npm run check` passes, and `git diff --check` passes. Fresh review found no production, spec, package-boundary, or ownership defect.
 
-The shared D-052 `placementFixture()` is not lawful evidence: `active(delegate)` attaches one `StoredSession`, then the fixture wraps that same Storage object and attaches a second `StoredSession`. Those sessions have independent mutation lines. Although the tests pass, placement-versus-cancel, abort, and close therefore do not prove the required single-owner serialization. Replacing only the later-admission race did not fix the shared fixture, causing the repeated rejection.
+The rejected shared D-052 `placementFixture()` was not lawful evidence: `active(delegate)` attached one `StoredSession`, then the fixture wrapped that same Storage object and attached a second `StoredSession`. Those sessions had independent mutation lines, so placement-versus-cancel, abort, and close did not prove the required single-owner serialization. Commit `7b2266f0d` removed that fixture pattern.
 
 ### Decision needed
 
@@ -27,7 +27,7 @@ The shared D-052 `placementFixture()` is not lawful evidence: `active(delegate)`
 
 ### Resume point
 
-Replace every D-052 placement fixture—not just one race—with one instrumented Storage, one `StoredSession`, and one `RuntimeOwner`; then run the focused tests, full Harness suite, `npm run check`, and `git diff --check`. Obtain a fresh independent PASS before committing Phase 4.2d.
+Completed by `7b2266f0d`. Resume Phase 4 at work item 4.2e: projector/context and planner integration.
 
 ## B-016 — Choose the custom-entry projector timing contract
 
