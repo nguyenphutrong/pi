@@ -1668,3 +1668,26 @@ Close and fault reject waiters and callbacks not yet started. Close waits the ru
 Commit `26791c55f` implements D-056. RuntimeShell now performs authoritative zero-write registration, resolves waiters at the exact durable idle point, reserves FIFO callback batches, tracks bypass reads and interrupt-admitted aborts through close, and keeps every callback artifact process-local. Async-local ownership rejects callback-originated mutation, abort, and close with `active` while external mutations wait normally. Abort retains §4.6 interrupt behavior by bypassing long effect awaits while still waiting idle reservations and linearizing its marker on StoredSession.
 
 The independent Test pass replaced the superseded serialized-read expectations and added deterministic idle, terminal, batch-cutoff, callback-error, marker/mutation, abort/reservation, close/fault, and fresh-reopen races. An initial final review blocked on missing isolated lifecycle evidence; the added admitted-abort, registration-before-close/fault, and callback-local abort/close traces closed the finding. Focused RuntimeShell passes 273/273, complete Harness passes 737/737, root check and diff check pass, and a fresh independent re-review reports PASS. No durable field, Storage/Session contract, package boundary, record/reducer recovery path, or `pi-ai` behavior changed.
+
+## D-057 — Establish hooks through the existing tool durability boundaries
+
+- Date: 2026-08-14
+- Phase: 5
+- Status: accepted after corrected independent design review
+- References: D-027–D-030, D-056; `packages/agent/docs/harness-v3.md` §§4.1–4.3, 4.6–4.8, 5.5–5.8, 9.1–9.3
+
+### Options
+
+1. Start with `before_run`, adding injected messages, system-prompt override, stable resume data, and their durable `Operation` ownership before introducing the registry elsewhere.
+2. Build the registry primitive around the already reachable `before_tool` and `after_tool` paths, whose clearance and settlement transactions already own the aggregate outputs.
+3. Implement every run, request, response, tool, and structural hook together with their durable state and recovery paths.
+
+### Choice
+
+Option 2. Phase 5.1 exposes only a typed tool-hook map with `before_tool` and `after_tool`; future names remain absent until they have a reachable procedure and durable owner. RuntimeShell owns one process-local registry and exposes `hooks.on`. Each invocation snapshots registrations in FIFO order, runs the whole aggregate inside the existing `prepare_tool_call` or `finalize_tool_effect` manual action, and observes unsubscribe only on later snapshots. Optional tool-hook ids are detached telemetry metadata, not stable resume identities and not uniqueness keys.
+
+The temporary `RuntimeShellOptions.beforeToolCall` and `afterToolCall` fields are removed without a compatibility adapter. The unchanged agent-loop callback APIs remain the phase boundary. Before integration, their callback-output normalizers become additive exports and remain the single shape-validation authority. The registry revalidates each detached replacement argument against the retained tool and JSON contract before the next handler. A throwing, rejected, malformed, or invalid `before_tool` handler reports one error, blocks closed, and stops the pipeline; a valid block also stops. An invalid `after_tool` handler is reported and skipped, later handlers receive the prior valid aggregate, and valid patches merge field by field including explicit falsy values. Expected handler failures never escape into agent-loop's whole-callback fallback.
+
+Hook output has no register or record. Effective arguments or a blocked result become durable only in `clearToolCall`; finalized output becomes durable only in `settleToolCall`. Precommit close/crash may rerun according to the current planned/effect-pending and safe-replay rules. Abort-first skips an unstarted hook; hook-first drains without forced interruption. Existing action admission decides whether a started clearance commits before close, while a started post-hook can drain with settlement still abandoned by close.
+
+Every handler crosses a canonical `pi.harness.hook` span through the existing `TelemetryContext`, using only lane, operation id, hook name, optional registration id, and the specified outcome. RuntimeShell does not duplicate or import the legacy agent-owned telemetry schema. A private isolated reporter receives only handler-error metadata and is the seam the next passive-event slice will bind to `handler_error`; no public events, buffering, watch, snapshot, or telemetry content is added now. No durable codec, Storage/schema, Session seam, `pi-ai`, legacy record/reducer, or future hook surface changes. A corrected independent design review reports PASS with no §6 ambiguity.
