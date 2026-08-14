@@ -51,6 +51,245 @@ describe("D-057 RuntimeShell hook surface", () => {
 	});
 });
 
+describe("D-058 RuntimeShell event surface", () => {
+	it("exposes only frozen events.on and preserves synchronous lifecycle registration errors", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		expect(Object.isFrozen(shell.events)).toBe(true);
+		expect(Object.isFrozen(shell.events.on)).toBe(true);
+		expect(Object.keys(shell.events)).toEqual(["on"]);
+		expect(() => shell.events.on("future" as never, () => undefined)).toThrow(TypeError);
+		expect(() => shell.events.on("run_start", 1 as never)).toThrow(TypeError);
+		const off = shell.events.on("run_start", () => undefined);
+		off();
+		off();
+		await shell.close();
+		expect(() => shell.events.on("run_start", () => undefined)).toThrow(
+			expect.objectContaining({ code: "closed", message: "Runtime shell is closed" }),
+		);
+	});
+
+	it("rethrows the existing shell fault synchronously from event registration", async () => {
+		const fixture = await rooted("finish");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		storage.commit = vi.fn().mockRejectedValueOnce(new Error("event registration fault"));
+		const fault = await shell.executeAction().catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault" });
+		expect(() => shell.events.on("run_start", () => undefined)).toThrow(fault);
+		await shell.close();
+	});
+
+	it("publishes the durable run id after commit without waiting for an async listener or adding writes", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(storage), config(), { models });
+		storage.committedTransactions.length = 0;
+		let release!: () => void;
+		const pending = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const events: Array<{ runId: string; commits: number }> = [];
+		shell.events.on("run_start", async (event) => {
+			events.push({ runId: event.runId, commits: storage.committedTransactions.length });
+			await pending;
+		});
+		const attachment = await shell.prompt(user("event prompt"));
+		const operationId = attachment.runOperation?.value.operationId;
+		expect(operationId).toEqual(expect.any(String));
+		expect(events).toEqual([{ runId: operationId, commits: 1 }]);
+		expect(storage.committedTransactions).toHaveLength(1);
+		release();
+		await shell.close();
+	});
+
+	it.each(["throw", "reject"] as const)(
+		"isolates a run_start listener %s after prompt acceptance without extra commits",
+		async (failure) => {
+			const fixture = await rooted("idle");
+			const storage = instrumentStorage(fixture.storage);
+			const { models } = availableModels();
+			const shell = await createRuntimeShell(session(storage), config(), { models });
+			storage.committedTransactions.length = 0;
+			const later = vi.fn();
+			const errors: unknown[] = [];
+			let reported!: () => void;
+			const report = new Promise<void>((resolve) => {
+				reported = resolve;
+			});
+			shell.events.on("handler_error", (event) => {
+				errors.push(event);
+				reported();
+			});
+			shell.events.on("run_start", () => {
+				if (failure === "throw") throw new Error("run listener failed");
+				return Promise.reject(new Error("run listener failed"));
+			});
+			shell.events.on("run_start", later);
+			await expect(shell.prompt(user("accepted"))).resolves.toMatchObject({ runOperation: { value: {} } });
+			await report;
+			expect(later).toHaveBeenCalledTimes(1);
+			expect(errors).toEqual([
+				{
+					type: "handler_error",
+					kind: "event",
+					event: "run_start",
+					lane: "main",
+					error: "run listener failed",
+					stack: expect.any(String),
+				},
+			]);
+			expect(Object.isFrozen(errors[0])).toBe(true);
+			expect(storage.committedTransactions).toHaveLength(1);
+			expect(storage.committedTransactions[0].writes.map((write) => write.kind)).toEqual([
+				"entry",
+				"register",
+				"register",
+				"register",
+				"register",
+			]);
+			expect(await shell.peekAction()).toMatchObject({ kind: "start_assistant_step" });
+			await shell.close();
+		},
+	);
+
+	it("emits no run_start for unavailable, failed commit, post-close prompt, or reopen paths", async () => {
+		const unavailableFixture = await rooted("idle");
+		const unavailable = await createRuntimeShell(session(unavailableFixture.storage), config());
+		const unavailableEvents = vi.fn();
+		unavailable.events.on("run_start", unavailableEvents);
+		await expect(unavailable.prompt(user("unavailable"))).rejects.toMatchObject({ code: "unavailable" });
+		expect(unavailableEvents).not.toHaveBeenCalled();
+		await unavailable.close();
+
+		const state = new MemoryStorageState();
+		const fixture = await rooted("idle", state.createStorage());
+		const storage = instrumentStorage(fixture.storage);
+		const { models } = availableModels();
+		const failed = await createRuntimeShell(session(storage), config(), { models });
+		const failedEvents = vi.fn();
+		failed.events.on("run_start", failedEvents);
+		storage.commit = vi.fn().mockRejectedValueOnce(new Error("prompt commit failed"));
+		await expect(failed.prompt(user("failed"))).rejects.toBeDefined();
+		expect(failedEvents).not.toHaveBeenCalled();
+		await failed.close();
+
+		const reopened = await createRuntimeShell(session(state.createStorage()), config(), { models });
+		const reopenedEvents = vi.fn();
+		reopened.events.on("run_start", reopenedEvents);
+		expect(reopenedEvents).not.toHaveBeenCalled();
+		await reopened.close();
+		await expect(reopened.prompt(user("closed"))).rejects.toMatchObject({ code: "closed" });
+		expect(reopenedEvents).not.toHaveBeenCalled();
+	});
+
+	it.each(["throw", "malformed", "hostile"] as const)(
+		"projects one exact before_tool %s error while blocking fail-closed without awaiting passive delivery",
+		async (failure) => {
+			const execute = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" } },
+				["echo"],
+			);
+			const errors: unknown[] = [];
+			let release!: () => void;
+			const pending = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			prepared.shell.events.on("handler_error", async (event) => {
+				errors.push(event);
+				await pending;
+			});
+			const hostile = new Proxy(
+				{},
+				{
+					get: () => {
+						throw new Error("hostile");
+					},
+				},
+			);
+			prepared.shell.hooks.on(
+				"before_tool",
+				failure === "throw"
+					? () => {
+							throw new Error("before failed");
+						}
+					: failure === "malformed"
+						? ((() => 1) as never)
+						: () => {
+								throw hostile;
+							},
+				{ id: "private-registration" },
+			);
+			await prepared.shell.executeAction();
+			expect(execute).not.toHaveBeenCalled();
+			expect(errors).toHaveLength(1);
+			expect(errors[0]).toEqual({
+				type: "handler_error",
+				kind: "hook",
+				hook: "before_tool",
+				lane: "main",
+				error:
+					failure === "throw"
+						? "before failed"
+						: failure === "malformed"
+							? "Invalid before tool hook output"
+							: "Hook handler failed",
+				...(failure === "hostile" ? {} : { stack: expect.any(String) }),
+			});
+			expect(Object.keys(errors[0] as object)).not.toContain("runId");
+			expect(Object.keys(errors[0] as object)).not.toContain("registrationId");
+			expect(Object.isFrozen(errors[0])).toBe(true);
+			release();
+			await prepared.shell.close();
+		},
+	);
+
+	it("isolates invalid after_tool output and reports it exactly once", async () => {
+		const prepared = await settledToolBatch(
+			toolMessage([{ id: "call-a" }]),
+			{ tools: [runtimeTool()], toolContext: { batch: "static" } },
+			["echo"],
+		);
+		const errors: unknown[] = [];
+		let reported!: () => void;
+		const report = new Promise<void>((resolve) => {
+			reported = resolve;
+		});
+		prepared.shell.events.on("handler_error", (event) => {
+			errors.push(event);
+			reported();
+		});
+		prepared.shell.hooks.on("after_tool", (() => 1) as never, { id: "private-after" });
+		for (const kind of [
+			"prepare_tool_call",
+			"dispatch_tool_effect",
+			"await_tool_effect",
+			"finalize_tool_effect",
+		] as const) {
+			expect(await prepared.shell.peekAction()).toMatchObject({ kind });
+			await prepared.shell.executeAction();
+		}
+		await report;
+		expect(errors).toEqual([
+			{
+				type: "handler_error",
+				kind: "hook",
+				hook: "after_tool",
+				lane: "main",
+				error: "Invalid after tool hook output",
+				stack: expect.any(String),
+			},
+		]);
+		expect(Object.keys(errors[0] as object)).not.toContain("runId");
+		expect(Object.keys(errors[0] as object)).not.toContain("registrationId");
+		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+		await prepared.shell.close();
+	});
+});
+
 describe("D-050 RuntimeShell SessionTree façade", () => {
 	it("is frozen and exposes exactly the SessionTree surface", async () => {
 		const fixture = await rooted("idle");
@@ -2376,6 +2615,8 @@ describe("Phase 1 runtime shell", () => {
 			const next = vi.spyOn(runtimeSession.idGenerator, "next");
 			const { models } = availableModels();
 			const shell = await createRuntimeShell(runtimeSession, config(), { models });
+			const runStarts = vi.fn();
+			shell.events.on("run_start", runStarts);
 			const current = await instrumented.getRegister(namespace, "main");
 			await fixture.storage.commit({
 				writes: [{ kind: "register", op: "set", namespace, key: "main", value: current!.value }],
@@ -2384,6 +2625,7 @@ describe("Phase 1 runtime shell", () => {
 			await expect(shell.prompt(user("prompt"))).rejects.toMatchObject({ code: "stale" });
 			expect(next).not.toHaveBeenCalled();
 			expect(instrumented.committedTransactions).toHaveLength(before);
+			expect(runStarts).not.toHaveBeenCalled();
 			expect(await shell.peekAction()).toBeUndefined();
 			await shell.close();
 		},
@@ -2413,10 +2655,13 @@ describe("Phase 1 runtime shell", () => {
 		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(operationId).mockReturnValueOnce(id());
 		const { models } = availableModels();
 		const shell = await createRuntimeShell(runtimeSession, config(), { models });
+		const runStarts = vi.fn();
+		shell.events.on("run_start", runStarts);
 		const results = await Promise.allSettled([shell.prompt(user("first")), shell.prompt(user("second"))]);
 		expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
 		expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
 		expect(results.find((result) => result.status === "rejected")).toMatchObject({ reason: { code: "busy" } });
+		expect(runStarts).toHaveBeenCalledTimes(1);
 		expect(instrumented.committedTransactions).toHaveLength(2);
 		expect(await shell.peekAction()).toMatchObject({ kind: "start_assistant_step", operationId });
 		await shell.close();

@@ -25,6 +25,7 @@ import {
 import { isUuidV7, type JsonValue } from "@nguyenphutrong/pi-session-storage";
 import { decodePendingEntry, encodeMessage, encodePendingEntry } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
+import { RuntimeEventRegistry, type RuntimeEvents } from "./events.ts";
 import { ToolHookRegistry, type ToolHooks } from "./hooks.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction, toolEffectKey } from "./planner.ts";
 import {
@@ -250,6 +251,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	readonly #entryProjectors: ReadonlyMap<string, EntryProjector>;
 	readonly #toolDefinitions: ReadonlyMap<string, RuntimeToolDefinition<TContext>>;
 	readonly #toolContext: RuntimeToolContextSource<TContext> | undefined;
+	readonly #eventRegistry: RuntimeEventRegistry;
+	readonly events: RuntimeEvents;
 	readonly #hookRegistry: ToolHookRegistry;
 	readonly hooks: ToolHooks;
 	readonly #toolBatches = new Map<string, ReadonlyMap<string, AgentTool>>();
@@ -345,13 +348,20 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		this.#entryProjectors = captureEntryProjectors(options.entryProjectors ?? {});
 		this.#toolDefinitions = captureToolDefinitions(options.tools ?? []);
 		this.#toolContext = options.toolContext;
+		const telemetryContext = options.telemetryContext ?? NOOP_TELEMETRY_CONTEXT;
+		this.#eventRegistry = new RuntimeEventRegistry(() => {
+			const lifecycleError = this.#lifecycleError();
+			if (lifecycleError) throw lifecycleError;
+		}, telemetryContext);
+		const eventOn = Object.freeze(this.#eventRegistry.on.bind(this.#eventRegistry));
+		this.events = Object.freeze({ on: eventOn });
 		this.#hookRegistry = new ToolHookRegistry(
 			() => {
 				const lifecycleError = this.#lifecycleError();
 				if (lifecycleError) throw lifecycleError;
 			},
-			options.telemetryContext ?? NOOP_TELEMETRY_CONTEXT,
-			() => {},
+			telemetryContext,
+			(metadata) => this.#eventRegistry.reportHookError(metadata),
 		);
 		const on = Object.freeze(this.#hookRegistry.on.bind(this.#hookRegistry));
 		this.hooks = Object.freeze({ on });
@@ -1518,6 +1528,12 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					followUpMode: settings.followUpMode,
 				});
 				this.#publish(result.attachment);
+				if (result.status === "committed") {
+					const runId = result.attachment.runOperation?.value.operationId;
+					if (!runId)
+						throw this.#faultShell(undefined, undefined, "Committed prompt attachment omitted its operation id");
+					this.#eventRegistry.publish({ type: "run_start", lane: "main", runId });
+				}
 				if (result.status === "stale") throw new RuntimeShellError("stale", "Prompt attachment is stale");
 				if (result.status === "busy") throw new RuntimeShellError("busy", "Main lane is busy");
 				if (result.status === "unavailable")

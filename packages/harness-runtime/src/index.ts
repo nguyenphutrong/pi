@@ -1,4 +1,14 @@
 export type {
+	EventHandlerErrorEvent,
+	EventListener,
+	HandlerErrorEvent,
+	HarnessEvent,
+	HarnessEventType,
+	HookHandlerErrorEvent,
+	RunStartEvent,
+	RuntimeEvents,
+} from "./events.ts";
+export type {
 	AfterToolHookInvocation,
 	AfterToolHookResult,
 	BeforeToolHookInvocation,
