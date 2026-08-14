@@ -1693,3 +1693,28 @@ Hook output has no register or record. Effective arguments or a blocked result b
 The abort-first rule retains operation-state fencing. If cancellation commits while an admitted preparation is still resolving `toolContext`, the old preparation rejects as stale after resolution; it does not bypass the expected `op.state` sequence. The replanned `cancel_planned_tool` action then commits the synthetic aborted result under the reserved id. This is the same deterministic two-boundary convergence as every other lane-mutation winner, not a special hook settlement.
 
 Every handler crosses a canonical `pi.harness.hook` span through the existing `TelemetryContext`, using only lane, operation id, hook name, optional registration id, and the specified outcome. RuntimeShell does not duplicate or import the legacy agent-owned telemetry schema. A private isolated reporter receives only handler-error metadata and is the seam the next passive-event slice will bind to `handler_error`; no public events, buffering, watch, snapshot, or telemetry content is added now. No durable codec, Storage/schema, Session seam, `pi-ai`, legacy record/reducer, or future hook surface changes. A corrected independent design review reports PASS with no §6 ambiguity.
+
+## D-058 — Establish passive events with one lifecycle owner and bounded errors
+
+- Date: 2026-08-14
+- Phase: 5
+- Status: accepted after corrected independent design review
+- References: D-050, D-056–D-057; `packages/agent/docs/harness-v3.md` §§4.1–4.3, 4.6–4.8, 5.4–5.8, 9.1–9.3
+
+### Options
+
+1. Expose only `handler_error`, binding D-057's private hook reporter but leaving postcommit event ownership unproved.
+2. Expose `run_start` plus `handler_error`, proving one exact postcommit lifecycle boundary and ordinary listener-failure reporting without widening transaction-result contracts.
+3. Expose every currently plausible run, tool, entry, usage, and queue event, adding explicit publication metadata to many procedures in one slice or inferring facts by diffing runtime attachments.
+
+### Choice
+
+Option 2. RuntimeShell owns one process-local passive registry and exposes a frozen `events.on` interface. The initial public event map contains only the complete v3 `run_start` event and the complete v3 `handler_error` hook/event union. `run_start` has one authoritative owner: after `acceptPrompt` returns `committed` and its attachment is published, RuntimeShell publishes the durable operation id. Stale, busy, unavailable, failed-commit, close-first, refresh, and reopen paths publish nothing. No attachment diff infers events, and no Storage, Session, runtime-port, durable codec, `pi-ai`, or agent-loop contract changes.
+
+Publishing detaches and deeply freezes one event, snapshots active matching registrations in FIFO order, and starts each callback in snapshot order without awaiting its result. Completion order is intentionally unconstrained: passive listener latency cannot delay another listener, the lane mutation line, manual drive, prompt resolution, hook aggregation, close, or fault. Unsubscribe is idempotent and affects only later publication snapshots; registration during a publication starts with the next one. Registration validates synchronously and rejects with the shell's existing close/fault error after sealing. Already started or postcommit-admitted process-local publication may finish after sealing; close does not drain listeners, and reopen has an empty registry. There is no replay, cursor, promise tail, queue, buffer, snapshot, or `watch()` in this slice.
+
+Each listener invocation crosses `pi.harness.event_handler` with only canonical `pi.event.type` and optional `pi.lane.name` attributes. A listener throw/rejection is isolated, does not alter execution, and publishes one detached `{ type:"handler_error", kind:"event", event, lane:"main", error, stack? }`; a `handler_error` listener failure records failed telemetry but publishes no recursive error. D-057 hook metadata is projected to the exact public `{ type:"handler_error", kind:"hook", hook, lane:"main", error, stack? }`; private operation and registration ids stay telemetry-only and do not enter the event. Hook behavior never awaits passive delivery.
+
+Telemetry calls one private idempotent `invokeOnce` closure that captures the listener's own promise and attaches failure reporting to that promise only. If `TelemetryContext.startSpan` throws, rejects, omits, delays, or repeats its callback, the registry invokes or returns the same listener promise exactly once; adapter failure is swallowed independently and never causes fallback reinvocation or `handler_error`. This keeps adapter faults isolated while still making an ordinary listener rejection visible once.
+
+The narrower event map is deliberate. `entry_added`/`usage`, queue, abort/end, tool/message/turn/retry, fact/config, structural, fault, and lane events remain absent until their exact procedure owners and complete payload/order contracts are implemented. This keeps the module deep: callers learn one stable typed `on` seam while registration snapshots, detachment, isolation, recursion control, and telemetry remain local inside the registry. Adding later map members and explicit publisher calls is additive. Corrected independent review reports PASS. No §6 ambiguity or retention obligation is activated.

@@ -4,17 +4,17 @@
 
 - Phase: 5 — Hooks, events, and snapshots
 - Work item: 5.2 — Passive events foundation
-- Status: Phase 5.1 tool-hook pipeline is committed and independently accepted; design the smallest passive event slice that binds the private hook-error reporter without adding snapshots or `watch()` early
-- Done bar: typed passive listeners are isolated from execution, handler failures emit bounded `handler_error` observation plus content-free telemetry, and publication occurs only at owned process-local or postcommit boundaries; no snapshot/watch surface yet
+- Status: corrected D-058 `run_start` + `handler_error` foundation passed independent design review; implement the typed process-local registry and exact RuntimeShell publication seams
+- Done bar: `run_start` publishes only after accepted prompt durability; hook/listener failures publish bounded `handler_error`; typed FIFO-start listener snapshots, detachment, lifecycle registration, and content-free telemetry are isolated from execution; no other event or snapshot/watch surface yet
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the passive-event, lifecycle ordering, abort/close, and telemetry sections; design event ownership and publication boundaries around the current RuntimeShell procedures.
-2. Obtain an independent design review before exposing any event names or public registry surface.
-3. Implement the smallest typed passive registry and bind D-057's private hook-error reporter to `handler_error`.
-4. Add isolated-listener ordering, failure, close/fault, and postcommit publication evidence for only the reachable event subset.
-5. Run full Harness/root verification and fresh independent review before designing snapshots and subscription gap prevention.
+1. Implement the typed passive registry, frozen `RuntimeShell.events.on`, and private publisher.
+2. Bind D-057's private hook-error reporter and publish `run_start` after successful prompt acceptance only.
+3. Add registry plus RuntimeShell ordering, failure, close/fault, reopen, telemetry, and zero-write evidence.
+4. Run full Harness/root verification and fresh independent review.
+5. Checkpoint Phase 5.2, then design explicit owners for the next event-catalog increment before snapshots/watch.
 
 ## Phase order
 
