@@ -9,6 +9,8 @@ import {
 	createToolResultMessage,
 	executeToolCall,
 	finalizeToolCall,
+	normalizeAfterToolCallResult,
+	normalizeBeforeToolCallResult,
 	type PreparedToolCall,
 	prepareToolCall,
 } from "../src/index.ts";
@@ -172,6 +174,40 @@ describe("prepareToolCall", () => {
 		expect(text(outcome)).toContain('Validation failed for tool "echo"');
 		expect(text(outcome)).not.toBe("must not settle");
 		if (outcome.kind === "immediate") expect(outcome.terminate).toBe(false);
+	});
+
+	it.each([
+		["function", { value: () => {} }],
+		["symbol", { value: Symbol("replacement") }],
+	])("preserves the exact validation outcome for non-cloneable replacement args: %s", async (_label, args) => {
+		const withoutBlock = await prepareToolCall(call, [tool()], () => ({ args }));
+		const withBlock = await prepareToolCall(call, [tool()], () => ({
+			args,
+			block: { reason: "must not replace validation", terminate: true },
+		}));
+		expect(withBlock).toEqual(withoutBlock);
+		expect(text(withoutBlock)).toContain("could not be cloned");
+		expect(text(withoutBlock)).not.toBe("Invalid before tool callback output");
+	});
+
+	it("leaves cyclic replacement behavior owned by argument validation", async () => {
+		const args: { value: unknown; self?: unknown } = { value: 1 };
+		args.self = args;
+		const withoutBlock = await prepareToolCall(call, [tool()], () => ({ args }));
+		const withBlock = await prepareToolCall(call, [tool()], () => ({ args, block: { reason: "blocked" } }));
+		expect(withBlock).toEqual(withoutBlock);
+		expect(withoutBlock.kind).toBe("immediate");
+		expect(text(withoutBlock)).not.toBe("Invalid before tool callback output");
+	});
+
+	it.each([
+		["custom prototype", Object.assign(Object.create({ inherited: true }), { value: 1 })],
+		["accessor", Object.defineProperty({}, "value", { enumerable: true, get: () => 1 })],
+	])("leaves %s replacement behavior owned by argument validation", async (_label, args) => {
+		const withoutBlock = await prepareToolCall(call, [tool()], () => ({ args }));
+		const withBlock = await prepareToolCall(call, [tool()], () => ({ args, block: { reason: "blocked" } }));
+		expect(withoutBlock).toMatchObject({ kind: "prepared", args: { value: "1" } });
+		expect(text(withBlock)).toBe("blocked");
 	});
 
 	it.each([
@@ -444,6 +480,64 @@ describe("finalizeToolCall", () => {
 });
 
 describe("normalization helpers", () => {
+	it("distinguishes valid undefined callback outputs from invalid outputs", () => {
+		expect(normalizeBeforeToolCallResult(undefined)).toEqual({ kind: "valid", value: undefined });
+		expect(normalizeAfterToolCallResult(undefined)).toEqual({ kind: "valid", value: undefined });
+		expect(normalizeBeforeToolCallResult(null)).toEqual({ kind: "invalid" });
+		expect(normalizeAfterToolCallResult(null)).toEqual({ kind: "invalid" });
+	});
+
+	it("detaches the before envelope and block while leaving args opaque for schema validation", () => {
+		const source = { args: { value: "replacement" }, block: { reason: "", terminate: false } };
+		const normalized = normalizeBeforeToolCallResult(source);
+		expect(normalized).toEqual({ kind: "valid", value: source });
+		if (normalized.kind === "valid" && normalized.value) {
+			expect(normalized.value).not.toBe(source);
+			expect(normalized.value.args).toBe(source.args);
+			expect(normalized.value.block).not.toBe(source.block);
+		}
+	});
+
+	it("normalizes and detaches all after fields while preserving falsy values", () => {
+		const source = {
+			content: [{ type: "text" as const, text: "" }],
+			details: { nested: false },
+			isError: false,
+			usage,
+			terminate: false,
+		};
+		const normalized = normalizeAfterToolCallResult(source);
+		expect(normalized).toEqual({ kind: "valid", value: source });
+		if (normalized.kind === "valid" && normalized.value) {
+			expect(normalized.value).not.toBe(source);
+			expect(normalized.value.content).not.toBe(source.content);
+			expect(normalized.value.details).not.toBe(source.details);
+			expect(normalized.value.usage).not.toBe(source.usage);
+		}
+	});
+
+	it.each([
+		["primitive", 1],
+		["unknown field", { unknown: true }],
+		["custom prototype", Object.create({ inherited: true })],
+		["accessor", Object.defineProperty({}, "args", { enumerable: true, get: () => ({ value: "x" }) })],
+		["symbol", { [Symbol("field")]: true }],
+		["block accessor", { block: Object.defineProperty({}, "reason", { enumerable: true, get: () => "x" }) }],
+	])("rejects invalid before callback shape: %s", (_label, value) => {
+		expect(normalizeBeforeToolCallResult(value)).toEqual({ kind: "invalid" });
+	});
+
+	it.each([
+		["primitive", 1],
+		["unknown field", { unknown: true }],
+		["custom prototype", Object.create({ inherited: true })],
+		["accessor", Object.defineProperty({}, "terminate", { enumerable: true, get: () => false })],
+		["symbol", { [Symbol("field")]: true }],
+		["invalid falsy field", { usage: undefined }],
+	])("rejects invalid after callback shape: %s", (_label, value) => {
+		expect(normalizeAfterToolCallResult(value)).toEqual({ kind: "invalid" });
+	});
+
 	it("creates the exact synthetic error shape", () => {
 		expect(createErrorToolResult("failure")).toEqual({ content: [{ type: "text", text: "failure" }], details: {} });
 	});

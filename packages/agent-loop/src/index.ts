@@ -43,6 +43,7 @@ export interface BeforeToolCallContext {
 }
 
 export interface BeforeToolCallResult {
+	/** Opaque until prepareToolCall validates and clones it against the tool schema. */
 	args?: unknown;
 	block?: { reason: string; terminate?: boolean };
 }
@@ -71,6 +72,8 @@ export type AfterToolCallCallback = (
 	context: AfterToolCallContext,
 	signal?: AbortSignal,
 ) => AfterToolCallResult | undefined | Promise<AfterToolCallResult | undefined>;
+
+export type CallbackNormalizationResult<T> = { kind: "valid"; value: T | undefined } | { kind: "invalid" };
 
 export interface PreparedToolCall {
 	kind: "prepared";
@@ -212,6 +215,47 @@ function isUsage(value: unknown): value is Usage {
 	);
 }
 
+export function normalizeBeforeToolCallResult(value: unknown): CallbackNormalizationResult<BeforeToolCallResult> {
+	if (value === undefined) return { kind: "valid", value: undefined };
+	const result = plainRecord(value);
+	if (!result || !hasExactFields(result, ["args", "block"])) return { kind: "invalid" };
+	let blockResult: BeforeToolCallResult["block"];
+	if (Object.hasOwn(result, "block")) {
+		const block = plainRecord(result.block);
+		if (
+			!block ||
+			!hasExactFields(block, ["reason", "terminate"]) ||
+			typeof block.reason !== "string" ||
+			(Object.hasOwn(block, "terminate") && typeof block.terminate !== "boolean")
+		)
+			return { kind: "invalid" };
+		blockResult = {
+			reason: block.reason as string,
+			...(Object.hasOwn(block, "terminate") ? { terminate: block.terminate as boolean } : {}),
+		};
+	}
+	return {
+		kind: "valid",
+		value: {
+			...(Object.hasOwn(result, "args") ? { args: result.args } : {}),
+			...(Object.hasOwn(result, "block") ? { block: blockResult } : {}),
+		},
+	};
+}
+
+export function normalizeAfterToolCallResult(value: unknown): CallbackNormalizationResult<AfterToolCallResult> {
+	if (value === undefined) return { kind: "valid", value: undefined };
+	const patch = plainRecord(value);
+	if (!patch || !hasExactFields(patch, ["content", "details", "isError", "usage", "terminate"]))
+		return { kind: "invalid" };
+	if (Object.hasOwn(patch, "content") && !isContent(patch.content)) return { kind: "invalid" };
+	if (Object.hasOwn(patch, "details") && !isJsonValue(patch.details)) return { kind: "invalid" };
+	if (Object.hasOwn(patch, "isError") && typeof patch.isError !== "boolean") return { kind: "invalid" };
+	if (Object.hasOwn(patch, "usage") && !isUsage(patch.usage)) return { kind: "invalid" };
+	if (Object.hasOwn(patch, "terminate") && typeof patch.terminate !== "boolean") return { kind: "invalid" };
+	return { kind: "valid", value: structuredClone(patch) as AfterToolCallResult };
+}
+
 function normalizeResult(value: unknown): AgentToolResult | undefined {
 	const result = plainRecord(value);
 	if (!result || !hasExactFields(result, ["content", "details", "usage", "addedToolNames", "terminate"]))
@@ -277,22 +321,16 @@ export async function prepareToolCall(
 		});
 		let blocked: { reason: string; terminate: boolean } | undefined;
 		if (before) {
-			const output = await before({ toolCall: structuredClone(toolCall), args: structuredClone(args) }, signal);
-			if (output !== undefined) {
-				const result = plainRecord(output);
-				if (!result || !hasExactFields(result, ["args", "block"]))
-					return immediate(toolCall, INVALID_BEFORE_OUTPUT);
+			const normalized = normalizeBeforeToolCallResult(
+				await before({ toolCall: structuredClone(toolCall), args: structuredClone(args) }, signal),
+			);
+			if (normalized.kind === "invalid") return immediate(toolCall, INVALID_BEFORE_OUTPUT);
+			const result = normalized.value;
+			if (result !== undefined) {
 				let blockResult: { reason: string; terminate: boolean } | undefined;
 				if (Object.hasOwn(result, "block")) {
-					const block = plainRecord(result.block);
-					if (
-						!block ||
-						!hasExactFields(block, ["reason", "terminate"]) ||
-						typeof block.reason !== "string" ||
-						(Object.hasOwn(block, "terminate") && typeof block.terminate !== "boolean")
-					)
-						return immediate(toolCall, INVALID_BEFORE_OUTPUT);
-					blockResult = { reason: block.reason, terminate: block.terminate === true };
+					const block = result.block;
+					if (block) blockResult = { reason: block.reason, terminate: block.terminate === true };
 				}
 				if (Object.hasOwn(result, "args"))
 					args = validateToolArguments(tool, { ...toolCall, arguments: result.args as Record<string, unknown> });
@@ -354,18 +392,6 @@ export async function executeToolCall(
 	}
 }
 
-function validateAfterResult(value: unknown): AfterToolCallResult | undefined | false {
-	if (value === undefined) return undefined;
-	const patch = plainRecord(value);
-	if (!patch || !hasExactFields(patch, ["content", "details", "isError", "usage", "terminate"])) return false;
-	if (Object.hasOwn(patch, "content") && !isContent(patch.content)) return false;
-	if (Object.hasOwn(patch, "details") && !isJsonValue(patch.details)) return false;
-	if (Object.hasOwn(patch, "isError") && typeof patch.isError !== "boolean") return false;
-	if (Object.hasOwn(patch, "usage") && !isUsage(patch.usage)) return false;
-	if (Object.hasOwn(patch, "terminate") && typeof patch.terminate !== "boolean") return false;
-	return patch as AfterToolCallResult;
-}
-
 export async function finalizeToolCall(
 	prepared: PreparedToolCall,
 	executed: ExecutedToolCallOutcome,
@@ -377,7 +403,7 @@ export async function finalizeToolCall(
 	let isError = normalized.valid ? executed.isError : true;
 	if (after) {
 		try {
-			const output = validateAfterResult(
+			const normalizedOutput = normalizeAfterToolCallResult(
 				await after(
 					{
 						toolCall: structuredClone(prepared.toolCall),
@@ -388,7 +414,8 @@ export async function finalizeToolCall(
 					signal,
 				),
 			);
-			if (output === false) throw new Error(INVALID_AFTER_OUTPUT);
+			if (normalizedOutput.kind === "invalid") throw new Error(INVALID_AFTER_OUTPUT);
+			const output = normalizedOutput.value;
 			if (output) {
 				result = {
 					content: output.content ?? result.content,
