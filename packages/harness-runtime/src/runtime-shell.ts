@@ -57,6 +57,7 @@ import {
 	captureEntryQuery,
 	type RuntimeAppendResult,
 	type RuntimeAttachment,
+	type RuntimeCommitFact,
 	type RuntimeOwner,
 } from "./session.ts";
 import type { EntryProjector, ProjectableCustomEntry, Session, SessionTree } from "./types.ts";
@@ -431,6 +432,20 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		this.#pumpIdle();
 	}
 
+	#publishOutcome(
+		outcome: { readonly attachment: RuntimeAttachment; readonly facts?: readonly RuntimeCommitFact[] },
+		leading?: () => void,
+	): void {
+		this.#publish(outcome.attachment);
+		leading?.();
+		for (const fact of outcome.facts ?? [])
+			this.#eventRegistry.publish(
+				fact.kind === "entry"
+					? { type: "entry_added", lane: "main", entry: fact.entry }
+					: { type: "usage", lane: "main", row: fact.row, totals: fact.totals },
+			);
+	}
+
 	#abortRunningEffects(): void {
 		for (const effect of this.#assistantEffects.values()) if (effect.status === "running") effect.controller.abort();
 		for (const effect of this.#toolEffects.values()) if (effect.status === "running") effect.controller.abort();
@@ -475,7 +490,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	async #append(append: () => Promise<RuntimeAppendResult>): Promise<string> {
 		try {
 			const result = await append();
-			this.#publish(result.attachment);
+			this.#publishOutcome(result);
 			return result.entryId;
 		} catch (cause) {
 			throw this.#transitionFailure(cause);
@@ -701,7 +716,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Deferred writes are obsolete");
 				return action.info;
 			}
@@ -714,7 +729,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (!result.committed) throw new RuntimeShellError("stale", "Queue consumption is no longer authoritative");
 				return action.info;
 			}
@@ -746,7 +761,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Cancelled tool is obsolete");
 				return info;
 			}
@@ -771,7 +786,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#toolFailure(effectKey, cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				this.#toolEffects.delete(effectKey);
 				this.#preparedTools.delete(`${plan.assistantEntryId}:${plan.sourceIndex}`);
 				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Cancelled tool is obsolete");
@@ -874,7 +889,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Tool clearance is no longer authoritative");
 				if (this.#sealed) throw new RuntimeShellError("closed", "Runtime shell is closed");
@@ -1013,7 +1028,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#toolFailure(toolEffectKey(info.operationId, info.turnId, info.sourceIndex), cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Tool effect is no longer authoritative");
 				return info;
@@ -1158,7 +1173,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const result = await settleToolCall(this.#session, detached).catch((cause: unknown) => {
 					throw this.#toolFailure(effectKey, cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				this.#toolEffects.delete(effectKey);
 				this.#preparedTools.delete(`${effect.plan.assistantEntryId}:${effect.plan.sourceIndex}`);
 				if (result.status === "obsolete")
@@ -1226,7 +1241,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#transitionFailure(cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				this.#assistantEffects.delete(assistantEffectKey(info.operationId, info.stepId, info.attempt));
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Assistant effect is no longer authoritative");
@@ -1313,7 +1328,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				}).catch((cause: unknown) => {
 					throw this.#assistantFailure(effectKey, cause);
 				});
-				this.#publish(result.attachment);
+				this.#publishOutcome(result);
 				if (result.status === "unsupported")
 					throw new RuntimeShellError(
 						"unavailable",
@@ -1554,13 +1569,14 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 					steeringMode: settings.steeringMode,
 					followUpMode: settings.followUpMode,
 				});
-				this.#publish(result.attachment);
 				if (result.status === "committed") {
 					const runId = result.attachment.runOperation?.value.operationId;
 					if (!runId)
 						throw this.#faultShell(undefined, undefined, "Committed prompt attachment omitted its operation id");
-					this.#eventRegistry.publish({ type: "run_start", lane: "main", runId });
-				}
+					this.#publishOutcome(result, () =>
+						this.#eventRegistry.publish({ type: "run_start", lane: "main", runId }),
+					);
+				} else this.#publish(result.attachment);
 				if (result.status === "stale") throw new RuntimeShellError("stale", "Prompt attachment is stale");
 				if (result.status === "busy") throw new RuntimeShellError("busy", "Main lane is busy");
 				if (result.status === "unavailable")

@@ -52,6 +52,109 @@ describe("D-057 RuntimeShell hook surface", () => {
 });
 
 describe("D-058 RuntimeShell event surface", () => {
+	it("publishes prompt facts after run_start in canonical write order before prompt resolution", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(storage), config(), { models });
+		storage.committedTransactions.length = 0;
+		const order: string[] = [];
+		let resolved = false;
+		shell.events.on("run_start", () => {
+			order.push("run_start");
+		});
+		shell.events.on("entry_added", (event) => {
+			expect(resolved).toBe(false);
+			order.push(`entry:${event.entry.id}`);
+		});
+		const accepted = shell.prompt([user("first"), user("second")]).then((value) => {
+			resolved = true;
+			return value;
+		});
+		const attachment = await accepted;
+		const ids = attachment.runOperation!.value.intent.promptEntryIds;
+		expect(order).toEqual(["run_start", ...ids.map((id) => `entry:${id}`)]);
+		expect(storage.committedTransactions).toHaveLength(1);
+		expect(
+			storage.committedTransactions[0].writes
+				.filter((write) => write.kind === "entry")
+				.map((write) => write.entry.id),
+		).toEqual(ids);
+		await shell.close();
+	});
+
+	it("publishes one exact fact for each placed façade write and none for active pending admission", async () => {
+		const idleFixture = await rooted("idle");
+		const idleStorage = instrumentStorage(idleFixture.storage);
+		const idle = await createRuntimeShell(session(idleStorage), config());
+		idleStorage.committedTransactions.length = 0;
+		const seen: unknown[] = [];
+		idle.events.on("entry_added", (event) => {
+			seen.push(event);
+		});
+		const messageId = await idle.session.appendMessage(user("placed"));
+		const customId = await idle.session.appendCustomEntry("projected", { value: 1 });
+		expect(seen).toEqual([
+			{
+				type: "entry_added",
+				lane: "main",
+				entry: expect.objectContaining({ id: messageId, parentId: null, type: "message", message: user("placed") }),
+			},
+			{
+				type: "entry_added",
+				lane: "main",
+				entry: expect.objectContaining({
+					id: customId,
+					parentId: messageId,
+					type: "custom",
+					customType: "projected",
+					data: { value: 1 },
+				}),
+			},
+		]);
+		expect(idleStorage.committedTransactions).toHaveLength(2);
+		await idle.close();
+
+		const activeFixture = await rooted("need");
+		const activeStorage = instrumentStorage(activeFixture.storage);
+		const active = await createRuntimeShell(session(activeStorage), config());
+		activeStorage.committedTransactions.length = 0;
+		const activeFacts = vi.fn();
+		active.events.on("entry_added", activeFacts);
+		await active.session.appendMessage(user("pending"));
+		expect(activeFacts).not.toHaveBeenCalled();
+		expect(activeStorage.committedTransactions).toHaveLength(1);
+		expect(activeStorage.committedTransactions[0].writes.some((write) => write.kind === "entry")).toBe(false);
+		await active.close();
+	});
+
+	it("publishes deferred projected writes in FIFO order and does not add a commit", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config(), {
+			entryProjectors: { projected: (entry) => [user(String(entry.data))] },
+		});
+		const ids = [
+			await shell.session.appendCustomEntry("projected", "first"),
+			await shell.session.appendCustomEntry("projected", "second"),
+		];
+		const facts: string[] = [];
+		shell.events.on("entry_added", ({ entry }) => {
+			facts.push(entry.id);
+		});
+		const before = storage.committedTransactions.length;
+		await shell.executeAction();
+		expect(facts).toEqual(ids);
+		expect(storage.committedTransactions).toHaveLength(before + 1);
+		expect(
+			storage.committedTransactions
+				.at(-1)!
+				.writes.filter((write) => write.kind === "entry")
+				.map((write) => write.entry.id),
+		).toEqual(ids);
+		await shell.close();
+	});
+
 	it("exposes only frozen events.on and preserves synchronous lifecycle registration errors", async () => {
 		const fixture = await rooted("idle");
 		const shell = await createRuntimeShell(session(fixture.storage), config());
@@ -3895,9 +3998,9 @@ describe("Phase 1 runtime shell", () => {
 		reopenedStorage.scanBranchStructure = async () => {
 			throw new Error("branch structure scan forbidden");
 		};
-		reopenedStorage.getStats = async () => {
-			throw new Error("usage scan forbidden");
-		};
+		const getStats = reopenedStorage.getStats.bind(reopenedStorage);
+		const statsReads = vi.fn(getStats);
+		reopenedStorage.getStats = statsReads;
 		const reopenedModels = createModels();
 		const lease = vi.spyOn(reopenedModels, "lease");
 		const reopened = await createRuntimeShell(session(reopenedStorage), config(), { models: reopenedModels });
@@ -3906,6 +4009,7 @@ describe("Phase 1 runtime shell", () => {
 		expect(lease).not.toHaveBeenCalled();
 		expect(await reopened.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
 		await expect(reopened.executeAction()).resolves.toMatchObject({ kind: "recover_assistant_effect" });
+		expect(statsReads).toHaveBeenCalledTimes(1);
 		expect(lease).not.toHaveBeenCalled();
 		await reopened.close();
 	});
@@ -4160,6 +4264,13 @@ describe("Phase 1 runtime shell", () => {
 	it("atomically settles a successful detached response and plans finish without registry or provider access", async () => {
 		const message = terminal();
 		const prepared = await preparedShell(() => message);
+		const facts: unknown[] = [];
+		prepared.shell.events.on("entry_added", (event) => {
+			facts.push(event);
+		});
+		prepared.shell.events.on("usage", (event) => {
+			facts.push(event);
+		});
 		const before = prepared.instrumented.committedTransactions.length;
 		const stateBefore = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
 		const generation = ((stateBefore.value as Record<string, JsonValue>).phase as Record<string, JsonValue>)
@@ -4205,6 +4316,15 @@ describe("Phase 1 runtime shell", () => {
 		expect((await prepared.fixture.storage.getEntries([responseEntryId])).get(responseEntryId)?.payload).toEqual(
 			message,
 		);
+		const durableRow = (await prepared.fixture.storage.getUsageRows([usageId])).get(usageId)!;
+		expect(facts).toEqual([
+			{
+				type: "entry_added",
+				lane: "main",
+				entry: expect.objectContaining({ id: responseEntryId, parentId: prepared.fixture.prompt, message }),
+			},
+			{ type: "usage", lane: "main", row: durableRow, totals: (await prepared.fixture.storage.getStats()).usage },
+		]);
 		expect(await prepared.shell.peekAction()).toEqual({
 			kind: "finish_run",
 			operationId: prepared.fixture.operationId,
@@ -4216,6 +4336,124 @@ describe("Phase 1 runtime shell", () => {
 		expect(prepared.lease.fetchDeferred).not.toHaveBeenCalled();
 		expect(prepared.lease.cancelDeferred).not.toHaveBeenCalled();
 		await prepared.shell.close();
+	});
+
+	it.each(["throw", "reject"] as const)(
+		"keeps a real assistant fact batch ordered when its first listener %s",
+		async (failure) => {
+			const prepared = await preparedShell(() => terminal());
+			const order: string[] = [];
+			const errors: unknown[] = [];
+			prepared.shell.events.on("handler_error", (event) => {
+				errors.push(event);
+			});
+			prepared.shell.events.on("entry_added", () => {
+				order.push("entry");
+				if (failure === "throw") throw new Error("fact failed");
+				return Promise.reject(new Error("fact failed"));
+			});
+			prepared.shell.events.on("usage", () => {
+				order.push("usage");
+			});
+			const before = prepared.instrumented.committedTransactions.length;
+			await settlePrepared(prepared);
+			await Promise.resolve();
+			await Promise.resolve();
+			expect(order).toEqual(["entry", "usage"]);
+			expect(errors).toEqual([
+				expect.objectContaining({
+					type: "handler_error",
+					kind: "event",
+					event: "entry_added",
+					error: "fact failed",
+				}),
+			]);
+			expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+			await prepared.shell.close();
+		},
+	);
+
+	it("faults after a committed assistant stats read fails, publishes nothing, and reopens without replay", async () => {
+		const prepared = await preparedShell(() => terminal());
+		const facts = vi.fn();
+		prepared.shell.events.on("entry_added", facts);
+		prepared.shell.events.on("usage", facts);
+		const stateBefore = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
+		const phase = (stateBefore.value as unknown as RunState).phase;
+		if (phase.kind !== "assistant" || phase.generation.status !== "effect_pending")
+			throw new Error("reservation missing");
+		const commit = prepared.instrumented.commit.bind(prepared.instrumented);
+		const getStats = prepared.instrumented.getStats.bind(prepared.instrumented);
+		let committed = false;
+		prepared.instrumented.commit = async (transaction) => {
+			const result = await commit(transaction);
+			if (transaction.writes.some((write) => write.kind === "usage")) committed = true;
+			return result;
+		};
+		prepared.instrumented.getStats = async () => {
+			if (committed) throw new Error("postcommit stats failed");
+			return getStats();
+		};
+		const before = prepared.instrumented.committedTransactions.length;
+		const fault = await settlePrepared(prepared).catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault", cause: { code: "storage" } });
+		expect(facts).not.toHaveBeenCalled();
+		expect(prepared.instrumented.committedTransactions).toHaveLength(before + 1);
+		await expect(prepared.shell.peekAction()).rejects.toBe(fault);
+		await prepared.shell.close();
+
+		const storage = prepared.state.createStorage();
+		const reopened = await createRuntimeShell(session(storage), config());
+		const replay = vi.fn();
+		reopened.events.on("entry_added", replay);
+		reopened.events.on("usage", replay);
+		expect((await storage.getEntries([phase.generation.responseEntryId])).has(phase.generation.responseEntryId)).toBe(
+			true,
+		);
+		expect((await storage.getUsageRows([phase.generation.usageId])).has(phase.generation.usageId)).toBe(true);
+		expect(await reopened.peekAction()).toMatchObject({ kind: "finish_run" });
+		expect(replay).not.toHaveBeenCalled();
+		await reopened.close();
+	});
+
+	it("holds close through admitted assistant commit-plus-stats and publishes before either promise settles", async () => {
+		const prepared = await preparedShell(() => terminal());
+		const getStats = prepared.instrumented.getStats.bind(prepared.instrumented);
+		let enter!: () => void;
+		let release!: () => void;
+		const entered = new Promise<void>((resolve) => {
+			enter = resolve;
+		});
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		let gate = false;
+		prepared.instrumented.getStats = async () => {
+			if (gate) {
+				enter();
+				await blocked;
+			}
+			return getStats();
+		};
+		gate = true;
+		let mutationSettled = false;
+		let closeSettled = false;
+		const observations: Array<[boolean, boolean]> = [];
+		prepared.shell.events.on("entry_added", () => {
+			observations.push([mutationSettled, closeSettled]);
+		});
+		const mutation = settlePrepared(prepared).finally(() => {
+			mutationSettled = true;
+		});
+		await entered;
+		const close = prepared.shell.close().finally(() => {
+			closeSettled = true;
+		});
+		expect(observations).toEqual([]);
+		release();
+		await mutation;
+		await close;
+		expect(observations).toEqual([[false, false]]);
 	});
 
 	it.each([
@@ -4717,8 +4955,12 @@ describe("Phase 1 runtime shell", () => {
 				},
 				["echo"],
 			);
+			const facts = vi.fn();
+			prepared.shell.events.on("entry_added", facts);
+			prepared.shell.events.on("usage", facts);
 			await prepared.shell.executeAction();
 			expect(execute).not.toHaveBeenCalled();
+			expect(facts).not.toHaveBeenCalled();
 			expect(
 				(
 					await prepared.fixture.storage.getRegister(
@@ -4878,8 +5120,16 @@ describe("Phase 1 runtime shell", () => {
 				).phase;
 				if (phase.kind !== "tools") throw new Error("tool batch missing");
 				const reserved = phase.batch.calls[0].resultEntryId;
+				const entries: string[] = [];
+				const usage = vi.fn();
+				prepared.shell.events.on("entry_added", ({ entry }) => {
+					entries.push(entry.id);
+				});
+				prepared.shell.events.on("usage", usage);
 				await prepared.shell.executeAction();
 				expect(execute).not.toHaveBeenCalled();
+				expect(entries).toEqual([reserved]);
+				expect(usage).not.toHaveBeenCalled();
 				const entry = (await prepared.fixture.storage.getEntries([reserved])).get(reserved);
 				expect(entry).toMatchObject({
 					id: reserved,
@@ -5194,6 +5444,13 @@ describe("Phase 1 runtime shell", () => {
 				},
 				["echo"],
 			);
+			const facts: unknown[] = [];
+			prepared.shell.events.on("entry_added", (event) => {
+				facts.push(event);
+			});
+			prepared.shell.events.on("usage", (event) => {
+				facts.push(event);
+			});
 			const writesBeforeClearance = prepared.instrumented.committedTransactions.length;
 			await prepared.shell.executeAction();
 			order.push("clearance committed");
@@ -5281,6 +5538,15 @@ describe("Phase 1 runtime shell", () => {
 				usage,
 				adjustment: false,
 			});
+			const usageRow = (await prepared.fixture.storage.getUsageRows([usageWrite.row.id])).get(usageWrite.row.id)!;
+			expect(facts).toEqual([
+				{
+					type: "entry_added",
+					lane: "main",
+					entry: expect.objectContaining({ id: resultId, parentId: phase.batch.assistantEntryId }),
+				},
+				{ type: "usage", lane: "main", row: usageRow, totals: (await prepared.fixture.storage.getStats()).usage },
+			]);
 			await prepared.shell.close();
 		});
 
@@ -5290,6 +5556,13 @@ describe("Phase 1 runtime shell", () => {
 				{ tools: [runtimeTool()], toolContext: { batch: "static" } },
 				["echo"],
 			);
+			const facts: string[] = [];
+			prepared.shell.events.on("entry_added", () => {
+				facts.push("entry");
+			});
+			prepared.shell.events.on("usage", () => {
+				facts.push("usage");
+			});
 			vi.mocked(prepared.runtimeSession.idGenerator.next).mockClear();
 			await prepared.shell.executeAction();
 			for (const kind of ["dispatch_tool_effect", "await_tool_effect", "finalize_tool_effect"] as const) {
@@ -5309,6 +5582,7 @@ describe("Phase 1 runtime shell", () => {
 			const entryWrite = settlement.writes.find((write) => write.kind === "entry");
 			if (entryWrite?.kind !== "entry") throw new Error("tool result entry missing");
 			expect(Object.hasOwn(entryWrite.entry.payload as object, "usage")).toBe(false);
+			expect(facts).toEqual(["entry"]);
 			await prepared.shell.close();
 		});
 
@@ -5706,10 +5980,14 @@ describe("Phase 1 runtime shell", () => {
 			await prepared.shell.executeAction();
 			for (let stage = 0; stage < 3; stage++) await prepared.shell.executeAction();
 			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
+			const facts = vi.fn();
+			prepared.shell.events.on("entry_added", facts);
+			prepared.shell.events.on("usage", facts);
 			const before = prepared.instrumented.committedTransactions.length;
 			await prepared.shell.close();
 			await expect(prepared.shell.executeAction()).rejects.toMatchObject({ code: "closed" });
 			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			expect(facts).not.toHaveBeenCalled();
 		});
 
 		it("allows an admitted tool settlement commit to stand before close", async () => {
@@ -5766,6 +6044,9 @@ describe("Phase 1 runtime shell", () => {
 			prepared.instrumented.commit = vi.fn().mockRejectedValueOnce(settlementFailure);
 			while ((await prepared.shell.peekAction())?.kind !== "settle_tool_effect")
 				await prepared.shell.executeAction();
+			const facts = vi.fn();
+			prepared.shell.events.on("entry_added", facts);
+			prepared.shell.events.on("usage", facts);
 			const before = prepared.instrumented.committedTransactions.length;
 			const fault = await prepared.shell.executeAction().catch((error: unknown) => error);
 			expect(fault).toMatchObject({
@@ -5776,6 +6057,7 @@ describe("Phase 1 runtime shell", () => {
 			await prepared.shell.close();
 			await expect(prepared.shell.executeAction()).rejects.toBe(fault);
 			expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+			expect(facts).not.toHaveBeenCalled();
 			const storage = prepared.state.createStorage();
 			const state = (await storage.getRegister("op.state", prepared.fixture.operationId))!
 				.value as unknown as RunState;
@@ -5905,6 +6187,10 @@ describe("Phase 1 runtime shell", () => {
 				tools: [runtimeTool({ replay: "safe", prepareArguments: pending.prepareArguments, execute })],
 				toolContext: context,
 			});
+			const facts: string[] = [];
+			shell.events.on("entry_added", ({ entry }) => {
+				facts.push(entry.id);
+			});
 			shell.hooks.on("before_tool", pending.beforeToolCall);
 			shell.hooks.on("after_tool", afterToolCall);
 			const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
@@ -5943,6 +6229,7 @@ describe("Phase 1 runtime shell", () => {
 				parentId: assistantEntryId,
 				payload: { toolCallId: "call-a", toolName: "echo", isError: false, details: { replayed: true } },
 			});
+			expect(facts).toEqual([calls[0].resultEntryId]);
 			expect(
 				await storage.getRegister("op.tool_args", `${pending.fixture.operationId}:${turnId}:0`),
 			).toBeUndefined();
@@ -5960,6 +6247,13 @@ describe("Phase 1 runtime shell", () => {
 				tools: [definition],
 				toolContext: context,
 			});
+			const facts: string[] = [];
+			shell.events.on("entry_added", ({ entry }) => {
+				facts.push(entry.id);
+			});
+			shell.events.on("usage", () => {
+				facts.push("usage");
+			});
 			const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
 				.value as unknown as RunState;
 			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
@@ -5972,6 +6266,7 @@ describe("Phase 1 runtime shell", () => {
 				isError: true,
 				content: [{ type: "text", text: "Tool outcome unknown after interruption" }],
 			});
+			expect(facts).toEqual([call.resultEntryId]);
 			await shell.close();
 		});
 
@@ -6441,9 +6736,13 @@ describe("Phase 1 runtime shell", () => {
 			],
 		});
 		const before = prepared.instrumented.committedTransactions.length;
+		const facts = vi.fn();
+		prepared.shell.events.on("entry_added", facts);
+		prepared.shell.events.on("usage", facts);
 
 		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_assistant_effect" });
 		expect(prepared.instrumented.committedTransactions).toHaveLength(before);
+		expect(facts).not.toHaveBeenCalled();
 		expect(await prepared.shell.peekAction()).toEqual({
 			kind: "repair_materialized_assistant",
 			operationId: prepared.fixture.operationId,
@@ -6451,6 +6750,18 @@ describe("Phase 1 runtime shell", () => {
 			usageId,
 		});
 		await prepared.shell.close();
+		const reopened = await createRuntimeShell(session(prepared.state.createStorage()), config());
+		const replay = vi.fn();
+		reopened.events.on("entry_added", replay);
+		reopened.events.on("usage", replay);
+		expect(await reopened.peekAction()).toEqual({
+			kind: "repair_materialized_assistant",
+			operationId: prepared.fixture.operationId,
+			responseEntryId,
+			usageId,
+		});
+		expect(replay).not.toHaveBeenCalled();
+		await reopened.close();
 	});
 
 	it.each(["partial", "mismatched"] as const)(
@@ -7064,6 +7375,13 @@ describe("Phase 1 runtime shell", () => {
 			const storage = instrumentStorage(state.createStorage());
 			const { models, lease } = availableModels();
 			const reopened = await createRuntimeShell(session(storage), config(), { models });
+			const facts: unknown[] = [];
+			reopened.events.on("entry_added", (event) => {
+				facts.push(event);
+			});
+			reopened.events.on("usage", (event) => {
+				facts.push(event);
+			});
 			expect(await reopened.peekAction()).toMatchObject({ kind: "recover_assistant_effect" });
 			await reopened.executeAction();
 			expectLeaseUnused(lease);
@@ -7089,6 +7407,19 @@ describe("Phase 1 runtime shell", () => {
 				usage: ZERO_USAGE,
 				adjustment: false,
 			});
+			expect(facts).toEqual([
+				{
+					type: "entry_added",
+					lane: "main",
+					entry: expect.objectContaining({ id: fixture.reservedResponse, parentId: fixture.prompt }),
+				},
+				{
+					type: "usage",
+					lane: "main",
+					row: (await storage.getUsageRows([fixture.reservedUsage])).get(fixture.reservedUsage),
+					totals: (await storage.getStats()).usage,
+				},
+			]);
 			expect(await reopened.peekAction()).toMatchObject({ kind: "finish_aborted_run" });
 			await reopened.close();
 		});
@@ -7107,6 +7438,13 @@ describe("Phase 1 runtime shell", () => {
 				},
 				["echo"],
 			);
+			const facts: string[] = [];
+			prepared.shell.events.on("entry_added", ({ entry }) => {
+				facts.push(entry.id);
+			});
+			prepared.shell.events.on("usage", () => {
+				facts.push("usage");
+			});
 			const durable = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
 				.value as unknown as RunState;
 			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
@@ -7147,6 +7485,7 @@ describe("Phase 1 runtime shell", () => {
 					},
 				});
 			}
+			expect(facts).toEqual(calls.map((call) => call.resultEntryId));
 			expect(
 				prepared.instrumented.committedTransactions.flatMap(({ writes }) => writes).some((w) => w.kind === "usage"),
 			).toBe(true);

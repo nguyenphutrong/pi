@@ -657,6 +657,12 @@ export interface RuntimeAttachment {
 	readonly toolArguments: ReadonlyMap<string, Readonly<Record<string, JsonValue>>>;
 }
 
+export type RuntimeCommitFact =
+	| { readonly kind: "entry"; readonly entry: Entry }
+	| { readonly kind: "usage"; readonly row: UsageRow; readonly totals: Usage };
+
+type RuntimeCommitFacts = { readonly facts?: readonly RuntimeCommitFact[] };
+
 export interface StartAssistantStepTransition {
 	readonly operationId: string;
 	readonly triggerEntryId: string;
@@ -681,7 +687,7 @@ export interface AcceptPromptTransition {
 }
 
 export type AcceptPromptResult =
-	| { readonly status: "committed"; readonly attachment: RuntimeAttachment }
+	| ({ readonly status: "committed"; readonly attachment: RuntimeAttachment } & RuntimeCommitFacts)
 	| { readonly status: "stale" | "busy" | "unavailable"; readonly attachment: RuntimeAttachment };
 
 export type CancelQueuedOutcome = "cancelled" | "already_consumed" | "not_found";
@@ -704,6 +710,7 @@ export interface ConsumeQueueTransition {
 export interface RuntimeTransitionResult {
 	readonly committed: boolean;
 	readonly attachment: RuntimeAttachment;
+	readonly facts?: readonly RuntimeCommitFact[];
 }
 
 export interface FinishRunTransition {
@@ -733,6 +740,7 @@ export interface ReleaseAssistantRetryTransition {
 export type RecoveryTransitionResult = {
 	readonly status: "committed" | "obsolete";
 	readonly attachment: RuntimeAttachment;
+	readonly facts?: readonly RuntimeCommitFact[];
 };
 
 type OptionalFinalAssistant =
@@ -862,6 +870,7 @@ export interface ClearToolCallTransition {
 export type ClearToolCallResult = {
 	readonly status: "committed" | "obsolete";
 	readonly attachment: RuntimeAttachment;
+	readonly facts?: readonly RuntimeCommitFact[];
 };
 
 export interface SettleToolCallTransition {
@@ -884,6 +893,7 @@ export interface SettleToolCallTransition {
 export type SettleToolCallResult = {
 	readonly status: "committed" | "obsolete";
 	readonly attachment: RuntimeAttachment;
+	readonly facts?: readonly RuntimeCommitFact[];
 };
 
 const PREPARED_CLEARANCE_FIELDS = new Set(["kind", "toolCall", "args", "replay"]);
@@ -998,7 +1008,10 @@ function validateSettleToolCallTransition(transition: unknown): asserts transiti
 }
 
 export type SettleAssistantEffectResult =
-	| { readonly status: "committed" | "materialized" | "obsolete"; readonly attachment: RuntimeAttachment }
+	| ({
+			readonly status: "committed" | "materialized" | "obsolete";
+			readonly attachment: RuntimeAttachment;
+	  } & RuntimeCommitFacts)
 	| {
 			readonly status: "unsupported";
 			readonly classification: "unsupported";
@@ -1030,6 +1043,7 @@ export interface RuntimeAppendResult {
 	readonly status: "placed" | "pending";
 	readonly entryId: string;
 	readonly attachment: RuntimeAttachment;
+	readonly facts?: readonly RuntimeCommitFact[];
 }
 
 export class StoredSession implements Session {
@@ -1392,6 +1406,9 @@ export class StoredSession implements Session {
 			}
 			return Object.freeze({
 				committed: true,
+				facts: Object.freeze(
+					entryWrites.map(({ entry }) => Object.freeze({ kind: "entry" as const, entry: entries.get(entry.id)! })),
+				),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({
@@ -2058,8 +2075,14 @@ export class StoredSession implements Session {
 					adjustment: false,
 				}),
 			);
+			const row = usageRows.get(transition.usageId)!;
+			const totals = Object.freeze(structuredClone((await this.#storage.getStats()).usage));
 			return Object.freeze({
 				status: "committed" as const,
+				facts: Object.freeze([
+					Object.freeze({ kind: "entry" as const, entry: entries.get(transition.responseEntryId)! }),
+					Object.freeze({ kind: "usage" as const, row, totals }),
+				]),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.responseEntryId }),
@@ -2368,8 +2391,14 @@ export class StoredSession implements Session {
 					adjustment: false,
 				}),
 			);
+			const row = usageRows.get(transition.usageId)!;
+			const totals = Object.freeze(structuredClone((await this.#storage.getStats()).usage));
 			return Object.freeze({
 				status: "committed" as const,
+				facts: Object.freeze([
+					Object.freeze({ kind: "entry" as const, entry: entries.get(transition.responseEntryId)! }),
+					Object.freeze({ kind: "usage" as const, row, totals }),
+				]),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.responseEntryId }),
@@ -2628,8 +2657,20 @@ export class StoredSession implements Session {
 						adjustment: false,
 					}),
 				);
+			const usageFact =
+				usageId === undefined
+					? undefined
+					: Object.freeze({
+							kind: "usage" as const,
+							row: usageRows.get(usageId)!,
+							totals: Object.freeze(structuredClone((await this.#storage.getStats()).usage)),
+						});
 			return Object.freeze({
 				status: "committed" as const,
+				facts: Object.freeze([
+					Object.freeze({ kind: "entry" as const, entry: entries.get(transition.resultEntryId)! }),
+					...(usageFact === undefined ? [] : [usageFact]),
+				]),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.resultEntryId }),
@@ -2885,6 +2926,9 @@ export class StoredSession implements Session {
 			);
 			return Object.freeze({
 				status: "committed" as const,
+				facts: Object.freeze([
+					Object.freeze({ kind: "entry" as const, entry: entries.get(transition.resultEntryId)! }),
+				]),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: transition.resultEntryId }),
@@ -3337,6 +3381,11 @@ export class StoredSession implements Session {
 			const offset = capturedIds.length + transition.messages.length + capturedIds.length;
 			return Object.freeze({
 				status: "committed" as const,
+				facts: Object.freeze(
+					[...capturedIds, ...entryIds].map((id) =>
+						Object.freeze({ kind: "entry" as const, entry: entries.get(id)! }),
+					),
+				),
 				attachment: Object.freeze({
 					laneConfiguration: configuration,
 					laneState: Object.freeze({
@@ -3698,6 +3747,7 @@ export class StoredSession implements Session {
 			return Object.freeze({
 				status: "placed" as const,
 				entryId: id,
+				facts: Object.freeze([Object.freeze({ kind: "entry" as const, entry: entries.get(id)! })]),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: id }),
@@ -3883,6 +3933,9 @@ export class StoredSession implements Session {
 			}
 			return Object.freeze({
 				status: "placed" as const,
+				facts: Object.freeze(
+					capturedIds.map((id) => Object.freeze({ kind: "entry" as const, entry: entries.get(id)! })),
+				),
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({

@@ -86,9 +86,30 @@ async function runtimeWithAssistant(state = new MemoryStorageState(), options: R
 }
 
 describe("RuntimeShell next-run queue", () => {
+	it("publishes captured next-run before multiple prompt entries and never publishes direct admission", async () => {
+		const fixture = await runtime();
+		const order: string[] = [];
+		fixture.shell.events.on("run_start", () => {
+			order.push("run_start");
+		});
+		fixture.shell.events.on("entry_added", ({ entry }) => {
+			order.push(entry.id);
+		});
+		const captured = await fixture.shell.nextRun(user("captured"));
+		expect(order).toEqual([]);
+		const accepted = await fixture.shell.prompt([user("first"), user("second")]);
+		expect(order).toEqual(["run_start", captured.entryId, ...accepted.runOperation!.value.intent.promptEntryIds]);
+		expect(fixture.observed.committedTransactions).toHaveLength(2);
+		await fixture.shell.close();
+	});
+
 	it("exposes steer and follow-up end to end and consumes the planned steer through executeAction", async () => {
 		const fixture = await runtime();
 		const accepted = await fixture.shell.prompt(user("prompt"));
+		const facts: string[] = [];
+		fixture.shell.events.on("entry_added", ({ entry }) => {
+			facts.push(entry.id);
+		});
 		const steerPayload = user("steer");
 		const followPayload = user("follow");
 		const steer = await fixture.shell.steer(steerPayload);
@@ -112,6 +133,7 @@ describe("RuntimeShell next-run queue", () => {
 		const consumedEntry = consumed.entries.get(steer.entryId);
 		expect(consumedEntry?.type === "message" ? consumedEntry.message : undefined).toEqual(steerPayload);
 		expect(consumed.runState?.value.inbox).toEqual({ steer: [], followUp: [follow.entryId], writes: [] });
+		expect(facts).toEqual([steer.entryId]);
 		await fixture.shell.close();
 	});
 
@@ -173,8 +195,14 @@ describe("RuntimeShell next-run queue", () => {
 
 	it("durably consumes follow-up after a real settled assistant and reopens at assistant work", async () => {
 		const fixture = await runtimeWithAssistant(undefined, { followUpMode: "one-at-a-time" });
+		const facts: string[] = [];
+		fixture.shell.events.on("entry_added", ({ entry }) => {
+			facts.push(entry.id);
+		});
 		await fixture.shell.prompt(user("prompt"));
+		facts.length = 0;
 		for (let index = 0; index < 5; index++) await fixture.shell.executeAction();
+		facts.length = 0;
 		expect(await fixture.shell.peekAction()).toMatchObject({ kind: "finish_run" });
 		const first = await fixture.shell.followUp(user("first"));
 		const second = await fixture.shell.followUp(user("second"));
@@ -193,6 +221,7 @@ describe("RuntimeShell next-run queue", () => {
 			},
 			inbox: { followUp: [second.entryId] },
 		});
+		expect(facts).toEqual([first.entryId]);
 		await fixture.shell.close();
 		const reopenedStorage = fixture.state.createStorage();
 		const reopenedSession = new StoredSession(

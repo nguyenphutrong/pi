@@ -1,7 +1,10 @@
-import type { AssistantMessage } from "@earendil-works/pi-ai";
+import type { AssistantMessage, Usage } from "@earendil-works/pi-ai";
 import { InMemoryTelemetryContext, type TelemetryContext, type TelemetrySpan } from "@earendil-works/pi-telemetry";
+import type { UsageRow } from "@nguyenphutrong/pi-session-storage";
 import { describe, expect, it, vi } from "vitest";
 import { type HarnessEvent, type RunEndEvent, RuntimeEventRegistry } from "../src/events.ts";
+import type { EntryAddedEvent, UsageEvent } from "../src/index.ts";
+import type { Entry } from "../src/types.ts";
 import { ZERO_USAGE } from "./fixtures.ts";
 
 const flush = async (): Promise<void> => {
@@ -13,6 +16,18 @@ function registry(telemetryContext: TelemetryContext = new InMemoryTelemetryCont
 }
 
 const runStart = (runId = "run"): HarnessEvent => ({ type: "run_start", lane: "main", runId });
+
+const usage = { ...ZERO_USAGE, input: 2, output: 3, totalTokens: 5 } satisfies Usage;
+const entry = {
+	id: "entry",
+	parentId: null,
+	seq: 1,
+	timestamp: 2,
+	type: "custom",
+	customType: "fact",
+	data: { nested: { value: "original" } },
+} satisfies Entry;
+const row = { id: "usage", seq: 3, entryId: entry.id, adjustment: false, usage } satisfies UsageRow;
 
 const assistant = (
 	stopReason: AssistantMessage["stopReason"],
@@ -71,6 +86,76 @@ const runEndShapes = [
 ] satisfies RunEndEvent[];
 
 describe("D-058 runtime event registry", () => {
+	it("exports exact entry_added and usage shapes and deeply detaches their committed payloads", () => {
+		const events = registry();
+		const seenEntries: EntryAddedEvent[] = [];
+		const seenUsage: UsageEvent[] = [];
+		events.on("entry_added", (event) => {
+			seenEntries.push(event);
+		});
+		events.on("usage", (event) => {
+			seenUsage.push(event);
+		});
+		const sourceEntry = structuredClone(entry);
+		const sourceRow = structuredClone(row);
+		const sourceTotals = structuredClone(usage);
+		events.publish({ type: "entry_added", lane: "other", entry: sourceEntry });
+		events.publish({ type: "usage", lane: "other", row: sourceRow, totals: sourceTotals });
+		expect(seenEntries).toEqual([{ type: "entry_added", lane: "other", entry }]);
+		expect(seenUsage).toEqual([{ type: "usage", lane: "other", row, totals: usage }]);
+		const publishedEntry = seenEntries[0].entry;
+		if (publishedEntry.type !== "custom") throw new Error("Expected custom entry");
+		for (const value of [
+			seenEntries[0],
+			publishedEntry,
+			publishedEntry.data,
+			seenUsage[0],
+			seenUsage[0].row,
+			seenUsage[0].row.usage,
+			seenUsage[0].totals,
+		])
+			expect(Object.isFrozen(value)).toBe(true);
+		expect(seenEntries[0].entry).not.toBe(sourceEntry);
+		expect(seenUsage[0].row).not.toBe(sourceRow);
+		(sourceEntry.data as { nested: { value: string } }).nested.value = "source mutation";
+		sourceRow.usage.input = 99;
+		sourceTotals.output = 99;
+		expect(publishedEntry.data).toEqual({ nested: { value: "original" } });
+		expect(seenUsage[0]).toMatchObject({ row: { usage: { input: 2 } }, totals: { output: 3 } });
+	});
+
+	it.each(["entry_added", "usage"] as const)(
+		"bounds a failing %s listener without delaying its sibling",
+		async (type) => {
+			const events = registry();
+			const order: string[] = [];
+			const errors: HarnessEvent[] = [];
+			events.on("handler_error", (event) => {
+				errors.push(event);
+			});
+			events.on(type, () => {
+				order.push("failed");
+				throw new Error(`${type} failed`);
+			});
+			events.on(type, () => {
+				order.push("sibling");
+			});
+			if (type === "entry_added") events.publish({ type, lane: "main", entry });
+			else events.publish({ type, lane: "main", row, totals: usage });
+			expect(order).toEqual(["failed", "sibling"]);
+			await flush();
+			expect(errors).toEqual([
+				{
+					type: "handler_error",
+					kind: "event",
+					event: type,
+					lane: "main",
+					error: `${type} failed`,
+					stack: expect.any(String),
+				},
+			]);
+		},
+	);
 	it("accepts every public run_end outcome shape and deeply detaches and freezes nested payloads", () => {
 		const events = registry();
 		const seen: RunEndEvent[] = [];

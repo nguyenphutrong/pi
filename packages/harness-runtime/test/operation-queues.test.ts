@@ -971,12 +971,12 @@ describe("operation-owned queues", () => {
 				entryIds: [entryId],
 				classifications: [{ entryId, projection: "projecting" as const }],
 			};
-			expect(
-				await placeRuntimeWrites(prepared.runtimeSession, {
-					...transition,
-					expectedOperationStateSeq: transition.expectedOperationStateSeq + 1,
-				}),
-			).toMatchObject({ status: "obsolete" });
+			const obsolete = await placeRuntimeWrites(prepared.runtimeSession, {
+				...transition,
+				expectedOperationStateSeq: transition.expectedOperationStateSeq + 1,
+			});
+			expect(obsolete).toMatchObject({ status: "obsolete" });
+			expect(obsolete).not.toHaveProperty("facts");
 			await expect(
 				placeRuntimeWrites(prepared.runtimeSession, {
 					...transition,
@@ -1716,6 +1716,7 @@ describe("operation-owned queues", () => {
 				entryIds: consumed,
 				expectedOperationStateSeq: current.runState!.seq,
 			});
+			expect(result.facts?.map((fact) => (fact.kind === "entry" ? fact.entry.id : fact.kind))).toEqual(consumed);
 			const transaction = storage.committedTransactions[0];
 			let parentId = current.mainLeaf.value;
 			const expectedEntries = consumed.map((entryId, index) => {
@@ -1837,6 +1838,7 @@ describe("operation-owned queues", () => {
 			expectedOperationStateSeq: current.runState!.seq,
 		});
 		expect(result).toMatchObject({ committed: false, attachment: { runState: { seq: current.runState!.seq } } });
+		expect(result).not.toHaveProperty("facts");
 		expect(storage.committedTransactions).toHaveLength(0);
 		expect((await delegate.getRegister("op.state", operationId))?.seq).toBe(current.runState!.seq);
 		await closeAttachedRuntime(runtimeSession);

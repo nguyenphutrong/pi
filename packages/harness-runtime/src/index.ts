@@ -1,4 +1,5 @@
 export type {
+	EntryAddedEvent,
 	EventHandlerErrorEvent,
 	EventListener,
 	HandlerErrorEvent,
@@ -8,6 +9,7 @@ export type {
 	RunEndEvent,
 	RunStartEvent,
 	RuntimeEvents,
+	UsageEvent,
 } from "./events.ts";
 export type {
 	AfterToolHookInvocation,
