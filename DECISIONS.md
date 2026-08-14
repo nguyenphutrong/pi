@@ -1773,3 +1773,64 @@ The corrected independent design review reports PASS with no remaining finding a
 ### Outcome
 
 Commit `ee3fee2ee` implements D-059. RuntimeShell now publishes one exact detached `run_end` after an authoritative terminal attachment and before action resolution; all outcomes preserve the paired final-assistant contract, failed results include the hydrated detached final message, and reopen/close/stale paths follow the approved process-local boundary. Focused event/RuntimeShell tests pass 309/309, complete Harness passes 786/786, root check and diff check pass, and fresh independent final review reports PASS with no blocking finding.
+
+## D-060 — Return ordered committed entry and usage facts from mutation owners
+
+- Date: 2026-08-14
+- Phase: 5
+- Status: accepted after independent design review
+- References: D-050–D-055, D-058–D-059; `packages/agent/docs/harness-v3.md` §§3.4–3.13, 4.1–4.8, 5.4–5.5, 5.8, 9.1–9.3
+
+### Problem
+
+A spec-faithful `watch()` cannot be exposed over only `run_start`, `run_end`, and `handler_error`. A snapshot can become stale during its delivery gap when prompt acceptance, direct or deferred tree writes, queue consumption, assistant/tool settlement, abort, retry, or process-local effects mutate fields without a corresponding event. Reading or diffing a later `RuntimeAttachment` would replay hydrated history and create a second race. The prerequisite sequence is therefore committed entry/usage facts, queue/pending-write facts, control/retry lifecycle, process-local message/tool lifecycle, fault, authoritative snapshot construction, then watcher buffering and the public `watch()` surface.
+
+### Options
+
+1. Add watcher buffering now and document that only the current three event names are gap-free. This is not the §5.4 contract and would expose stale transcript, queue, pending-write, and operation state.
+2. Add ad-hoc publishers independently in every RuntimeShell procedure while keeping Session results unchanged. This avoids a private result seam but scatters the public mutation order and invites omission when one transaction creates multiple entries and usage.
+3. Have each successful mutation owner return an ordered, process-local commit-fact batch built from its own write plan and `CommitResult`; RuntimeShell installs the attachment and projects those facts through one publisher. The batch is neither an attachment diff nor durable state and contains no UI or serving concern.
+
+### Choice
+
+Option 3. The private Session/runtime-port result seam gains an immutable ordered `RuntimeCommitFact` batch permanently limited to `{ kind:"entry", entry }` and `{ kind:"usage", row, totals }`. RuntimeShell maps those facts to the exact public events below. Future queue/write/control prerequisites require separately reviewed private metadata rather than widening this union into a mirror of the public event catalog. No fact is stored, queried on reopen, exported from the package root, or used by recovery/planning.
+
+```ts
+type EntryAddedEvent = {
+  readonly type: "entry_added";
+  readonly lane: string;
+  readonly entry: Entry;
+};
+
+type UsageEvent = {
+  readonly type: "usage";
+  readonly lane: string;
+  readonly row: UsageRow;
+  readonly totals: Usage;
+};
+```
+
+Runtime is currently single-lane and emits `lane:"main"`; the new public types follow the v3 string lane contract rather than making that implementation limit permanent. `usage` remains the future all-lane-watcher delivery exception. D-058 detachment, deep freezing, FIFO-start listener snapshots, bounded handler failure, and content-free `pi.harness.event_handler` telemetry apply unchanged.
+
+Every authoritative result is complete before publication. Entry facts are constructed directly from the successful transaction's known entries plus assigned `seq`/`timestamp`, in write order. Usage facts contain the committed row plus exact session totals. Because `Storage.commit()` returns no totals, a usage-writing owner performs one bounded `Storage.getStats()` after commit while still holding the StoredSession mutation line; RuntimeShell never sums attachment rows. A stats-read failure rejects the transition, faults and seals RuntimeShell, and publishes no partial fact batch, while the already committed transaction remains recoverable after reopen. Close waits for an admitted commit-plus-stats procedure; close-first admits neither commit nor facts. This is the existing process-local delivery limitation, not a partial durable event. No Storage API or schema change is required.
+
+The complete currently reachable owner set is:
+
+- `RuntimeOwner.appendMessage` and `appendCustomEntry`: a placed idle write returns one entry fact; an active deferred admission returns none. Direct internal Session calls do not claim RuntimeShell event delivery.
+- `acceptPrompt`: committed captured `nextRun` entries first and normalized prompt entries second; stale, busy, unavailable, and failed commits return no facts.
+- `placeRuntimeWrites` and `consumeOperationQueue`: committed FIFO entries only; obsolete/noncommitted results return none.
+- `settleAssistantEffect`: a newly committed response entry then its usage; materialized, obsolete, and unsupported results return none.
+- `recoverAssistantEffect`: retry-only recovery returns none; a newly committed synthetic response returns entry then zero-usage facts.
+- `clearToolCall`: prepared clearance returns none; committed immediate, blocked, or cancelled settlement returns one result-entry fact.
+- `settleToolCall`: committed result entry followed by optional usage; normal, safe replay, and interrupted paths share this owner; obsolete returns none.
+- `recordUsage` remains unavailable and gains no API or fact owner in this slice; materialized repair is not a creator and never re-emits existing rows.
+
+RuntimeShell uses one private outcome publisher: install the authoritative attachment first, synchronously start an optional leading lifecycle event, then start each fact event in batch order, and only then resolve the calling procedure; listener promises remain unawaited. Prompt acceptance supplies `run_start` as the leading lifecycle event, so its exact postcommit order is `run_start → entry_added*`, matching the §5.5 lifecycle bracket. Other owners publish facts directly; assistant/tool settlement is `entry_added → usage`, and a later terminal transaction independently publishes `run_end`. The existing idle pump schedules callbacks only after the synchronous publication stack, so no idle callback overtakes the batch. Failed or obsolete commits may still publish a refreshed attachment internally but never facts.
+
+Reopen never replays entries or usage. A newly committed synthetic recovery settlement emits ordinary durable-fact events without `recovery:true`; an already materialized reservation emits none. Close-first produces no commit or fact. A commit admitted before close may complete publication after sealing. Process death after commit and before publication loses only process-local delivery and is reconciled through snapshot/state, not event replay.
+
+Required evidence covers: public type shapes and deep detachment; prompt with captured `nextRun` plus multiple prompt entries ordered after `run_start`; direct placed message/custom writes and active pending admission; deferred-write and steer/follow-up FIFO placement; normal and synthetic assistant entry-before-usage with exact totals; no replay for materialized/reopen cases; prepared versus immediate/cancelled tool clearance; currently supported normal, safe-replay, and synthetic-interruption tool settlement with optional usage; obsolete, failed-commit, postcommit-stats failure, and both close orders; unchanged transaction count/write lists; listener failure without fact reordering; and complete Harness/root checks plus fresh independent review. Tests do not manufacture unavailable public resume/watch behavior.
+
+D-060 does not add queue/write/control/retry/message/tool/fault events, snapshots, buffering, `watch()`, a durable log/cursor, attachment diffing, structural/multi-lane runtime behavior, Storage/schema changes, `pi-ai` changes, or record/reducer recovery. The private commit-fact seam is additive and incrementally extensible, not a public or durable contract; no §6 escalation is required.
+
+Independent design review reports PASS with no blocking finding. Its three boundary advisories—permanently narrow fact variants, exact stats-failure lifecycle, and currently supported replay/interruption test scope—are incorporated above.
