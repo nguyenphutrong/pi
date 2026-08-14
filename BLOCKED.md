@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. B-017 option 1 was implemented by `7b2266f0d` and passed fresh independent review.
+No active blockers. Phase 4.2e was implemented by `4643c85cf` and passed fresh independent review.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 

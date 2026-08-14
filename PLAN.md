@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.2e — Projector/context and planner integration
-- Status: D-054 design independently accepted; implement RuntimeShell-owned projection and the pure deferred-write planner action
-- Done bar: RuntimeShell projects the selected FIFO write prefix sequentially outside the mutation line, invokes atomic placement with exact authority, makes stale/fault/close behavior deterministic, projects committed custom entries identically into provider context, and planner order obeys writes-before-queues plus cancellation reconciliation without changing Storage or durable codecs
+- Work item: 4.2f — Representative SQLite deferred-write process-crash evidence
+- Status: Phase 4.2e committed by `4643c85cf` after full verification and fresh independent review PASS; design the smallest exact SQLite crash matrix for projecting and unprojected custom writes
+- Done bar: real SQLite subprocess deaths before and after deferred-write placement reopen deterministically with exact pending/entry/state/leaf/lease evidence, no duplicate projection or write, lawful fence takeover, and a final fresh no-op without adding a production seam
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Add the pure `apply_deferred_writes` planner action with exact running/cancelled order.
-2. Implement one RuntimeShell projection path for pending classification and committed provider context.
-3. Add stale projector, fault, abort, admission, and close interleaving coverage.
-4. Obtain fresh independent Phase 4.2e review and commit.
-5. Add representative SQLite deferred-write crash evidence.
+1. Design representative projecting/unprojected SQLite process-death prefixes and exact oracle.
+2. Implement the subprocess fixture and focused crash matrix without production hooks.
+3. Run complete Harness/SQLite verification, fresh independent review, and commit Phase 4.2f.
+4. Design `waitForIdle` and `runWhenIdle` settlement behavior against the Phase 4 queue state machine.
+5. Implement waiter/idle-callback lifecycle, abort, close, and recovery coverage.
 
 ## Phase order
 
