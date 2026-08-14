@@ -4,14 +4,14 @@
 
 - Phase: 5 — Hooks, events, and snapshots
 - Work item: 5.4 — Gap-free snapshot/subscription prerequisites
-- Status: D-060 committed-fact events are complete; design the separate queue/pending-write mutation metadata prerequisite without widening `RuntimeCommitFact`
-- Done bar: D-061 identifies every authoritative queue and pending-write snapshot mutation, fixes one exact private metadata/projection contract and ordering policy, passes independent design review, and still exposes neither snapshots nor `watch()`
+- Status: BLOCKED on B-018 — choose how the public event stream represents `cancelQueued(writeId)` removal from `LaneSnapshot.pendingWrites`
+- Done bar: after human selection, D-061 identifies every authoritative queue and pending-write snapshot mutation, fixes one exact private metadata/projection contract and ordering policy, passes independent design review, and still exposes neither snapshots nor `watch()`
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the watcher/snapshot contract and inventory exact queue and pending-write mutation owners and observable fields.
-2. Produce three bounded D-061 design options and choose the smallest seam that keeps committed entry/usage facts permanently narrow.
+1. Resolve B-018 by selecting the public pending-write removal contract.
+2. Record D-061 with the selected event shape and the verified mutation-owner matrix.
 3. Obtain fresh independent design review and correct every blocking finding before implementation.
 4. Implement and test the approved queue/pending-write slice, then run complete Harness and root verification.
 5. Checkpoint D-061, then design control/retry lifecycle prerequisites; do not expose snapshot/watch yet.

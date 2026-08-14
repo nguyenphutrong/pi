@@ -2,7 +2,33 @@
 
 ## Current status
 
-No active blockers. Phase 5.3 `run_end` passed full verification and fresh independent review in `ee3fee2ee`; resume at Phase 5.4 gap-free snapshot/subscription prerequisite design.
+Active blocker B-018. D-060 is complete in `d4a35a2b2`; Phase 5.4 pauses before D-061 because the specified public event catalog cannot represent cancellation of a pending tree write.
+
+## B-018 — Choose the pending-write removal event contract
+
+- Date: 2026-08-14
+- Phase: 5
+- Work item: 5.4 — queue/pending-write snapshot-gap prerequisite
+- Trigger: the spec permits `cancelQueued(writeId)` but defines no event that can remove that item from a remote client's `LaneSnapshot.pendingWrites`; resolving it changes the public event API and is therefore a major, hard-to-reverse §6 decision
+- Status: active; no D-061 design or implementation may be committed until a human selects the public contract
+
+### Context
+
+`harness-v3.md` §3.11 and the intentional D-051 implementation let `cancelQueued` atomically remove an id from `inbox.writes` and delete its `pending.entry` payload without creating an entry. A watcher snapshot exposes that item in `pendingWrites`. The §5.5 catalog provides only addition-shaped `write_pending { runId, entryId, entryType }`, while `queue_update` replaces only `steer`, `followUp`, and `nextRun`. No `entry_added` follows cancellation, and the watch contract has no refetch or toggle rule. A remote client that received the snapshot therefore cannot observe the removal.
+
+The complete mutation-owner inventory otherwise supports exact postcommit queue/write metadata without widening D-060's permanent `RuntimeCommitFact` union. Failed, stale, no-op, close-first, and reopen paths would emit nothing; an admitted commit may publish after close sealing; no durable log, Storage/schema change, attachment diff, recovery inference, or `pi-ai` change is needed.
+
+### Decision needed
+
+1. **Recommended:** preserve `write_pending` as the singular addition event and add `write_update { pendingWrites }`, carrying the complete authoritative pending-write collection after placement or cancellation. Queue mutations continue to use complete `queue_update` projections. This is additive and keeps the existing event meaning stable.
+2. Remodel `write_pending` to carry the complete `pendingWrites` collection on every addition, placement, and cancellation. This avoids a new event name but changes the specified payload and meaning more broadly.
+3. Keep the catalog unchanged and require clients to refetch after an otherwise-identical `queue_update`. This narrows §5.4, cannot identify a cancelled write from the event stream alone, and is not recommended.
+
+Reply with `1`, `2`, or `3`.
+
+### Resume point
+
+Record the selected public contract in D-061, obtain independent design PASS, then implement a separate immutable queue/pending-write metadata seam and exact postcommit projection. Do not widen `RuntimeCommitFact` or expose `watch()` in this slice.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 
