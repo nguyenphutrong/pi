@@ -403,7 +403,15 @@ async function hydrateCurrentState(
 		if (entry.type !== "message") throw new SessionError("corruption", `${name} must reference a message entry`);
 		return entry;
 	};
-	if (mainLeaf.value !== null) requireEntry(mainLeaf.value, "Main leaf");
+	const currentLeaf = mainLeaf.value === null ? undefined : requireEntry(mainLeaf.value, "Main leaf");
+	const permitsBoundedCustomTailAfter = (parentId: string): boolean => {
+		const parent = requireEntry(parentId, "Tail parent");
+		if (currentLeaf?.type !== "custom" || currentLeaf.parentId === null || currentLeaf.seq <= parent.seq)
+			return false;
+		if (currentLeaf.parentId === parentId) return true;
+		// Unnamed ancestry is outside bounded hydration; reject only a directly loaded, contradictory parent.
+		return !entryIds.has(currentLeaf.parentId);
+	};
 	if (runOperation && runState && triggerEntryId) {
 		const operation = runOperation.value;
 		const state = runState.value;
@@ -466,7 +474,7 @@ async function hydrateCurrentState(
 				"timestamp",
 			]);
 			if (
-				mainLeaf.value !== triggerEntryId ||
+				(mainLeaf.value !== triggerEntryId && !permitsBoundedCustomTailAfter(triggerEntryId)) ||
 				state.latestAssistantEntryId !== triggerEntryId ||
 				!isDeepStrictEqual(state.phase.error, expectedError) ||
 				triggerMessage.message.role !== "assistant" ||
@@ -538,10 +546,34 @@ async function hydrateCurrentState(
 					expectedToolParent = call.resultEntryId;
 				}
 			}
-			if (mainLeaf.value !== expectedToolParent)
+			if (
+				mainLeaf.value !== expectedToolParent &&
+				!(
+					state.control.status === "cancel_requested" &&
+					batch.calls.every((call) => call.status === "completed") &&
+					permitsBoundedCustomTailAfter(expectedToolParent)
+				)
+			)
 				throw new SessionError("corruption", "Tool batch lane leaf does not close its completed result prefix");
 		} else if (state.phase.kind === "checkpoint" || state.phase.kind === "assistant") {
-			if (mainLeaf.value !== triggerEntryId)
+			const latestAssistantId = state.latestAssistantEntryId;
+			const assistantRetryLeaf =
+				state.phase.kind === "assistant" &&
+				latestAssistantId !== null &&
+				latestAssistantId !== triggerEntryId &&
+				mainLeaf.value === latestAssistantId;
+			const cancelledAssistantTail =
+				state.phase.kind === "assistant" &&
+				state.control.status === "cancel_requested" &&
+				latestAssistantId !== null &&
+				latestAssistantId !== triggerEntryId &&
+				permitsBoundedCustomTailAfter(latestAssistantId);
+			if (
+				mainLeaf.value !== triggerEntryId &&
+				!permitsBoundedCustomTailAfter(triggerEntryId) &&
+				!assistantRetryLeaf &&
+				!cancelledAssistantTail
+			)
 				throw new SessionError("corruption", "Assistant trigger must close the current lane leaf");
 			if (state.phase.kind === "checkpoint" && state.phase.continuation.kind === "may_finish") {
 				const triggerMessage = requireMessageEntry(triggerEntryId, "Finishing checkpoint trigger");
@@ -552,8 +584,7 @@ async function hydrateCurrentState(
 						triggerMessage.message.stopReason === "aborted" &&
 						(state.control.status !== "cancel_requested" ||
 							typeof triggerMessage.message.errorMessage !== "string" ||
-							state.latestAssistantEntryId !== triggerEntryId ||
-							mainLeaf.value !== triggerEntryId)
+							state.latestAssistantEntryId !== triggerEntryId)
 					)
 						throw new SessionError("corruption", "Aborted generation has an invalid assistant closure");
 				}
@@ -571,7 +602,7 @@ async function hydrateCurrentState(
 			throw new SessionError("corruption", "Generation response and usage reservations must materialize together");
 		if (
 			response &&
-			(response.type !== "message" || response.message.role !== "assistant" || response.parentId !== triggerEntryId)
+			(response.type !== "message" || response.message.role !== "assistant" || response.parentId !== mainLeaf.value)
 		)
 			throw new SessionError("corruption", "Materialized response reservation has an invalid assistant closure");
 		if (usage && (usage.id !== usageId || usage.adjustment || usage.entryId !== responseEntryId))
@@ -1901,8 +1932,8 @@ export class StoredSession implements Session {
 				generation.usageId !== transition.usageId
 			)
 				return Object.freeze({ status: "obsolete" as const, attachment });
-			if (mainLeaf.value !== generation.context.triggerEntryId)
-				throw new SessionError("corruption", "Pending recovery no longer closes the current leaf");
+			if (mainLeaf.value === null) throw new SessionError("corruption", "Pending recovery has no current leaf");
+			const responseParentId = mainLeaf.value;
 			const capturedNow = Date.now();
 			let nextState: RunState;
 			if (
@@ -1987,7 +2018,7 @@ export class StoredSession implements Session {
 						kind: "entry",
 						entry: {
 							id: transition.responseEntryId,
-							parentId: generation.context.triggerEntryId,
+							parentId: responseParentId,
 							type: "message",
 							payload: encodeMessage(message),
 						},
@@ -2011,7 +2042,7 @@ export class StoredSession implements Session {
 				transition.responseEntryId,
 				Object.freeze({
 					id: transition.responseEntryId,
-					parentId: generation.context.triggerEntryId,
+					parentId: responseParentId,
 					seq: committed.seqs[0],
 					timestamp: committed.timestamp,
 					type: "message" as const,
@@ -2187,8 +2218,9 @@ export class StoredSession implements Session {
 				generation.contextWindow !== transition.contextWindow
 			)
 				return Object.freeze({ status: "obsolete" as const, attachment });
-			if (mainLeaf.value !== transition.triggerEntryId)
-				throw new SessionError("corruption", "Pending assistant effect no longer closes the current leaf");
+			if (mainLeaf.value === null)
+				throw new SessionError("corruption", "Pending assistant effect has no current leaf");
+			const responseParentId = mainLeaf.value;
 
 			const settledMessage: AssistantMessage =
 				runState.value.control.status === "cancel_requested"
@@ -2205,7 +2237,7 @@ export class StoredSession implements Session {
 					throw new SessionError("corruption", "Assistant settlement reservations materialized partially");
 				if (
 					response.type !== "message" ||
-					response.parentId !== transition.triggerEntryId ||
+					response.parentId !== responseParentId ||
 					!isDeepStrictEqual(response.message, settledMessage) ||
 					usage.entryId !== transition.responseEntryId ||
 					usage.adjustment ||
@@ -2291,7 +2323,7 @@ export class StoredSession implements Session {
 						kind: "entry",
 						entry: {
 							id: transition.responseEntryId,
-							parentId: transition.triggerEntryId,
+							parentId: responseParentId,
 							type: "message",
 							payload: encodeMessage(settledMessage),
 						},
@@ -2320,7 +2352,7 @@ export class StoredSession implements Session {
 				transition.responseEntryId,
 				Object.freeze({
 					id: transition.responseEntryId,
-					parentId: transition.triggerEntryId,
+					parentId: responseParentId,
 					seq: committed.seqs[0],
 					timestamp: committed.timestamp,
 					type: "message" as const,
@@ -2929,13 +2961,12 @@ export class StoredSession implements Session {
 				runState.value.inbox.followUp.length !== 0 ||
 				runState.value.inbox.writes.length !== 0 ||
 				mainLeaf.value === null ||
-				(completed && mainLeaf.value !== phase.triggerEntryId) ||
-				(failed && mainLeaf.value !== phase.provenance.entryId) ||
 				(completed &&
 					phase.kind === "checkpoint" &&
 					phase.continuation.kind === "may_finish" &&
 					phase.continuation.includeFinalAssistant &&
-					mainLeaf.value !== runState.value.latestAssistantEntryId) ||
+					phase.triggerEntryId !== runState.value.latestAssistantEntryId) ||
+				(failed && phase.provenance.entryId !== runState.value.latestAssistantEntryId) ||
 				(!cancelled && runState.value.latestAssistantEntryId === null)
 			)
 				throw new SessionError("corruption", "Run is not at a valid finish boundary");
@@ -2954,14 +2985,8 @@ export class StoredSession implements Session {
 				phase.kind !== "checkpoint" ||
 				phase.continuation.kind !== "may_finish" ||
 				phase.continuation.includeFinalAssistant;
-			if (
-				!cancelled &&
-				(finalEntry.type !== "message" ||
-					(includeFinalAssistant
-						? finalEntry.message.role !== "assistant"
-						: finalEntry.message.role !== "toolResult"))
-			)
-				throw new SessionError("corruption", "Final entry is missing or invalid");
+			if (!cancelled && includeFinalAssistant && latestEntry?.type !== "message")
+				throw new SessionError("corruption", "Final assistant entry is missing or invalid");
 
 			const [toolArgs, preparations] = await Promise.all([
 				this.#storage.listRegisters("op.tool_args"),
@@ -3013,14 +3038,14 @@ export class StoredSession implements Session {
 					kind: "run",
 					outcome: "failed",
 					leafId: mainLeaf.value,
-					finalAssistantEntryId: mainLeaf.value,
+					finalAssistantEntryId: runState.value.latestAssistantEntryId!,
 					error: structuredClone(phase.error),
 				});
 				result = Object.freeze({
 					operationId: transition.operationId,
 					kind: "failed",
 					leafId: mainLeaf.value,
-					finalEntryId: mainLeaf.value,
+					finalEntryId: runState.value.latestAssistantEntryId!,
 					error: structuredClone(phase.error),
 				});
 			} else {
@@ -3030,16 +3055,16 @@ export class StoredSession implements Session {
 						kind: "run",
 						outcome: "completed",
 						leafId: mainLeaf.value,
-						finalAssistantEntryId: mainLeaf.value,
+						finalAssistantEntryId: runState.value.latestAssistantEntryId!,
 						runCompletion: "assistant",
 					});
 					result = Object.freeze({
 						operationId: transition.operationId,
 						kind: "completed",
 						leafId: mainLeaf.value,
-						finalEntryId: mainLeaf.value,
+						finalEntryId: runState.value.latestAssistantEntryId!,
 						finalMessage: structuredClone(
-							requireStoredMessage(finalEntry, "Final assistant").message,
+							requireStoredMessage(latestEntry, "Final assistant").message,
 						) as AssistantMessage,
 					});
 				} else {

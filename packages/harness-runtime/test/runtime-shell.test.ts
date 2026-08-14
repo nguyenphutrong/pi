@@ -1193,6 +1193,49 @@ describe("D-019 no-tool ordered writer audit", () => {
 });
 
 describe("D-054 deferred-write projection", () => {
+	it("hydrates an unprojected custom tail and parents the provider response to that current leaf", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("need", state.createStorage());
+		const { models, lease } = availableModels();
+		vi.mocked(lease.streamSimple).mockReturnValue({ result: () => terminal() } as unknown as ReturnType<
+			ModelRequestLease["streamSimple"]
+		>);
+		const first = await createRuntimeShell(session(fixture.storage), config(), { models });
+		const customId = await first.session.appendCustomEntry("unprojected", { durable: true });
+		await expect(first.executeAction()).resolves.toMatchObject({ kind: "apply_deferred_writes" });
+		expect(await first.session.getLeafId()).toBe(customId);
+		await first.close();
+
+		const storage = state.createStorage();
+		const reopened = await createRuntimeShell(session(storage), config(), { models });
+		expect(await reopened.session.getLeafId()).toBe(customId);
+		await reopened.executeAction();
+		await reopened.executeAction();
+		await reopened.executeAction();
+		const [context] = vi.mocked(lease.streamSimple).mock.calls[0] as [Context];
+		expect(context.messages).toEqual([user("source"), user("prompt")]);
+		await reopened.executeAction();
+		await reopened.executeAction();
+		const operationState = (await storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		const responseId = operationState.latestAssistantEntryId;
+		if (responseId === null) throw new Error("settled response missing");
+		const response = (await storage.getEntries([responseId])).get(responseId);
+		expect(response).toMatchObject({ id: responseId, parentId: customId, type: "message" });
+		expect(await reopened.session.findEntriesOnBranch({ start: responseId, order: "oldestFirst" })).toMatchObject([
+			{ id: fixture.source },
+			{ id: fixture.prompt },
+			{ id: customId },
+			{ id: responseId },
+		]);
+		await expect(reopened.executeAction()).resolves.toMatchObject({ kind: "finish_run" });
+		expect((await storage.getRegister("lane.lastResult", "main"))?.value).toMatchObject({
+			outcome: "completed",
+			leafId: responseId,
+			finalAssistantEntryId: responseId,
+		});
+		await reopened.close();
+	});
+
 	it("captures the projector registry and exact function at construction", async () => {
 		const fixture = await rooted("need");
 		const captured = vi.fn(() => [user("captured")]);
@@ -1307,7 +1350,8 @@ describe("D-054 deferred-write projection", () => {
 	});
 
 	it("passes exact detached prospective custom views and preserves absent data versus null", async () => {
-		const fixture = await rooted("need");
+		const state = new MemoryStorageState();
+		const fixture = await rooted("need", state.createStorage());
 		const seen: Array<Record<string, unknown>> = [];
 		const projector = vi.fn((entry) => {
 			seen.push(entry as unknown as Record<string, unknown>);
@@ -1331,7 +1375,40 @@ describe("D-054 deferred-write projection", () => {
 		expect(durable.get(absent)).not.toHaveProperty("data");
 		expect(durable.get(nullable)).toHaveProperty("data", null);
 		await shell.close();
+
+		const reopened = await createRuntimeShell(session(state.createStorage()), config(), {
+			entryProjectors: { absent: projector, nullable: projector },
+		});
+		expect(await reopened.session.getLeafId()).toBe(nullable);
+		expect(await reopened.peekAction()).toMatchObject({ kind: "start_assistant_step" });
+		expect(projector).toHaveBeenCalledTimes(2);
+		await reopened.close();
 	});
+
+	it.each(["message", "custom"] as const)(
+		"rejects an unrelated %s lane leaf after the current trigger",
+		async (type) => {
+			const fixture = await rooted("need");
+			const unrelatedId = id();
+			await fixture.storage.commit({
+				writes: [
+					type === "message"
+						? {
+								kind: "entry",
+								entry: { id: unrelatedId, parentId: fixture.prompt, type, payload: json(user("unrelated")) },
+							}
+						: {
+								kind: "entry",
+								entry: { id: unrelatedId, parentId: fixture.source, type, customType: "unrelated" },
+							},
+					{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: unrelatedId },
+				],
+			});
+			await expect(createRuntimeShell(session(fixture.storage), config())).rejects.toMatchObject({
+				code: "corruption",
+			});
+		},
+	);
 
 	it.each([
 		["no projector", undefined, "unprojected"],
@@ -2045,6 +2122,52 @@ describe("Phase 1 runtime shell", () => {
 		expect(lease).not.toHaveBeenCalled();
 		expect(await shell.peekAction()).toMatchObject({ kind: "finish_failed_run" });
 		await shell.close();
+	});
+
+	it("recovers an assistant onto the current custom leaf and retains that assistant after a failed-run tail", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("pending", state.createStorage());
+		const firstCustomId = id();
+		await fixture.storage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: { id: firstCustomId, parentId: fixture.prompt, type: "custom", customType: "before-recovery" },
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: firstCustomId },
+			],
+		});
+		const models = createModels();
+		const lease = vi.spyOn(models, "lease");
+		const shell = await createRuntimeShell(session(fixture.storage), config(), { models });
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "recover_assistant_effect" });
+		expect(
+			(await fixture.storage.getEntries([fixture.reservedResponse])).get(fixture.reservedResponse),
+		).toMatchObject({
+			parentId: firstCustomId,
+			type: "message",
+		});
+
+		const finalCustomId = await shell.session.appendCustomEntry("after-failure");
+		await expect(shell.executeAction()).resolves.toMatchObject({
+			kind: "apply_deferred_writes",
+			entryIds: [finalCustomId],
+		});
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "finish_failed_run" });
+		expect((await fixture.storage.getRegister("lane.lastResult", "main"))?.value).toEqual({
+			operationId: fixture.operationId,
+			kind: "run",
+			outcome: "failed",
+			leafId: finalCustomId,
+			finalAssistantEntryId: fixture.reservedResponse,
+			error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+		});
+		expect(lease).not.toHaveBeenCalled();
+		await shell.close();
+
+		const reopened = await createRuntimeShell(session(state.createStorage()), config(), { models });
+		expect(await reopened.peekAction()).toBeUndefined();
+		await reopened.close();
 	});
 
 	it("crosses a below-cap durable retry boundary, then prepares fresh attempt-two reservations", async () => {
@@ -5707,6 +5830,41 @@ describe("Phase 1 runtime shell", () => {
 		expect(await reopened.peekAction()).toBeUndefined();
 		expect(reads).not.toContain("lane.lastResult/main");
 		await reopened.close();
+	});
+
+	it("finishes a may_finish checkpoint at an unprojected custom leaf while retaining the final assistant", async () => {
+		const fixture = await rooted("finish");
+		const customId = createIdGenerator().next(uuidV7Timestamp(fixture.response) + 1);
+		await fixture.storage.commit({
+			writes: [
+				{
+					kind: "entry",
+					entry: { id: customId, parentId: fixture.response, type: "custom", customType: "unprojected" },
+				},
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: customId },
+			],
+		});
+		const runtimeSession = session(fixture.storage);
+		const operationState = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const assistantEntry = (await fixture.storage.getEntries([fixture.response])).get(fixture.response)!;
+		const finished = await runtimeSession.finishRun({
+			operationId: fixture.operationId,
+			expectedOperationStateSeq: operationState.seq,
+		});
+		expect(finished).toMatchObject({
+			status: "committed",
+			result: {
+				kind: "completed",
+				leafId: customId,
+				finalEntryId: fixture.response,
+				finalMessage: assistantEntry.payload,
+			},
+		});
+		expect((await fixture.storage.getRegister("lane.lastResult", "main"))?.value).toMatchObject({
+			leafId: customId,
+			finalAssistantEntryId: fixture.response,
+		});
+		await runtimeSession.close();
 	});
 
 	it("deletes defensive operation prefixes in deterministic namespace/key order only", async () => {

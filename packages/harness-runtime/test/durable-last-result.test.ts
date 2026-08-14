@@ -24,6 +24,20 @@ describe("LaneLastResult codec", () => {
 		expect(decodeLaneLastResult(encoded).operationId).not.toBe(candidate.operationId);
 	});
 
+	it("allows a custom lane leaf after the completed or failed run's final assistant", () => {
+		const completed = { ...value(), leafId: id() };
+		const failed: LaneLastResult = {
+			operationId: id(),
+			kind: "run",
+			outcome: "failed",
+			leafId: id(),
+			finalAssistantEntryId: id(),
+			error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+		};
+		expect(decodeLaneLastResult(encodeLaneLastResult(completed))).toEqual(completed);
+		expect(decodeLaneLastResult(encodeLaneLastResult(failed))).toEqual(failed);
+	});
+
 	it("round-trips the exact failed-run shape without runCompletion", () => {
 		const finalAssistantEntryId = id();
 		const candidate: LaneLastResult = {
@@ -39,7 +53,6 @@ describe("LaneLastResult codec", () => {
 			{ ...candidate, runCompletion: "assistant" },
 			{ ...candidate, error: { ...candidate.error, extra: true } },
 			{ ...candidate, error: { code: 1, message: candidate.error.message } },
-			{ ...candidate, leafId: id() },
 		])
 			expect(() => decodeLaneLastResult(invalid)).toThrowError(expect.objectContaining({ code: "corruption" }));
 	});
@@ -80,7 +93,6 @@ describe("LaneLastResult codec", () => {
 		["invalid operation UUIDv7", (candidate: LaneLastResult) => ({ ...candidate, operationId: "not-a-uuid" })],
 		["invalid leaf UUIDv7", (candidate: LaneLastResult) => ({ ...candidate, leafId: "not-a-uuid" })],
 		["invalid final UUIDv7", (candidate: LaneLastResult) => ({ ...candidate, finalAssistantEntryId: "not-a-uuid" })],
-		["unequal leaf and final assistant", (candidate: LaneLastResult) => ({ ...candidate, leafId: id() })],
 	])("rejects %s", (_label, mutate) => {
 		expect(() => decodeLaneLastResult(mutate(value()))).toThrowError(expect.objectContaining({ code: "corruption" }));
 	});

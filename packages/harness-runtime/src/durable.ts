@@ -329,12 +329,6 @@ export function decodeLaneLastResult(value: unknown): LaneLastResult {
 		if (result.finalAssistantEntryId !== undefined)
 			uuid(result.finalAssistantEntryId, "lane last result finalAssistantEntryId");
 	} else fail("Unsupported lane last result outcome");
-	if (
-		result.outcome !== "aborted" &&
-		result.runCompletion !== "terminated_tools" &&
-		result.leafId !== result.finalAssistantEntryId
-	)
-		fail("Assistant lane last result leaf must equal its final assistant");
 	return result as unknown as LaneLastResult;
 }
 
