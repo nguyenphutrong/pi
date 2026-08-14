@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.3 — `waitForIdle` and `runWhenIdle`
-- Status: D-056 RuntimeShell-local idle coordinator design passed independent review; implement its authoritative registration, tracked reads, callback batch cutoff, reservation, release pump, and lifecycle settlement
-- Done bar: waiters and idle callbacks settle exactly once across prompt, queue, abort, terminal, fault, and close histories; callbacks never become durable work or run while the lane is active; fresh reopen derives only current durable state
+- Work item: Phase 4 final acceptance
+- Status: Phase 4.3 is complete at `26791c55f`; run an independent whole-phase conformance review and Recovery/QA gate before advancing to Phase 5
+- Done bar: every Phase 4 queue, deferred-write, idle-waiter, abort, close, and SQLite process-death history satisfies the spec with no forbidden durable or package-boundary regression
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement authoritative waiter/callback registration and the process-local idle pump in RuntimeShell.
-2. Split tracked read admission from reservation-aware state-mutation admission, including abort and manual drive.
-3. Add deterministic batch-cutoff, FIFO, callback-error, reentrancy, and terminal-order coverage.
-4. Add close/fault, tracked-read drain, and fresh-reopen coverage.
-5. Run complete Harness verification, fresh independent review, and commit Phase 4.3.
+1. Re-read the Phase 4 queue, deferred-write, abort, idle-control, race-catalog, and testing-tier sections as one acceptance contract.
+2. Run Recovery/QA across the complete Harness suite and the real SQLite queue/deferred-write process-death matrices.
+3. Run a fresh independent whole-phase review against D-047 through D-056 and the Phase 4 done bar.
+4. Record and commit Phase 4 final acceptance if both gates pass.
+5. Begin Phase 5 with a narrow hooks/events/snapshots design slice; do not combine all three surfaces in one increment.
 
 ## Phase order
 
