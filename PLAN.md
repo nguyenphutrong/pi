@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 5 — Hooks, events, and snapshots
-- Work item: 5.2 — Passive events foundation
-- Status: corrected D-058 `run_start` + `handler_error` foundation passed independent design review; implement the typed process-local registry and exact RuntimeShell publication seams
-- Done bar: `run_start` publishes only after accepted prompt durability; hook/listener failures publish bounded `handler_error`; typed FIFO-start listener snapshots, detachment, lifecycle registration, and content-free telemetry are isolated from execution; no other event or snapshot/watch surface yet
+- Work item: 5.3 — First public event-catalog increment
+- Status: Phase 5.2 passive events foundation is committed and independently accepted; design the next smallest event set around explicit durable commit owners before adding snapshots or `watch()`
+- Done bar: every selected event has one explicit publication owner and durable visibility boundary, remains passive and content-safe, and introduces no durable event log or premature snapshot/watch contract
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement the typed passive registry, frozen `RuntimeShell.events.on`, and private publisher.
-2. Bind D-057's private hook-error reporter and publish `run_start` after successful prompt acceptance only.
-3. Add registry plus RuntimeShell ordering, failure, close/fault, reopen, telemetry, and zero-write evidence.
-4. Run full Harness/root verification and fresh independent review.
-5. Checkpoint Phase 5.2, then design explicit owners for the next event-catalog increment before snapshots/watch.
+1. Re-read the event catalog and current RuntimeShell commit owners; design the smallest coherent public increment.
+2. Obtain an independent design review before exposing additional event names or payloads.
+3. Implement only the approved publications and public type additions.
+4. Add independent ordering, failure, lifecycle, and zero-extra-write evidence; run full verification and fresh review.
+5. Checkpoint Phase 5.3, then design gap-free snapshots/subscriptions before exposing `watch()`.
 
 ## Phase order
 

@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Phase 5.1 tool hooks passed full verification and fresh independent review in `6de414f5d`; resume at Phase 5.2 passive-event foundation design.
+No active blockers. Phase 5.2 passive events passed full verification and fresh independent review in `3b72872b1`; resume at Phase 5.3 first public event-catalog design.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 
