@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 5 — Hooks, events, and snapshots
-- Work item: 5.1 — Hook pipeline foundation
-- Status: D-057 tool-hook registry design passed corrected independent review; implement the behavior-preserving agent-loop validator seam before RuntimeShell registry integration
-- Done bar: `before_tool` and `after_tool` run as typed FIFO aggregate pipelines with exact validation, reporting, telemetry, durability, abort, close, and reopen semantics; no future hook names or public event/watch surface
+- Work item: 5.2 — Passive events foundation
+- Status: Phase 5.1 tool-hook pipeline is committed and independently accepted; design the smallest passive event slice that binds the private hook-error reporter without adding snapshots or `watch()` early
+- Done bar: typed passive listeners are isolated from execution, handler failures emit bounded `handler_error` observation plus content-free telemetry, and publication occurs only at owned process-local or postcommit boundaries; no snapshot/watch surface yet
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Extract additive before/after callback-output normalizers in `pi-agent-loop` without changing existing behavior; test and independently review the refactor.
-2. Add the tool-only typed registry, private handler-error reporter, and canonical hook telemetry in `harness-runtime`.
-3. Replace RuntimeShell singleton tool callbacks with `hooks.on` aggregation and remove the temporary options without a compatibility shim.
-4. Add Tier A/B/C FIFO snapshot, validation, reporter, telemetry, durability, abort, close, and reopen evidence.
-5. Run full Harness/root verification and fresh independent review before beginning passive events.
+1. Re-read the passive-event, lifecycle ordering, abort/close, and telemetry sections; design event ownership and publication boundaries around the current RuntimeShell procedures.
+2. Obtain an independent design review before exposing any event names or public registry surface.
+3. Implement the smallest typed passive registry and bind D-057's private hook-error reporter to `handler_error`.
+4. Add isolated-listener ordering, failure, close/fault, and postcommit publication evidence for only the reachable event subset.
+5. Run full Harness/root verification and fresh independent review before designing snapshots and subscription gap prevention.
 
 ## Phase order
 
