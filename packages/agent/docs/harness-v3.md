@@ -1900,7 +1900,7 @@ Skill/template expansion precedes storage. Prompt intent names only normalized c
 
 `waitForIdle()` registers on the lane mutation line and resolves when all earlier admitted lane jobs have settled, `currentOperationId` is null, and no process-local operation/admission reservation is held. Later operations may start immediately after it resolves. Multiple waiters resolve together; close/fault rejects pending waiters.
 
-`runWhenIdle(callback)` waits by the same rule, then takes a process-local lane admission reservation for the callback. The reservation is released on return or throw; callback rejection propagates. The callback must not invoke a state-mutating method on the same lane, which would deadlock behind its own reservation. Close rejects callbacks not yet started and waits for an already-running callback, which cannot be forcibly interrupted.
+`runWhenIdle(callback)` waits by the same rule, then takes a process-local lane admission reservation for the callback. The reservation is released on return or throw; callback rejection propagates. A state-mutating method invoked from that callback fails immediately with `RuntimeShellError("active", ...)` instead of waiting behind its own reservation; lane reads remain available. Close rejects callbacks not yet started and waits for an already-running callback, which cannot be forcibly interrupted.
 
 ### Results and errors
 

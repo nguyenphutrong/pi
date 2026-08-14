@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from "node:async_hooks";
 import type {
 	AssistantMessage,
 	Context,
@@ -59,7 +60,7 @@ import {
 } from "./session.ts";
 import type { EntryProjector, ProjectableCustomEntry, Session, SessionTree } from "./types.ts";
 
-export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed" | "fault";
+export type RuntimeShellErrorCode = "unavailable" | "busy" | "active" | "stale" | "closed" | "fault";
 
 export class RuntimeShellError extends Error {
 	readonly code: RuntimeShellErrorCode;
@@ -168,6 +169,20 @@ type ToolEffectState =
 	  }
 	| { readonly status: "finalized"; readonly plan: ToolEffectPlan; readonly finalized: FinalizedToolCallOutcome };
 
+interface IdleWaiter {
+	eligible: boolean;
+	readonly resolve: () => void;
+	readonly reject: (error: RuntimeShellError) => void;
+}
+
+interface IdleCallback {
+	eligible: boolean;
+	started: boolean;
+	readonly callback: () => void | Promise<void>;
+	readonly resolve: () => void;
+	readonly reject: (error: unknown) => void;
+}
+
 function bindRuntimeTool<TContext extends object | undefined, TParameters extends TSchema, TDetails>(
 	definition: RuntimeToolDefinition<TContext, TParameters, TDetails>,
 	context: TContext,
@@ -247,6 +262,14 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	#sealed = false;
 	#fault: RuntimeShellError | undefined;
 	#admissionLine: Promise<void> = Promise.resolve();
+	#reservation: Promise<void> | undefined;
+	readonly #idleCallbackContext = new AsyncLocalStorage<symbol>();
+	readonly #idleCallbackToken = Symbol("idle callback");
+	readonly #idleWaiters: IdleWaiter[] = [];
+	readonly #idleCallbacks: IdleCallback[] = [];
+	#runningIdleBatch: readonly IdleCallback[] = [];
+	readonly #trackedReads = new Set<Promise<unknown>>();
+	readonly #trackedAborts = new Set<Promise<unknown>>();
 	#closePromise: Promise<void> | undefined;
 	readonly #shutdownNotice: Promise<void>;
 	readonly #notifyShutdown: () => void;
@@ -260,35 +283,35 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		this.#session = session;
 		this.#owner = owner;
 		const facade: SessionTree = {
-			getLeafId: () => this.#admit(() => session.getLeafId()),
+			getLeafId: () => this.#admitRead(() => session.getLeafId()),
 			getEntry: (id) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryId(id),
 					(captured) => session.getEntry(captured),
 				),
 			getEntries: (ids) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryIds(ids),
 					(captured) => session.getEntries(captured),
 				),
-			getStats: () => this.#admit(() => session.getStats()),
+			getStats: () => this.#admitRead(() => session.getStats()),
 			findEntries: (query) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryQuery(query === undefined ? {} : query, false),
 					(captured) => session.findEntries(captured),
 				),
 			findEntry: (query) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryQuery(query === undefined ? {} : query, false),
 					(captured) => session.findEntry(captured),
 				),
 			findEntriesOnBranch: (query) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryQuery(query === undefined ? {} : query, true),
 					(captured) => session.findEntriesOnBranch(captured),
 				),
 			findEntryOnBranch: (query) =>
-				this.#captureThenAdmit(
+				this.#captureThenRead(
 					() => captureEntryQuery(query === undefined ? {} : query, true),
 					(captured) => session.findEntryOnBranch(captured),
 				),
@@ -388,6 +411,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				...Array.from(candidate.usageRows.values(), (usage) => usage.seq),
 			);
 		if (highWaterMark(attachment) >= highWaterMark(this.#current)) this.#current = attachment;
+		this.#pumpIdle();
 	}
 
 	#abortRunningEffects(): void {
@@ -398,6 +422,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	#faultShell(effectKey: string | undefined, cause: unknown, message: string): RuntimeShellError {
 		if (!this.#fault) this.#fault = new RuntimeShellError("fault", message, cause);
 		this.#sealed = true;
+		this.#rejectIdleRecords(this.#fault);
 		this.#notifyShutdown();
 		this.#abortRunningEffects();
 		if (effectKey !== undefined) this.#assistantEffects.delete(effectKey);
@@ -454,6 +479,20 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		}
 	}
 
+	#captureThenRead<TCapture, TResult>(
+		capture: () => TCapture,
+		operation: (captured: TCapture) => Promise<TResult>,
+	): Promise<TResult> {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		try {
+			const captured = capture();
+			return this.#admitRead(() => operation(captured));
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}
+
 	#lifecycleError(): RuntimeShellError | undefined {
 		if (this.#fault) return this.#fault;
 		if (this.#sealed) return new RuntimeShellError("closed", "Runtime shell is closed");
@@ -463,7 +502,15 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	#admit<T>(operation: () => Promise<T> | T): Promise<T> {
 		const lifecycleError = this.#lifecycleError();
 		if (lifecycleError) return Promise.reject(lifecycleError);
-		const admitted = this.#admissionLine.then(() => {
+		if (this.#idleCallbackContext.getStore() === this.#idleCallbackToken)
+			return Promise.reject(new RuntimeShellError("active", "Idle callback cannot mutate runtime state"));
+		return this.#admitMarker(operation);
+	}
+
+	#admitMarker<T>(operation: () => Promise<T> | T): Promise<T> {
+		const admitted = this.#admissionLine.then(async () => {
+			if (this.#fault) throw this.#fault;
+			if (this.#reservation) await this.#reservation;
 			if (this.#fault) throw this.#fault;
 			return operation();
 		});
@@ -474,8 +521,127 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return admitted;
 	}
 
+	#admitRead<T>(operation: () => Promise<T> | T): Promise<T> {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		const read = Promise.resolve().then(() => {
+			if (this.#fault) throw this.#fault;
+			return operation();
+		});
+		this.#trackedReads.add(read);
+		void read.then(
+			() => this.#trackedReads.delete(read),
+			() => this.#trackedReads.delete(read),
+		);
+		return read;
+	}
+
+	#rejectIdleRecords(error: RuntimeShellError): void {
+		for (const waiter of this.#idleWaiters.splice(0)) waiter.reject(error);
+		for (const record of this.#idleCallbacks.splice(0)) if (!record.started) record.reject(error);
+		for (const record of this.#runningIdleBatch) if (!record.started) record.reject(error);
+	}
+
+	#pumpIdle(): void {
+		if (this.#sealed || this.#fault || this.#reservation || this.#current.laneState.value.currentOperationId !== null)
+			return;
+		for (let index = this.#idleWaiters.length - 1; index >= 0; index--) {
+			const waiter = this.#idleWaiters[index];
+			if (!waiter?.eligible) continue;
+			this.#idleWaiters.splice(index, 1);
+			waiter.resolve();
+		}
+		const batch: IdleCallback[] = [];
+		while (this.#idleCallbacks[0]?.eligible) {
+			const record = this.#idleCallbacks.shift();
+			if (record) batch.push(record);
+		}
+		if (batch.length === 0) return;
+		let release!: () => void;
+		this.#reservation = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		this.#runningIdleBatch = batch;
+		void Promise.resolve().then(async () => {
+			try {
+				for (const record of batch) {
+					const lifecycleError = this.#lifecycleError();
+					if (lifecycleError) {
+						record.reject(lifecycleError);
+						continue;
+					}
+					record.started = true;
+					try {
+						await this.#idleCallbackContext.run(this.#idleCallbackToken, record.callback);
+						record.resolve();
+					} catch (error) {
+						record.reject(error);
+					}
+				}
+			} finally {
+				this.#runningIdleBatch = [];
+				this.#reservation = undefined;
+				release();
+				this.#pumpIdle();
+			}
+		});
+	}
+
+	waitForIdle(): Promise<void> {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		let resolve!: () => void;
+		let reject!: (error: RuntimeShellError) => void;
+		const promise = new Promise<void>((onResolve, onReject) => {
+			resolve = onResolve;
+			reject = onReject;
+		});
+		const record: IdleWaiter = { eligible: false, resolve, reject };
+		this.#idleWaiters.push(record);
+		void this.#admitMarker(async () => {
+			const attachment = await refreshRuntimeAttachment(this.#session).catch((cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			});
+			this.#publish(attachment);
+			record.eligible = true;
+			this.#pumpIdle();
+		}).catch((error: unknown) => {
+			const index = this.#idleWaiters.indexOf(record);
+			if (index >= 0) this.#idleWaiters.splice(index, 1);
+			reject(error instanceof RuntimeShellError ? error : this.#transitionFailure(error));
+		});
+		return promise;
+	}
+
+	runWhenIdle(callback: () => void | Promise<void>): Promise<void> {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		if (typeof callback !== "function") return Promise.reject(new TypeError("Idle callback must be a function"));
+		let resolve!: () => void;
+		let reject!: (error: unknown) => void;
+		const promise = new Promise<void>((onResolve, onReject) => {
+			resolve = onResolve;
+			reject = onReject;
+		});
+		const record: IdleCallback = { eligible: false, started: false, callback, resolve, reject };
+		this.#idleCallbacks.push(record);
+		void this.#admitMarker(async () => {
+			const attachment = await refreshRuntimeAttachment(this.#session).catch((cause: unknown) => {
+				throw this.#transitionFailure(cause);
+			});
+			this.#publish(attachment);
+			record.eligible = true;
+			this.#pumpIdle();
+		}).catch((error: unknown) => {
+			const index = this.#idleCallbacks.indexOf(record);
+			if (index >= 0) this.#idleCallbacks.splice(index, 1);
+			reject(error instanceof RuntimeShellError ? error : this.#transitionFailure(error));
+		});
+		return promise;
+	}
+
 	peekAction(): Promise<ActionInfo | undefined> {
-		return this.#admit(() => this.#plan()?.info);
+		return this.#admitRead(() => this.#plan()?.info);
 	}
 
 	executeAction(): Promise<ActionInfo | undefined> {
@@ -1245,25 +1411,33 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		readonly drainedSteer: readonly Message[];
 		readonly drainedFollowUp: readonly Message[];
 	}> {
-		if (this.#fault) return Promise.reject(this.#fault);
-		if (this.#sealed) return Promise.reject(new RuntimeShellError("closed", "Runtime shell is closed"));
-		return requestAbort(this.#session, (attachment) => {
-			this.#publish(attachment);
-			this.#abortRunningEffects();
-		}).then(
-			(result) => {
-				this.#publish(result.attachment);
-				if (result.status === "no_active") throw new RuntimeShellError("unavailable", "No active operation");
-				return Object.freeze({
-					operationId: result.operationId,
-					drainedSteer: cloneFrozen(result.drainedSteer),
-					drainedFollowUp: cloneFrozen(result.drainedFollowUp),
-				});
-			},
-			(cause: unknown) => {
+		const lifecycleError = this.#lifecycleError();
+		if (lifecycleError) return Promise.reject(lifecycleError);
+		if (this.#idleCallbackContext.getStore() === this.#idleCallbackToken)
+			return Promise.reject(new RuntimeShellError("active", "Idle callback cannot abort the runtime"));
+		const abort = (async () => {
+			while (this.#reservation) await this.#reservation;
+			if (this.#fault) throw this.#fault;
+			const result = await requestAbort(this.#session, (attachment) => {
+				this.#publish(attachment);
+				this.#abortRunningEffects();
+			}).catch((cause: unknown) => {
 				throw this.#transitionFailure(cause);
-			},
+			});
+			this.#publish(result.attachment);
+			if (result.status === "no_active") throw new RuntimeShellError("unavailable", "No active operation");
+			return Object.freeze({
+				operationId: result.operationId,
+				drainedSteer: cloneFrozen(result.drainedSteer),
+				drainedFollowUp: cloneFrozen(result.drainedFollowUp),
+			});
+		})();
+		this.#trackedAborts.add(abort);
+		void abort.then(
+			() => this.#trackedAborts.delete(abort),
+			() => this.#trackedAborts.delete(abort),
 		);
+		return abort;
 	}
 
 	prompt(input: Message | readonly Message[]): Promise<RuntimeAttachment> {
@@ -1379,17 +1553,23 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 
 	close(): Promise<void> {
 		if (this.#closePromise) return this.#closePromise;
+		if (this.#idleCallbackContext.getStore() === this.#idleCallbackToken)
+			return Promise.reject(new RuntimeShellError("active", "Idle callback cannot close the runtime"));
 		this.#sealed = true;
+		this.#rejectIdleRecords(new RuntimeShellError("closed", "Runtime shell is closed"));
 		this.#notifyShutdown();
 		this.#abortRunningEffects();
-		this.#closePromise = this.#admissionLine.then(() => {
+		this.#closePromise = this.#admissionLine.then(async () => {
+			if (this.#reservation) await this.#reservation;
+			await Promise.allSettled([...this.#trackedAborts]);
+			await Promise.allSettled([...this.#trackedReads]);
 			this.#abortRunningEffects();
 			this.#assistantEffects.clear();
 			this.#toolEffects.clear();
 			this.#toolBatches.clear();
 			this.#preparedTools.clear();
 			this.#retryElapsed.clear();
-			return this.#owner.close();
+			await this.#owner.close();
 		});
 		return this.#closePromise;
 	}

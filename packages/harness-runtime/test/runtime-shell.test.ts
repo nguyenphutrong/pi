@@ -156,7 +156,7 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		await shell.close();
 	});
 
-	it("serializes reads after an admitted façade write and lets close wait for that write", async () => {
+	it("captures reads independently of an admitted façade write and lets close drain both", async () => {
 		const fixture = await rooted("idle");
 		const storage = instrumentStorage(fixture.storage);
 		const shell = await createRuntimeShell(session(storage), config());
@@ -180,17 +180,12 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		};
 		const append = shell.session.appendMessage(user("ordered"));
 		await admitted;
-		let readSettled = false;
-		const read = shell.session.getLeafId().then((value) => {
-			readSettled = true;
-			return value;
-		});
+		const read = shell.session.getLeafId();
 		const close = shell.close();
-		await Promise.resolve();
-		expect(readSettled).toBe(false);
+		await expect(read).resolves.toBeNull();
 		release();
 		const entryId = await append;
-		await expect(read).resolves.toBe(entryId);
+		expect(entryId).toEqual(expect.any(String));
 		await close;
 	});
 
@@ -229,11 +224,11 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		cursor.seq = 99;
 		branch.start = id();
 		branch.stopAtId = id();
+		expect((await entries).has(existingId)).toBe(true);
+		expect(await global).toHaveLength(1);
+		expect(await onBranch).toHaveLength(1);
 		release();
 		await append;
-		expect((await entries).has(existingId)).toBe(true);
-		expect(await global).toHaveLength(2);
-		expect(await onBranch).toHaveLength(1);
 		await shell.close();
 	});
 
@@ -583,6 +578,378 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		await close;
 		expect(closeStorage).toHaveBeenCalledTimes(1);
 		expect(shell.close()).toBe(close);
+	});
+});
+
+describe("D-056 RuntimeShell idle coordination", () => {
+	it("resolves idle immediately, resolves simultaneous active waiters at one terminal point, and permits a later operation", async () => {
+		const idleFixture = await rooted("idle");
+		const idle = await createRuntimeShell(session(idleFixture.storage), config());
+		await expect(idle.waitForIdle()).resolves.toBeUndefined();
+		await idle.close();
+
+		const fixture = await rooted("finish");
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(fixture.storage), config(), { models });
+		const events: string[] = [];
+		const first = shell.waitForIdle().then(() => events.push("first"));
+		const second = shell.waitForIdle().then(() => events.push("second"));
+		await shell.executeAction();
+		await Promise.all([first, second]);
+		expect(events.sort()).toEqual(["first", "second"]);
+		await expect(shell.prompt(user("after idle"))).resolves.toMatchObject({
+			runOperation: { value: { intent: { kind: "run" } } },
+		});
+		await shell.close();
+	});
+
+	it("runs callbacks FIFO with a batch cutoff and isolates sync throws and async rejections", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		const events: string[] = [];
+		let nested!: Promise<void>;
+		const first = shell.runWhenIdle(() => {
+			events.push("first");
+			nested = shell.runWhenIdle(() => {
+				events.push("nested");
+			});
+		});
+		const syncFailure = new Error("sync callback failure");
+		const second = shell.runWhenIdle(() => {
+			events.push("second");
+			throw syncFailure;
+		});
+		const asyncFailure = new Error("async callback failure");
+		const third = shell.runWhenIdle(async () => {
+			events.push("third");
+			throw asyncFailure;
+		});
+		const fourth = shell.runWhenIdle(() => {
+			events.push("fourth");
+		});
+		await expect(first).resolves.toBeUndefined();
+		await expect(second).rejects.toBe(syncFailure);
+		await expect(third).rejects.toBe(asyncFailure);
+		await expect(fourth).resolves.toBeUndefined();
+		expect(events).toEqual(["first", "second", "third", "fourth"]);
+		await nested;
+		expect(events).toEqual(["first", "second", "third", "fourth", "nested"]);
+		await shell.close();
+	});
+
+	it("allows callback reads and fails awaited and fire-and-forget same-lane mutations fast as active", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		let detached!: Promise<unknown>;
+		await expect(
+			shell.runWhenIdle(async () => {
+				await expect(shell.session.getLeafId()).resolves.toBeNull();
+				detached = shell.session.appendCustomEntry("detached");
+				await expect(shell.prompt(user("awaited"))).rejects.toMatchObject({ code: "active" });
+			}),
+		).resolves.toBeUndefined();
+		await expect(detached).rejects.toMatchObject({ code: "active" });
+		await shell.close();
+	});
+
+	it("gives a callback marker ordered before a mutation the idle reservation first", async () => {
+		const fixture = await rooted("finish");
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(fixture.storage), config(), { models });
+		const events: string[] = [];
+		const finish = shell.executeAction();
+		const callback = shell.runWhenIdle(() => {
+			events.push("C2");
+		});
+		const mutation = shell.prompt(user("M")).then(() => events.push("M"));
+		await Promise.all([finish, callback, mutation]);
+		expect(events).toEqual(["C2", "M"]);
+		await shell.close();
+	});
+
+	it("runs a mutation ordered before a callback marker before reevaluating idle", async () => {
+		const fixture = await rooted("finish");
+		const { models } = availableModels();
+		const shell = await createRuntimeShell(session(fixture.storage), config(), { models });
+		const events: string[] = [];
+		const finish = shell.executeAction();
+		const mutation = shell.prompt(user("M")).then(() => events.push("M"));
+		let callbackRan = false;
+		const callback = shell.runWhenIdle(() => {
+			callbackRan = true;
+			events.push("C2");
+		});
+		await Promise.all([finish, mutation]);
+		expect(events).toEqual(["M"]);
+		expect(callbackRan).toBe(false);
+		await shell.abort();
+		await shell.runToCompletion();
+		await callback;
+		expect(events).toEqual(["M", "C2"]);
+		await shell.close();
+	});
+
+	it.each(["manual", "abort"] as const)(
+		"publishes %s terminal progress to waiters and callbacks without idle-only writes",
+		async (kind) => {
+			const fixture = await rooted("finish");
+			const storage = instrumentStorage(fixture.storage);
+			const shell = await createRuntimeShell(session(storage), config());
+			storage.committedTransactions.length = 0;
+			const events: string[] = [];
+			const waiter = shell.waitForIdle().then(() => events.push("waiter"));
+			const callback = shell.runWhenIdle(() => {
+				events.push("callback");
+			});
+			if (kind === "abort") await shell.abort();
+			await shell.runToCompletion();
+			await Promise.all([waiter, callback]);
+			expect(events).toEqual(["waiter", "callback"]);
+			expect(storage.committedTransactions.length).toBe(kind === "abort" ? 2 : 1);
+			await shell.close();
+		},
+	);
+
+	it("keeps idle-callback reservation ahead of abort and rejects unavailable only after the callback completes", async () => {
+		const fixture = await rooted("idle");
+		const raw = session(fixture.storage);
+		const requestAbort = vi.spyOn(raw, "requestAbort");
+		const shell = await createRuntimeShell(raw, config());
+		const events: string[] = [];
+		let releaseCallback!: () => void;
+		let enterCallback!: () => void;
+		const callbackEntered = new Promise<void>((resolve) => {
+			enterCallback = resolve;
+		});
+		const callbackGate = new Promise<void>((resolve) => {
+			releaseCallback = resolve;
+		});
+		const callback = shell.runWhenIdle(async () => {
+			events.push("callback:start");
+			enterCallback();
+			await callbackGate;
+			events.push("callback:end");
+		});
+		await callbackEntered;
+		const abort = shell.abort().then(
+			() => events.push("abort:resolved"),
+			(error: unknown) => {
+				events.push("abort:rejected");
+				throw error;
+			},
+		);
+		await Promise.resolve();
+		expect(requestAbort).not.toHaveBeenCalled();
+		expect(events).toEqual(["callback:start"]);
+		releaseCallback();
+		await callback;
+		await expect(abort).rejects.toMatchObject({ code: "unavailable" });
+		expect(requestAbort).toHaveBeenCalledTimes(1);
+		expect(events).toEqual(["callback:start", "callback:end", "abort:rejected"]);
+		await shell.close();
+	});
+
+	it("drains an admitted gated abort before owner close", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const events: string[] = [];
+		const commit = storage.commit.bind(storage);
+		const ownerClose = storage.close.bind(storage);
+		let releaseCommit!: () => void;
+		let enterCommit!: () => void;
+		const commitEntered = new Promise<void>((resolve) => {
+			enterCommit = resolve;
+		});
+		const commitGate = new Promise<void>((resolve) => {
+			releaseCommit = resolve;
+		});
+		storage.commit = async (transaction) => {
+			events.push("abort:commit:start");
+			enterCommit();
+			await commitGate;
+			const result = await commit(transaction);
+			events.push("abort:commit:end");
+			return result;
+		};
+		storage.close = async () => {
+			events.push("owner:close");
+			return ownerClose();
+		};
+		const shell = await createRuntimeShell(session(storage), config());
+		const abort = shell.abort().then((result) => {
+			events.push("abort:resolved");
+			return result;
+		});
+		await commitEntered;
+		const close = shell.close().then(() => events.push("close:resolved"));
+		expect(events).toEqual(["abort:commit:start"]);
+		releaseCommit();
+		await abort;
+		await close;
+		expect(events).toEqual([
+			"abort:commit:start",
+			"abort:commit:end",
+			"abort:resolved",
+			"owner:close",
+			"close:resolved",
+		]);
+	});
+
+	it("rejects abort and close called inside an idle callback, then permits external close", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		const events: string[] = [];
+		await expect(
+			shell.runWhenIdle(async () => {
+				events.push("callback:start");
+				await expect(shell.abort()).rejects.toMatchObject({ code: "active" });
+				await expect(shell.close()).rejects.toMatchObject({ code: "active" });
+				events.push("callback:end");
+			}),
+		).resolves.toBeUndefined();
+		expect(events).toEqual(["callback:start", "callback:end"]);
+		await expect(shell.close()).resolves.toBeUndefined();
+	});
+
+	it("close before idle admission rejects registrations and still drains the earlier admitted mutation", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const ownerClose = vi.spyOn(storage, "close");
+		const commit = storage.commit.bind(storage);
+		let releaseCommit!: () => void;
+		let enterCommit!: () => void;
+		const commitEntered = new Promise<void>((resolve) => {
+			enterCommit = resolve;
+		});
+		const commitGate = new Promise<void>((resolve) => {
+			releaseCommit = resolve;
+		});
+		storage.commit = async (transaction) => {
+			enterCommit();
+			await commitGate;
+			return commit(transaction);
+		};
+		const shell = await createRuntimeShell(session(storage), config());
+		const earlier = shell.session.appendCustomEntry("earlier");
+		await commitEntered;
+		let callbackRan = false;
+		const waiter = shell.waitForIdle();
+		const callback = shell.runWhenIdle(() => {
+			callbackRan = true;
+		});
+		const close = shell.close();
+		expect(ownerClose).not.toHaveBeenCalled();
+		releaseCommit();
+		await expect(earlier).resolves.toEqual(expect.any(String));
+		await expect(waiter).rejects.toMatchObject({ code: "closed" });
+		await expect(callback).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.waitForIdle()).rejects.toMatchObject({ code: "closed" });
+		await expect(shell.runWhenIdle(() => undefined)).rejects.toMatchObject({ code: "closed" });
+		expect(callbackRan).toBe(false);
+		await close;
+		expect(ownerClose).toHaveBeenCalledTimes(1);
+	});
+
+	it("fault before idle admission rejects registrations with the same fault and never runs the callback", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const cause = new Error("gated commit failed");
+		let rejectCommit!: (error: Error) => void;
+		let enterCommit!: () => void;
+		const commitEntered = new Promise<void>((resolve) => {
+			enterCommit = resolve;
+		});
+		const commitGate = new Promise<never>((_resolve, reject) => {
+			rejectCommit = reject;
+		});
+		storage.commit = async () => {
+			enterCommit();
+			return commitGate;
+		};
+		const shell = await createRuntimeShell(session(storage), config());
+		const earlier = shell.session.appendCustomEntry("fault");
+		await commitEntered;
+		let callbackRan = false;
+		const waiter = shell.waitForIdle();
+		const callback = shell.runWhenIdle(() => {
+			callbackRan = true;
+		});
+		rejectCommit(cause);
+		const fault = await earlier.catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault", cause: { code: "storage", cause } });
+		await expect(waiter).rejects.toBe(fault);
+		await expect(callback).rejects.toBe(fault);
+		await expect(shell.waitForIdle()).rejects.toBe(fault);
+		await expect(shell.runWhenIdle(() => undefined)).rejects.toBe(fault);
+		expect(callbackRan).toBe(false);
+		await shell.close();
+	});
+
+	it("close rejects callbacks that have not started, drains a running callback and tracked read, then closes the owner", async () => {
+		const fixture = await rooted("idle");
+		const storage = instrumentStorage(fixture.storage);
+		const ownerClose = vi.spyOn(storage, "close");
+		let releaseRead!: () => void;
+		let enterRead!: () => void;
+		const readEntered = new Promise<void>((resolve) => {
+			enterRead = resolve;
+		});
+		const readGate = new Promise<void>((resolve) => {
+			releaseRead = resolve;
+		});
+		const getStats = storage.getStats.bind(storage);
+		storage.getStats = async () => {
+			enterRead();
+			await readGate;
+			return getStats();
+		};
+		const shell = await createRuntimeShell(session(storage), config());
+		let releaseCallback!: () => void;
+		let enterCallback!: () => void;
+		const callbackEntered = new Promise<void>((resolve) => {
+			enterCallback = resolve;
+		});
+		const callbackGate = new Promise<void>((resolve) => {
+			releaseCallback = resolve;
+		});
+		const running = shell.runWhenIdle(async () => {
+			enterCallback();
+			await callbackGate;
+		});
+		await callbackEntered;
+		const read = shell.session.getStats();
+		await readEntered;
+		const queued = shell.runWhenIdle(() => undefined);
+		const close = shell.close();
+		await expect(queued).rejects.toMatchObject({ code: "closed" });
+		expect(ownerClose).not.toHaveBeenCalled();
+		releaseCallback();
+		await running;
+		expect(ownerClose).not.toHaveBeenCalled();
+		releaseRead();
+		await read;
+		await close;
+		expect(ownerClose).toHaveBeenCalledTimes(1);
+	});
+
+	it("fault rejects an unstarted idle record and a fresh reopen restores no process-local record", async () => {
+		const state = new MemoryStorageState();
+		const fixture = await rooted("need", state.createStorage());
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		const callback = shell.runWhenIdle(() => undefined);
+		const cause = new Error("append commit failed");
+		storage.commit = vi.fn().mockRejectedValueOnce(cause);
+		const fault = await shell.session.appendCustomEntry("fault").catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault" });
+		await expect(callback).rejects.toBe(fault);
+		await shell.close();
+
+		const reopened = await createRuntimeShell(session(state.createStorage()), config());
+		await reopened.abort();
+		await reopened.runToCompletion();
+		await expect(reopened.waitForIdle()).resolves.toBeUndefined();
+		await reopened.close();
 	});
 });
 const json = (value: unknown): JsonValue => value as JsonValue;
