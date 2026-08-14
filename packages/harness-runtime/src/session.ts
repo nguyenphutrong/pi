@@ -425,7 +425,7 @@ async function hydrateCurrentState(
 		}
 		const newestPromptId = operation.intent.promptEntryIds.at(-1)!;
 		const newestPrompt = requireMessageEntry(newestPromptId, "Newest run prompt");
-		const trigger = requireMessageEntry(triggerEntryId, "Current trigger");
+		const trigger = requireEntry(triggerEntryId, "Current trigger");
 		if (operation.intent.promptEntryIds.includes(triggerEntryId)) {
 			if (triggerEntryId !== newestPromptId)
 				throw new SessionError("corruption", "Current trigger references a stale run prompt");
@@ -441,6 +441,7 @@ async function hydrateCurrentState(
 				throw new SessionError("corruption", "Current trigger must be newer than the latest assistant");
 		}
 		if (state.phase.kind === "failure_drain") {
+			const triggerMessage = requireMessageEntry(triggerEntryId, "Failure drain trigger");
 			const expectedError = {
 				code: "provider_interrupted",
 				message: "Provider outcome unknown after interruption",
@@ -468,13 +469,13 @@ async function hydrateCurrentState(
 				mainLeaf.value !== triggerEntryId ||
 				state.latestAssistantEntryId !== triggerEntryId ||
 				!isDeepStrictEqual(state.phase.error, expectedError) ||
-				trigger.message.role !== "assistant" ||
-				!isExactDataObject(trigger.message, syntheticMessageFields) ||
-				trigger.message.content.length !== 0 ||
-				trigger.message.api !== "harness" ||
-				!isDeepStrictEqual(trigger.message.usage, expectedUsage) ||
-				trigger.message.stopReason !== "error" ||
-				trigger.message.errorMessage !== expectedError.message
+				triggerMessage.message.role !== "assistant" ||
+				!isExactDataObject(triggerMessage.message, syntheticMessageFields) ||
+				triggerMessage.message.content.length !== 0 ||
+				triggerMessage.message.api !== "harness" ||
+				!isDeepStrictEqual(triggerMessage.message.usage, expectedUsage) ||
+				triggerMessage.message.stopReason !== "error" ||
+				triggerMessage.message.errorMessage !== expectedError.message
 			)
 				throw new SessionError("corruption", "Failure drain has an invalid assistant closure");
 		} else if (state.phase.kind === "tools") {
@@ -542,21 +543,20 @@ async function hydrateCurrentState(
 		} else if (state.phase.kind === "checkpoint" || state.phase.kind === "assistant") {
 			if (mainLeaf.value !== triggerEntryId)
 				throw new SessionError("corruption", "Assistant trigger must close the current lane leaf");
-			if (
-				state.phase.kind === "checkpoint" &&
-				state.phase.continuation.kind === "may_finish" &&
-				state.phase.continuation.includeFinalAssistant
-			) {
-				if (trigger.message.role !== "assistant")
-					throw new SessionError("corruption", "Finished generation has an invalid assistant closure");
-				if (
-					trigger.message.stopReason === "aborted" &&
-					(state.control.status !== "cancel_requested" ||
-						typeof trigger.message.errorMessage !== "string" ||
-						state.latestAssistantEntryId !== triggerEntryId ||
-						mainLeaf.value !== triggerEntryId)
-				)
-					throw new SessionError("corruption", "Aborted generation has an invalid assistant closure");
+			if (state.phase.kind === "checkpoint" && state.phase.continuation.kind === "may_finish") {
+				const triggerMessage = requireMessageEntry(triggerEntryId, "Finishing checkpoint trigger");
+				if (state.phase.continuation.includeFinalAssistant) {
+					if (triggerMessage.message.role !== "assistant")
+						throw new SessionError("corruption", "Finished generation has an invalid assistant closure");
+					if (
+						triggerMessage.message.stopReason === "aborted" &&
+						(state.control.status !== "cancel_requested" ||
+							typeof triggerMessage.message.errorMessage !== "string" ||
+							state.latestAssistantEntryId !== triggerEntryId ||
+							mainLeaf.value !== triggerEntryId)
+					)
+						throw new SessionError("corruption", "Aborted generation has an invalid assistant closure");
+				}
 			}
 		}
 	}

@@ -118,6 +118,129 @@ function attachment(
 }
 
 describe("pure Phase 1 action planner", () => {
+	it("plans a frozen copied deferred-write prefix before checkpoint work", () => {
+		const fixture = attachment("need");
+		const first = id();
+		const second = id();
+		fixture.value.runState!.value.inbox.writes.push(first, second);
+		const plan = planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })!;
+		expect(plan.info).toEqual({
+			kind: "apply_deferred_writes",
+			operationId: fixture.operationId,
+			entryIds: [first, second],
+		});
+		fixture.value.runState!.value.inbox.writes.push(id());
+		expect(plan.info.kind === "apply_deferred_writes" ? plan.info.entryIds : []).toEqual([first, second]);
+		expect(Object.isFrozen(plan.info)).toBe(true);
+		expect(Object.isFrozen(plan.info.kind === "apply_deferred_writes" ? plan.info.entryIds : [])).toBe(true);
+	});
+
+	it("reconciles cancelled intended effects before applying eligible writes", () => {
+		const pending = attachment("pending");
+		pending.value.runState!.value.control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [],
+			drainedFollowUp: [],
+		};
+		pending.value.runState!.value.inbox.writes.push(id());
+		expect(
+			planAction(pending.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("recover_assistant_effect");
+
+		const ready = attachment("ready");
+		ready.value.runState!.value.control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [],
+			drainedFollowUp: [],
+		};
+		ready.value.runState!.value.inbox.writes.push(id());
+		expect(planAction(ready.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind).toBe(
+			"apply_deferred_writes",
+		);
+	});
+
+	it("reconciles cancelled tool effects before writes, then drains writes before abort cleanup", () => {
+		const fixture = attachment("need");
+		const turnId = id();
+		const resultEntryId = id();
+		fixture.value.runState!.value.control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [],
+			drainedFollowUp: [],
+		};
+		fixture.value.runState!.value.inbox.writes = [id()];
+		fixture.value.runState!.value.phase = {
+			kind: "tools",
+			batch: {
+				assistantEntryId: id(),
+				turnId,
+				configuration: fixture.value.laneConfiguration.value,
+				calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId, replay: "never" }],
+			},
+		};
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("recover_tool_effect");
+		if (fixture.value.runState!.value.phase.kind !== "tools") throw new Error("tools expected");
+		fixture.value.runState!.value.phase.batch.calls[0] = {
+			status: "completed",
+			sourceIndex: 0,
+			resultEntryId,
+			terminate: false,
+		};
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("apply_deferred_writes");
+		fixture.value.runState!.value.inbox.writes = [];
+		expect(
+			planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("finish_aborted_run");
+	});
+
+	it("enforces the exact deferred-write ordering matrix", () => {
+		const write = id();
+		const steer = id();
+		const followUp = id();
+		for (const position of ["need", "failure"] as const) {
+			const fixture = attachment(position);
+			fixture.value.runState!.value.inbox = { writes: [write], steer: [steer], followUp: [followUp] };
+			expect(
+				planAction(fixture.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info,
+			).toEqual({
+				kind: "apply_deferred_writes",
+				operationId: fixture.operationId,
+				entryIds: [write],
+			});
+		}
+
+		const skipped = attachment("need");
+		skipped.value.runState!.value.inbox = { writes: [write], steer: [steer], followUp: [] };
+		if (skipped.value.runState!.value.phase.kind !== "checkpoint") throw new Error("checkpoint expected");
+		skipped.value.runState!.value.phase.skipInboxOnce = true;
+		expect(
+			planAction(skipped.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("start_assistant_step");
+
+		const cancelled = attachment("finish");
+		cancelled.value.runState!.value.control = {
+			status: "cancel_requested",
+			requestedAt: 1,
+			drainedSteer: [],
+			drainedFollowUp: [],
+		};
+		cancelled.value.runState!.value.inbox.writes = [write];
+		expect(
+			planAction(cancelled.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("apply_deferred_writes");
+		cancelled.value.runState!.value.inbox.writes = [];
+		expect(
+			planAction(cancelled.value, { settingsRevision: 0, assistantEffectStatus: () => undefined })?.info.kind,
+		).toBe("finish_aborted_run");
+	});
+
 	it("covers every durable position and hides correctness tokens from ActionInfo", () => {
 		expect(
 			planAction(attachment("idle").value, { settingsRevision: 0, assistantEffectStatus: () => undefined }),

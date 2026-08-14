@@ -201,13 +201,17 @@ describe("operation-owned queues", () => {
 		expect(selectQueueDrain(skipped)).toBeUndefined();
 	});
 
-	it("does not select writes or add a write drain to planning", async () => {
+	it("keeps writes out of queue selection and plans their dedicated drain first", async () => {
 		const prepared = await active();
 		const writeId = id();
 		await installWrites(prepared, [{ id: writeId, value: { type: "custom", customType: "deferred" } }]);
 		const current = await prepared.runtimeSession.refreshRuntimeAttachment();
 		expect(selectQueueDrain(current.runState!.value)).toBeUndefined();
-		expect(planner(current)?.kind).toBe("start_assistant_step");
+		expect(planner(current)).toEqual({
+			kind: "apply_deferred_writes",
+			operationId: current.runOperation!.value.operationId,
+			entryIds: [writeId],
+		});
 		await closeAttachedRuntime(prepared.runtimeSession);
 	});
 

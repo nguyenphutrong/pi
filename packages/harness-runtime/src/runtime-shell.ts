@@ -34,6 +34,7 @@ import {
 	consumeOperationQueue,
 	finishRun,
 	nextRun,
+	placeRuntimeWrites,
 	prepareAssistantEffect,
 	queueOperationInput,
 	recoverAssistantEffect,
@@ -56,7 +57,7 @@ import {
 	type RuntimeAttachment,
 	type RuntimeOwner,
 } from "./session.ts";
-import type { Session, SessionTree } from "./types.ts";
+import type { EntryProjector, ProjectableCustomEntry, Session, SessionTree } from "./types.ts";
 
 export type RuntimeShellErrorCode = "unavailable" | "busy" | "stale" | "closed" | "fault";
 
@@ -98,6 +99,7 @@ export interface RuntimeShellOptions<TContext extends object | undefined = objec
 	readonly toolContext?: RuntimeToolContextSource<TContext>;
 	readonly beforeToolCall?: BeforeToolCallCallback;
 	readonly afterToolCall?: AfterToolCallCallback;
+	readonly entryProjectors?: Record<string, EntryProjector>;
 }
 
 interface AssistantEffectPlan {
@@ -215,12 +217,23 @@ function captureToolDefinitions<TContext extends object | undefined>(
 	return captured;
 }
 
+function captureEntryProjectors(source: Record<string, EntryProjector>): ReadonlyMap<string, EntryProjector> {
+	const captured = new Map<string, EntryProjector>();
+	for (const [customType, projector] of Object.entries(source)) {
+		if (customType.length === 0 || customType.includes("\u0000") || typeof projector !== "function")
+			throw new RuntimeShellError("unavailable", "Invalid entry projector registry");
+		captured.set(customType, projector);
+	}
+	return captured;
+}
+
 export class RuntimeShell<TContext extends object | undefined = object | undefined> {
 	readonly #session: Session;
 	readonly #owner: RuntimeOwner;
 	readonly session: SessionTree;
 	readonly #settings: RuntimeSettingsOwner;
 	readonly #models: Models | undefined;
+	readonly #entryProjectors: ReadonlyMap<string, EntryProjector>;
 	readonly #toolDefinitions: ReadonlyMap<string, RuntimeToolDefinition<TContext>>;
 	readonly #toolContext: RuntimeToolContextSource<TContext> | undefined;
 	readonly #beforeToolCall: BeforeToolCallCallback | undefined;
@@ -307,6 +320,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		this.#settings = settings;
 		this.#current = owner.attachment;
 		this.#models = options.models;
+		this.#entryProjectors = captureEntryProjectors(options.entryProjectors ?? {});
 		this.#toolDefinitions = captureToolDefinitions(options.tools ?? []);
 		this.#toolContext = options.toolContext;
 		this.#beforeToolCall = options.beforeToolCall;
@@ -316,6 +330,40 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 			notifyShutdown = resolve;
 		});
 		this.#notifyShutdown = notifyShutdown;
+	}
+
+	async #projectCustomEntry(entry: ProjectableCustomEntry): Promise<readonly Message[]> {
+		const projector = this.#entryProjectors.get(entry.customType);
+		if (!projector) return [];
+		const output = await projector(entry);
+		if (output === undefined) return [];
+		if (!Array.isArray(output)) throw new Error("Entry projector must return an array or undefined");
+		return Object.freeze(output.map((message) => Object.freeze(encodeMessage(message) as unknown as Message)));
+	}
+
+	async #projectContext(leafId: string | null): Promise<Message[]> {
+		if (leafId === null) return [];
+		const entries = await this.#session.findEntriesOnBranch({ start: leafId, order: "oldestFirst" });
+		const messages: Message[] = [];
+		for (const entry of entries) {
+			if (entry.type === "message") {
+				if (
+					entry.message.role !== "assistant" ||
+					!["error", "aborted", "deferred"].includes(entry.message.stopReason)
+				)
+					messages.push(Object.freeze(encodeMessage(entry.message) as unknown as Message));
+				continue;
+			}
+			const projectable = Object.freeze({
+				id: entry.id,
+				parentId: entry.parentId,
+				type: "custom" as const,
+				customType: entry.customType,
+				...(Object.hasOwn(entry, "data") ? { data: structuredClone(entry.data) } : {}),
+			});
+			messages.push(...(await this.#projectCustomEntry(projectable)));
+		}
+		return messages;
 	}
 
 	#plan(): PlannedAction | undefined {
@@ -434,6 +482,46 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return this.#admit(async () => {
 			const action = this.#plan();
 			if (!action) return undefined;
+			if (action.info.kind === "apply_deferred_writes") {
+				const classifications: { entryId: string; projection: "projecting" | "unprojected" }[] = [];
+				const plannedLeaf = this.#current.mainLeaf;
+				let parentId = plannedLeaf.value;
+				try {
+					for (const entryId of action.info.entryIds) {
+						const pending = this.#current.pendingEntries.get(entryId);
+						if (!pending) throw new Error("Planned pending entry is missing");
+						let projection: "projecting" | "unprojected" = "projecting";
+						if (pending.type === "custom") {
+							const projectable = Object.freeze({
+								id: entryId,
+								parentId,
+								type: "custom" as const,
+								customType: pending.customType,
+								...(Object.hasOwn(pending, "payload") ? { data: structuredClone(pending.payload) } : {}),
+							});
+							projection =
+								(await this.#projectCustomEntry(projectable)).length > 0 ? "projecting" : "unprojected";
+						}
+						classifications.push({ entryId, projection });
+						parentId = entryId;
+					}
+				} catch (cause) {
+					throw this.#transitionFailure(cause);
+				}
+				const result = await placeRuntimeWrites(this.#session, {
+					operationId: action.info.operationId,
+					expectedOperationStateSeq: action.expected.operationStateSeq,
+					expectedLeafSeq: plannedLeaf.seq,
+					expectedLeafId: plannedLeaf.value,
+					entryIds: action.info.entryIds,
+					classifications,
+				}).catch((cause: unknown) => {
+					throw this.#transitionFailure(cause);
+				});
+				this.#publish(result.attachment);
+				if (result.status === "obsolete") throw new RuntimeShellError("stale", "Deferred writes are obsolete");
+				return action.info;
+			}
 			if (action.info.kind === "consume_queue") {
 				const result = await consumeOperationQueue(this.#session, {
 					operationId: action.info.operationId,
@@ -1074,7 +1162,12 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 						contextWindow <= 0
 					)
 						throw new RuntimeShellError("unavailable", "Captured provider/model lease is unavailable");
-					const messages = structuredClone(await this.#session.projectBuiltinContext());
+					let messages: Message[];
+					try {
+						messages = await this.#projectContext(this.#current.mainLeaf.value);
+					} catch (cause) {
+						throw this.#transitionFailure(cause);
+					}
 					const context: Context = {
 						messages,
 						...(operation.intent.systemPromptOverride === undefined
@@ -1308,11 +1401,16 @@ export async function createRuntimeShell<TContext extends object | undefined = o
 	options: RuntimeShellOptions<TContext> = {},
 ): Promise<RuntimeShell<TContext>> {
 	const tools = [...captureToolDefinitions(options.tools ?? []).values()];
+	const entryProjectors = Object.fromEntries(captureEntryProjectors(options.entryProjectors ?? {}));
 	const settings = new RuntimeSettingsOwner(
 		options.streamOptions,
 		options.retryPolicy,
 		options.steeringMode,
 		options.followUpMode,
 	);
-	return new RuntimeShell(session, settings, await claimRuntime(session, seed), { ...options, tools });
+	return new RuntimeShell(session, settings, await claimRuntime(session, seed), {
+		...options,
+		tools,
+		entryProjectors,
+	});
 }

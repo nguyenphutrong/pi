@@ -3,6 +3,7 @@ import type { RuntimeAttachment } from "./session.ts";
 
 export type ActionInfo =
 	| { kind: "consume_queue"; operationId: string; queue: "steer" | "followUp"; entryIds: readonly string[] }
+	| { kind: "apply_deferred_writes"; operationId: string; entryIds: readonly string[] }
 	| { kind: "start_assistant_step"; operationId: string; triggerEntryId: string }
 	| { kind: "prepare_assistant_effect"; operationId: string; stepId: string; nextAttempt: number }
 	| { kind: "dispatch_assistant_effect"; operationId: string; effectKey: string }
@@ -84,6 +85,13 @@ export function planAction(
 	});
 	const phase = state.value.phase;
 	let info: ActionInfo;
+	const deferredWrites = (): PlannedAction => {
+		const entryIds = Object.freeze([...state.value.inbox.writes]);
+		return Object.freeze({
+			info: Object.freeze({ kind: "apply_deferred_writes", operationId: operation.value.operationId, entryIds }),
+			expected,
+		});
+	};
 	if (state.value.control.status === "cancel_requested") {
 		if (phase.kind === "tools") {
 			const call = phase.batch.calls.find((candidate) => candidate.status !== "completed");
@@ -144,10 +152,18 @@ export function planAction(
 				};
 			return Object.freeze({ info: Object.freeze(info), expected });
 		}
+		const eligibleForWrites =
+			phase.kind === "checkpoint" ||
+			phase.kind === "failure_drain" ||
+			(phase.kind === "assistant" &&
+				(phase.generation.status === "ready" || phase.generation.status === "retry_wait")) ||
+			(phase.kind === "tools" && phase.batch.calls.every((call) => call.status === "completed"));
+		if (eligibleForWrites && state.value.inbox.writes.length > 0) return deferredWrites();
 		info = { kind: "finish_aborted_run", operationId: operation.value.operationId };
 		return Object.freeze({ info: Object.freeze(info), expected });
 	}
 	if (phase.kind === "failure_drain") {
+		if (state.value.inbox.writes.length > 0) return deferredWrites();
 		const drain = selectQueueDrain(state.value);
 		if (drain) {
 			info = {
@@ -164,6 +180,7 @@ export function planAction(
 			responseEntryId: phase.provenance.entryId,
 		};
 	} else if (phase.kind === "checkpoint") {
+		if (phase.skipInboxOnce !== true && state.value.inbox.writes.length > 0) return deferredWrites();
 		const drain = selectQueueDrain(state.value);
 		if (drain) {
 			info = {

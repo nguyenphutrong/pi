@@ -839,7 +839,7 @@ async function preparedShell<TContext extends object | undefined = object | unde
 	);
 	const instrumented = instrumentStorage(fixture.storage);
 	const runtimeSession = session(instrumented);
-	const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+	const branchRead = vi.spyOn(runtimeSession, "findEntriesOnBranch");
 	vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(id()).mockReturnValueOnce(id());
 	const { models, lease, leaseSpy } = availableModels();
 	const streamSimple = vi.mocked(lease.streamSimple);
@@ -855,7 +855,7 @@ async function preparedShell<TContext extends object | undefined = object | unde
 		fixture,
 		instrumented,
 		runtimeSession,
-		projection,
+		branchRead,
 		models,
 		lease,
 		leaseSpy,
@@ -1192,6 +1192,270 @@ describe("D-019 no-tool ordered writer audit", () => {
 	});
 });
 
+describe("D-054 deferred-write projection", () => {
+	it("captures the projector registry and exact function at construction", async () => {
+		const fixture = await rooted("need");
+		const captured = vi.fn(() => [user("captured")]);
+		const replacement = vi.fn(() => [user("replacement")]);
+		const entryProjectors = { custom: captured };
+		const shell = await createRuntimeShell(session(fixture.storage), config(), { entryProjectors });
+		entryProjectors.custom = replacement;
+		delete (entryProjectors as Partial<typeof entryProjectors>).custom;
+		Object.assign(entryProjectors, { other: replacement });
+		await shell.session.appendCustomEntry("custom");
+		await shell.executeAction();
+		expect(captured).toHaveBeenCalledTimes(1);
+		expect(replacement).not.toHaveBeenCalled();
+		await shell.close();
+	});
+
+	it("projects committed custom entries in branch order while retaining built-in assistant filtering", async () => {
+		const fixture = await rooted("need");
+		const runtimeSession = session(fixture.storage);
+		const projector = vi.fn((entry) => [user(`custom:${entry.customType}`)]);
+		const { models, lease } = availableModels();
+		const shell = await createRuntimeShell(runtimeSession, config(), {
+			models,
+			entryProjectors: { projected: projector },
+		});
+		const customId = await shell.session.appendCustomEntry("projected", { durable: true });
+		const stoppedId = await shell.session.appendMessage(terminal("stop"));
+		const lengthId = await shell.session.appendMessage(terminal("length"));
+		const filteredId = await shell.session.appendMessage(terminal("error"));
+		expect(await shell.executeAction()).toMatchObject({
+			kind: "apply_deferred_writes",
+			entryIds: [customId, stoppedId, lengthId, filteredId],
+		});
+		await shell.executeAction();
+		await shell.executeAction();
+		await shell.executeAction();
+		const [context] = vi.mocked(lease.streamSimple).mock.calls[0] as [Context];
+		expect(context.messages).toEqual([
+			user("source"),
+			user("prompt"),
+			user("custom:projected"),
+			terminal("stop"),
+			terminal("length"),
+		]);
+		expect(projector).toHaveBeenCalledTimes(2);
+		await shell.close();
+	});
+
+	it("treats a pending message as projecting when every custom write is unprojected", async () => {
+		const fixture = await rooted("need");
+		const shell = await createRuntimeShell(session(fixture.storage), config(), {
+			entryProjectors: { custom: () => [] },
+		});
+		await shell.session.appendCustomEntry("custom", { first: true });
+		await shell.session.appendCustomEntry("custom", { second: true });
+		const messageId = await shell.session.appendMessage(user("last pending message"));
+		await shell.executeAction();
+		const state = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		expect(state.phase).toMatchObject({
+			kind: "checkpoint",
+			continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+			triggerEntryId: messageId,
+			skipInboxOnce: true,
+		});
+		await shell.close();
+	});
+
+	it("detaches pending and committed projector views and provider output in both directions", async () => {
+		const fixture = await rooted("need");
+		const outputs: ReturnType<typeof user>[] = [];
+		const views: Array<Record<string, unknown>> = [];
+		const projector = vi.fn((entry) => {
+			views.push(entry as unknown as Record<string, unknown>);
+			(entry.data as { nested: { value: string } }).nested.value = "projector mutation";
+			const output = user(`projection-${outputs.length}`);
+			outputs.push(output);
+			return [output];
+		});
+		const { models, lease } = availableModels();
+		const shell = await createRuntimeShell(session(fixture.storage), config(), {
+			models,
+			entryProjectors: { custom: projector },
+		});
+		const entryId = await shell.session.appendCustomEntry("custom", { nested: { value: "durable" } });
+		await expect(shell.executeAction()).resolves.toMatchObject({
+			kind: "apply_deferred_writes",
+			entryIds: [entryId],
+		});
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "start_assistant_step" });
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "prepare_assistant_effect" });
+		expect(views).toHaveLength(2);
+		expect(Reflect.ownKeys(views[1]).sort()).toEqual(["customType", "data", "id", "parentId", "type"].sort());
+		expect(views[1]).toEqual({
+			id: entryId,
+			parentId: fixture.prompt,
+			type: "custom",
+			customType: "custom",
+			data: { nested: { value: "projector mutation" } },
+		});
+		expect(views[1]).not.toHaveProperty("seq");
+		expect(views[1]).not.toHaveProperty("timestamp");
+		expect(await shell.session.getEntry(entryId)).toMatchObject({ data: { nested: { value: "durable" } } });
+		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "dispatch_assistant_effect" });
+		const [context] = vi.mocked(lease.streamSimple).mock.calls[0] as [Context];
+		expect(context.messages[2]).toEqual(user("projection-1"));
+		outputs[0].content = [{ type: "text", text: "caller mutated pending" }];
+		outputs[1].content = [{ type: "text", text: "caller mutated committed" }];
+		(views[0].data as { nested: { value: string } }).nested.value = "caller mutation";
+		expect(context.messages[2]).toEqual(user("projection-1"));
+		expect(await shell.session.getEntry(entryId)).toMatchObject({ data: { nested: { value: "durable" } } });
+		await shell.close();
+	});
+
+	it("passes exact detached prospective custom views and preserves absent data versus null", async () => {
+		const fixture = await rooted("need");
+		const seen: Array<Record<string, unknown>> = [];
+		const projector = vi.fn((entry) => {
+			seen.push(entry as unknown as Record<string, unknown>);
+			return [];
+		});
+		const shell = await createRuntimeShell(session(fixture.storage), config(), {
+			entryProjectors: { absent: projector, nullable: projector },
+		});
+		const absent = await shell.session.appendCustomEntry("absent");
+		const nullable = await shell.session.appendCustomEntry("nullable", null);
+		await shell.executeAction();
+		expect(seen).toHaveLength(2);
+		expect(Reflect.ownKeys(seen[0]).sort()).toEqual(["customType", "id", "parentId", "type"].sort());
+		expect(seen[0]).toEqual({ id: absent, parentId: fixture.prompt, type: "custom", customType: "absent" });
+		expect(seen[1]).toEqual({ id: nullable, parentId: absent, type: "custom", customType: "nullable", data: null });
+		for (const entry of seen) {
+			expect(entry).not.toHaveProperty("seq");
+			expect(entry).not.toHaveProperty("timestamp");
+		}
+		const durable = await shell.session.getEntries([absent, nullable]);
+		expect(durable.get(absent)).not.toHaveProperty("data");
+		expect(durable.get(nullable)).toHaveProperty("data", null);
+		await shell.close();
+	});
+
+	it.each([
+		["no projector", undefined, "unprojected"],
+		["undefined", (): undefined => undefined, "unprojected"],
+		["empty", (): [] => [], "unprojected"],
+		["message", (): ReturnType<typeof user>[] => [user("projected")], "projecting"],
+	] as const)("classifies custom output %s", async (_name, projector, classification) => {
+		const fixture = await rooted("need");
+		const originalPhase = structuredClone(
+			((await fixture.storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState).phase,
+		);
+		const shell = await createRuntimeShell(session(fixture.storage), config(), {
+			entryProjectors: projector === undefined ? {} : { custom: projector },
+		});
+		const entryId = await shell.session.appendCustomEntry("custom");
+		await shell.executeAction();
+		const state = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		if (classification === "projecting")
+			expect(state.phase).toMatchObject({
+				kind: "checkpoint",
+				continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+				triggerEntryId: entryId,
+				skipInboxOnce: true,
+			});
+		else expect(state.phase).toEqual(originalPhase);
+		await shell.close();
+	});
+
+	it("publishes stale authority, drops local output, and reprojects the exact write", async () => {
+		const fixture = await rooted("need");
+		const runtimeSession = session(fixture.storage);
+		let first = true;
+		const projector = vi.fn(async () => {
+			if (first) {
+				first = false;
+				await runtimeSession.requestAbort(() => undefined);
+			}
+			return [user("local")];
+		});
+		const shell = await createRuntimeShell(runtimeSession, config(), { entryProjectors: { custom: projector } });
+		const entryId = await shell.session.appendCustomEntry("custom");
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+		expect(projector).toHaveBeenCalledTimes(1);
+		expect(await fixture.storage.getRegister("pending.entry", entryId)).toBeDefined();
+		expect((await fixture.storage.getEntries([entryId])).has(entryId)).toBe(false);
+		expect(await shell.peekAction()).toMatchObject({ kind: "apply_deferred_writes", entryIds: [entryId] });
+		await shell.executeAction();
+		expect(projector).toHaveBeenCalledTimes(2);
+		expect((await fixture.storage.getEntries([entryId])).has(entryId)).toBe(true);
+		await shell.close();
+	});
+
+	it.each([
+		[
+			"throw",
+			() => {
+				throw new Error("projection failed");
+			},
+		],
+		["reject", async () => Promise.reject(new Error("projection rejected"))],
+		["non-array", () => user("malformed") as never],
+		["invalid message", () => [{ role: "user", content: [] }] as never],
+	] as const)("faults on projector %s without placement", async (_name, projector) => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config(), { entryProjectors: { custom: projector } });
+		const entryId = await shell.session.appendCustomEntry("custom");
+		const before = storage.committedTransactions.length;
+		await expect(shell.executeAction()).rejects.toMatchObject({ code: "fault" });
+		expect(storage.committedTransactions).toHaveLength(before);
+		expect(await fixture.storage.getRegister("pending.entry", entryId)).toBeDefined();
+		expect((await fixture.storage.getEntries([entryId])).has(entryId)).toBe(false);
+		await shell.close();
+	});
+
+	it("runs projectors FIFO, lets an admitted job finish before close, and prevents close-first execution", async () => {
+		const fixture = await rooted("need");
+		const calls: string[] = [];
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const started = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		const shell = await createRuntimeShell(session(fixture.storage), config(), {
+			entryProjectors: {
+				first: async () => {
+					calls.push("first:start");
+					entered();
+					await blocked;
+					calls.push("first:end");
+					return [];
+				},
+				second: () => {
+					calls.push("second");
+					return [];
+				},
+			},
+		});
+		await shell.session.appendCustomEntry("first");
+		await shell.session.appendCustomEntry("second");
+		const placement = shell.executeAction();
+		await started;
+		const close = shell.close();
+		expect(calls).toEqual(["first:start"]);
+		release();
+		await placement;
+		await close;
+		expect(calls).toEqual(["first:start", "first:end", "second"]);
+
+		const lateFixture = await rooted("need");
+		const lateProjector = vi.fn(() => []);
+		const late = await createRuntimeShell(session(lateFixture.storage), config(), {
+			entryProjectors: { custom: lateProjector },
+		});
+		await late.session.appendCustomEntry("custom");
+		await late.close();
+		await expect(late.executeAction()).rejects.toMatchObject({ code: "closed" });
+		expect(lateProjector).not.toHaveBeenCalled();
+	});
+});
+
 describe("Phase 1 runtime shell", () => {
 	it("prepares one detached durable assistant intent and parks the retained live plan", async () => {
 		const fixture = await rooted("ready");
@@ -1200,7 +1464,7 @@ describe("Phase 1 runtime shell", () => {
 		const responseEntryId = id();
 		const usageId = id();
 		vi.spyOn(runtimeSession.idGenerator, "next").mockReturnValueOnce(responseEntryId).mockReturnValueOnce(usageId);
-		const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+		const branchRead = vi.spyOn(runtimeSession, "findEntriesOnBranch");
 		const { models, lease, leaseSpy } = availableModels({ maxTokens: 321, contextWindow: 654 });
 		const shell = await createRuntimeShell(runtimeSession, config(), { models });
 
@@ -1211,7 +1475,7 @@ describe("Phase 1 runtime shell", () => {
 			nextAttempt: 1,
 		});
 		expect(leaseSpy).toHaveBeenCalledExactlyOnceWith("test", "current");
-		expect(projection).toHaveBeenCalledTimes(1);
+		expect(branchRead).toHaveBeenCalledExactlyOnceWith({ start: fixture.prompt, order: "oldestFirst" });
 		expectLeaseUnused(lease);
 		expect(instrumented.committedTransactions).toHaveLength(1);
 		expect(instrumented.committedTransactions[0].writes).toEqual([
@@ -1239,7 +1503,7 @@ describe("Phase 1 runtime shell", () => {
 		const beforePark = instrumented.committedTransactions.length;
 		await expect(shell.executeAction()).resolves.toMatchObject({ kind: "dispatch_assistant_effect" });
 		expect(instrumented.committedTransactions).toHaveLength(beforePark);
-		expect(projection).toHaveBeenCalledTimes(1);
+		expect(branchRead).toHaveBeenCalledTimes(1);
 		expect(lease.streamSimple).toHaveBeenCalledTimes(1);
 		await shell.close();
 	});
@@ -1297,11 +1561,11 @@ describe("Phase 1 runtime shell", () => {
 		const projected = new Promise<void>((resolve) => {
 			entered = resolve;
 		});
-		const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
-		vi.spyOn(runtimeSession, "projectBuiltinContext").mockImplementation(async () => {
+		const originalBranchRead = runtimeSession.findEntriesOnBranch.bind(runtimeSession);
+		vi.spyOn(runtimeSession, "findEntriesOnBranch").mockImplementation(async (query) => {
 			entered();
 			await blocked;
-			return originalProjection();
+			return originalBranchRead(query);
 		});
 		const shell = await createRuntimeShell(runtimeSession, config(), { models });
 		const execute = shell.executeAction();
@@ -1330,17 +1594,17 @@ describe("Phase 1 runtime shell", () => {
 			const instrumented = instrumentStorage(fixture.storage);
 			const runtimeSession = session(instrumented);
 			const next = vi.spyOn(runtimeSession.idGenerator, "next");
-			const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
-			const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+			const originalBranchRead = runtimeSession.findEntriesOnBranch.bind(runtimeSession);
+			const branchRead = vi.spyOn(runtimeSession, "findEntriesOnBranch");
 			const { models, leaseSpy } = availableModels();
 			const shell = await createRuntimeShell(runtimeSession, config(), { models });
 			const key = namespace === "op.state" ? fixture.operationId : "main";
 			const current = await fixture.storage.getRegister(namespace, key);
-			projection.mockImplementationOnce(async () => {
+			branchRead.mockImplementationOnce(async (query) => {
 				await fixture.storage.commit({
 					writes: [{ kind: "register", op: "set", namespace, key, value: current!.value }],
 				});
-				return originalProjection();
+				return originalBranchRead(query);
 			});
 			const before = instrumented.committedTransactions.length;
 			await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
@@ -1358,11 +1622,11 @@ describe("Phase 1 runtime shell", () => {
 		const instrumented = instrumentStorage(fixture.storage);
 		const runtimeSession = session(instrumented);
 		const next = vi.spyOn(runtimeSession.idGenerator, "next");
-		const projection = vi.spyOn(runtimeSession, "projectBuiltinContext");
+		const branchRead = vi.spyOn(runtimeSession, "findEntriesOnBranch");
 		const { models, lease, leaseSpy } = availableModels();
 		const replacement: LaneConfiguration = { ...config(), model: { provider: "test", modelId: "replacement" } };
-		const originalProjection = runtimeSession.projectBuiltinContext.bind(runtimeSession);
-		projection.mockImplementationOnce(async () => {
+		const originalBranchRead = runtimeSession.findEntriesOnBranch.bind(runtimeSession);
+		branchRead.mockImplementationOnce(async (query) => {
 			await fixture.storage.commit({
 				writes: [
 					{
@@ -1374,7 +1638,7 @@ describe("Phase 1 runtime shell", () => {
 					},
 				],
 			});
-			return originalProjection();
+			return originalBranchRead(query);
 		});
 		const shell = await createRuntimeShell(runtimeSession, config(), { models });
 
@@ -1414,11 +1678,12 @@ describe("Phase 1 runtime shell", () => {
 		const runtimeSession = session(instrumented);
 		const next = vi.spyOn(runtimeSession.idGenerator, "next");
 		const { models } = availableModels();
-		vi.spyOn(runtimeSession, "projectBuiltinContext").mockImplementationOnce(async () => {
+		const originalBranchRead = runtimeSession.findEntriesOnBranch.bind(runtimeSession);
+		vi.spyOn(runtimeSession, "findEntriesOnBranch").mockImplementationOnce(async (query) => {
 			await fixture.storage.commit({
 				writes: [{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: fixture.source }],
 			});
-			return [user("projected")];
+			return originalBranchRead(query);
 		});
 		const shell = await createRuntimeShell(runtimeSession, config(), { models });
 		const before = instrumented.committedTransactions.length;
@@ -2708,7 +2973,7 @@ describe("Phase 1 runtime shell", () => {
 			resolve = done;
 		});
 		const prepared = await preparedShell(() => result);
-		const projection = prepared.projection;
+		const branchRead = prepared.branchRead;
 		const durableOptionsBefore = structuredClone(prepared.durableOptions);
 		const beforeDispatch = prepared.instrumented.committedTransactions.length;
 		const dispatch = prepared.shell.executeAction();
@@ -2716,9 +2981,9 @@ describe("Phase 1 runtime shell", () => {
 		expect(prepared.streamSimple).toHaveBeenCalledTimes(1);
 		expect(prepared.leaseSpy).toHaveBeenCalledTimes(1);
 		const [context, options] = prepared.streamSimple.mock.calls[0] as [Context, Record<string, unknown>];
-		expect(projection).toHaveBeenCalledTimes(1);
+		expect(branchRead).toHaveBeenCalledExactlyOnceWith({ start: prepared.fixture.prompt, order: "oldestFirst" });
 		expect(context).toEqual({ messages: [user("source"), user("prompt")] });
-		expect(context.messages).not.toBe(await projection.mock.results[0].value);
+		expect(context.messages).not.toBe(branchRead.mock.results[0].value);
 		expect(options).toEqual({
 			headers: { retained: "yes" },
 			metadata: { nested: [1] },
@@ -2731,7 +2996,7 @@ describe("Phase 1 runtime shell", () => {
 		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "await_assistant_effect" });
 		resolve(terminal());
 		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "await_assistant_effect" });
-		expect(projection).toHaveBeenCalledTimes(1);
+		expect(branchRead).toHaveBeenCalledTimes(1);
 		expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_assistant_effect" });
 		await expect(prepared.shell.executeAction()).resolves.toMatchObject({ kind: "settle_assistant_effect" });
 		expect(prepared.instrumented.committedTransactions).toHaveLength(beforeDispatch + 1);
