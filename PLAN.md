@@ -4,13 +4,13 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.2d — Active write admission and atomic placement
-- Status: blocked at B-017 after two independent reviews rejected the same dual-owner placement-test fixture; production and 695/695 Harness tests remain uncommitted
+- Status: B-017 option 1 selected; replace every D-052 placement fixture with one lawful owner/mutation line, then reverify and re-review
 - Done bar: active façade writes reserve an id and atomically persist pending content plus total `op.state`, idle writes retain their existing direct path, placement commits entries/deletes/leaf/total state in one transaction after exact authority recheck, stale placement writes nothing, and cancel/abort races produce one of the two serialized valid outcomes
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Resolve B-017 and replace all D-052 placement fixtures with one lawful owner/mutation line.
+1. Replace all D-052 placement fixtures with one lawful owner/mutation line.
 2. Re-run full verification and obtain a fresh independent Phase 4.2d PASS.
 3. Add projector/context and planner actions with stale/fault/close coverage.
 4. Add representative SQLite deferred-write crash evidence.

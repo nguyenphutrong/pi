@@ -2,7 +2,7 @@
 
 ## Current status
 
-Blocked at B-017. Phase 4.2d production passes full verification, but its required Tier C evidence cannot be accepted until the repeated dual-owner fixture finding is resolved.
+No active blockers. B-017 option 1 was selected; its lawful single-owner fixture rework is in progress.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 
@@ -10,7 +10,8 @@ Blocked at B-017. Phase 4.2d production passes full verification, but its requir
 - Phase: 4
 - Work item: 4.2d — active write admission and atomic placement
 - Trigger: two independent implementation reviews rejected the same test-ownership boundary; §6 requires human resolution after repeated rejection
-- Status: active; production and tests remain uncommitted
+- Resolved: 2026-08-13 — human selected option 1
+- Status: resolved; production and tests remain uncommitted pending fixture rework, verification, and fresh review
 
 ### Context
 
@@ -26,7 +27,7 @@ The shared D-052 `placementFixture()` is not lawful evidence: `active(delegate)`
 
 ### Resume point
 
-Do not commit the uncommitted production or test files. After selecting option 1 or 2, replace every D-052 placement fixture—not just one race—then run the focused tests, full Harness suite, `npm run check`, and `git diff --check`. Obtain a fresh independent PASS before committing Phase 4.2d.
+Replace every D-052 placement fixture—not just one race—with one instrumented Storage, one `StoredSession`, and one `RuntimeOwner`; then run the focused tests, full Harness suite, `npm run check`, and `git diff --check`. Obtain a fresh independent PASS before committing Phase 4.2d.
 
 ## B-016 — Choose the custom-entry projector timing contract
 

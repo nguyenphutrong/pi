@@ -1566,3 +1566,16 @@ Cancellation, abort, later admission, and placement serialize into one of two co
 Tier A covers each eligible running and cancelled phase, including cancelled all-completed tools, plus explicit write-free rejection of a running skip-once checkpoint and unfinished effect-owning phases; projecting, mixed, and all-unprojected reduction; exact phase preservation; non-empty proper-prefix placement with later-write preservation; malformed classification vectors; separate stale owner, operation-state, leaf sequence/value, and FIFO prefix cases; and separate corruption cases for missing/malformed pending payload, committed-entry overlap, and usage-materialization overlap. Tier B asserts the exact idle, active-admission, and placement write arrays, `CommitResult.seqs` mapping, shared timestamp, register/entry exclusivity, absent data versus JSON null, attachment equivalence, generated-id collision, failed-commit zero-publication, and explicit absence of postcommit reads. Tier C proves both orders of placement versus cancellation, abort, later admission, and close, including a proper-prefix placement. The complete Harness suite and root check remain the implementation gates.
 
 The first independent design review rejected ambiguity in the classification vector, generated-id collision outcome, tagged append-result invariants, and test matrix. A fresh pass then rejected unsafe placement from effect-owning phases and conflation of stale authority with durable corruption. The corrected contract follows the spec's effect-first cancellation order and current planner state machine, closing each finding without changing scope or durable/public contracts. No §6 escalation remains.
+
+## D-053 — Use one lawful owner for every placement test
+
+- Date: 2026-08-13
+- Phase: 4
+- Status: accepted by human resolution of B-017
+- References: D-052; B-017; `packages/agent/docs/harness-v3.md` §§3.4, 9.2–9.3
+
+### Choice
+
+Option 1. Every D-052 placement fixture uses one instrumented Storage, one `StoredSession`, and one `RuntimeOwner` obtained through `claimRuntime`. Setup, placement, cancellation, abort, later admission, and close all serialize through that StoredSession's one mutation line. No second session or owner may share the Storage handle, even for sequential setup or observation.
+
+This replaces only invalid test ownership. The independently reviewed production contract and current test expectations remain unchanged. After the complete fixture replacement, full verification and a fresh independent review are required before the Phase 4.2d implementation can commit.
