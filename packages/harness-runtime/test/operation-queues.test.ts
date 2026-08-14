@@ -1,18 +1,21 @@
 import {
+	createFollowerId,
+	createIdGenerator,
 	type JsonValue,
 	MemoryStorage,
 	MemoryStorageState,
 	type Storage,
+	uuidV7Timestamp,
 	type Write,
 } from "@nguyenphutrong/pi-session-storage";
 import { instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
 import { type LaneConfiguration, type RunState, selectQueueDrain } from "../src/durable.ts";
 import { planAction } from "../src/planner.ts";
-import { attachRuntime, closeAttachedRuntime } from "../src/runtime-port.ts";
+import { attachRuntime, claimRuntime, closeAttachedRuntime, placeRuntimeWrites } from "../src/runtime-port.ts";
 import { StoredSession } from "../src/session.ts";
 import { CURRENT_STORAGE_VERSION } from "../src/types.ts";
-import { id, user } from "./fixtures.ts";
+import { assistant, id, toolResult, user, ZERO_USAGE } from "./fixtures.ts";
 
 const configuration: LaneConfiguration = {
 	model: { provider: "test", modelId: "model" },
@@ -206,6 +209,1029 @@ describe("operation-owned queues", () => {
 		expect(selectQueueDrain(current.runState!.value)).toBeUndefined();
 		expect(planner(current)?.kind).toBe("start_assistant_step");
 		await closeAttachedRuntime(prepared.runtimeSession);
+	});
+
+	describe("D-052 runtime write placement", () => {
+		type ActiveBootstrap = {
+			readonly operationId: string;
+			readonly promptEntryId: string;
+			readonly state: RunState;
+		};
+
+		type ActiveBootstrapResult = {
+			readonly writes?: Write[];
+			readonly leafId?: string;
+		};
+
+		async function claimedRuntime(
+			storage = instrumentStorage(new MemoryStorage()),
+			prepare?: (bootstrap: ActiveBootstrap) => ActiveBootstrapResult | undefined,
+		) {
+			const operationId = id();
+			const promptEntryId = id();
+			const state: RunState = {
+				kind: "run",
+				control: { status: "running" },
+				settings: {
+					compaction: { enabled: false, reserveTokens: 0, keepRecentTokens: 0 },
+					steeringMode: "all",
+					followUpMode: "all",
+					toolExecution: "sequential",
+				},
+				phase: {
+					kind: "checkpoint",
+					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+					triggerEntryId: promptEntryId,
+				},
+				inbox: { steer: [], followUp: [], writes: [] },
+				latestAssistantEntryId: null,
+			};
+			const prepared = prepare?.({ operationId, promptEntryId, state });
+			await storage.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: { id: promptEntryId, parentId: null, type: "message", payload: jsonValue(user("prompt")) },
+					},
+					...(prepared?.writes ?? []),
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.config",
+						key: "main",
+						value: jsonValue(configuration),
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.leaf",
+						key: "main",
+						value: prepared?.leafId ?? promptEntryId,
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.meta",
+						key: operationId,
+						value: {
+							operationId,
+							lane: "main",
+							sourceLeafId: null,
+							startedAt: 1,
+							intent: { kind: "run", promptEntryIds: [promptEntryId] },
+						},
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: operationId,
+						value: jsonValue(state),
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.state",
+						key: "main",
+						value: { currentOperationId: operationId, pendingNextRun: [] },
+					},
+				],
+			});
+			const runtimeSession = session(storage);
+			const owner = await claimRuntime(runtimeSession, configuration);
+			return { runtimeSession, owner, attachment: owner.attachment, storage };
+		}
+
+		async function admitRuntimeWrite(owner: Awaited<ReturnType<typeof claimedRuntime>>["owner"], value: JsonValue) {
+			if (value === null || typeof value !== "object" || Array.isArray(value))
+				throw new Error("pending value expected");
+			if (value.type === "message")
+				return owner.appendMessage(value.payload as unknown as Parameters<typeof owner.appendMessage>[0]);
+			if (value.type !== "custom" || typeof value.customType !== "string") throw new Error("pending value expected");
+			return Object.hasOwn(value, "payload")
+				? owner.appendCustomEntry(value.customType, value.payload)
+				: owner.appendCustomEntry(value.customType);
+		}
+
+		async function placementFixture(
+			values: JsonValue[],
+			prepare?: (bootstrap: ActiveBootstrap) => ActiveBootstrapResult | undefined,
+			storage = instrumentStorage(new MemoryStorage()),
+		) {
+			const prepared = await claimedRuntime(storage, prepare);
+			const admissions = [];
+			for (const value of values) admissions.push(await admitRuntimeWrite(prepared.owner, value));
+			const pending = admissions.map(({ entryId: id }, index) => ({ id, value: values[index] }));
+			const before = admissions.at(-1)?.attachment ?? prepared.attachment;
+			storage.committedTransactions.length = 0;
+			const transition = {
+				operationId: before.runOperation!.value.operationId,
+				expectedOperationStateSeq: before.runState!.seq,
+				expectedLeafSeq: before.mainLeaf.seq,
+				expectedLeafId: before.mainLeaf.value,
+				entryIds: pending.map(({ id: entryId }) => entryId),
+				classifications: pending.map(({ id: entryId }) => ({
+					entryId,
+					projection: "unprojected" as "projecting" | "unprojected",
+				})),
+			};
+			return { prepared, pending, storage, before, transition };
+		}
+
+		it("places an exact proper prefix atomically and preserves the later write", async () => {
+			const storage = instrumentStorage(new MemoryStorage());
+			const prepared = await claimedRuntime(storage);
+			const first = await prepared.owner.appendMessage(user("first"));
+			const nullable = await prepared.owner.appendCustomEntry("null", null);
+			const later = await prepared.owner.appendCustomEntry("later");
+			const pending = [first, nullable, later].map(({ entryId: id }) => ({ id }));
+			const before = later.attachment;
+			storage.committedTransactions.length = 0;
+			const reads = storage.attempts.length;
+			const result = await placeRuntimeWrites(prepared.runtimeSession, {
+				operationId: before.runOperation!.value.operationId,
+				expectedOperationStateSeq: before.runState!.seq,
+				expectedLeafSeq: before.mainLeaf.seq,
+				expectedLeafId: before.mainLeaf.value,
+				entryIds: pending.slice(0, 2).map(({ id: entryId }) => entryId),
+				classifications: [
+					{ entryId: pending[0].id, projection: "projecting" },
+					{ entryId: pending[1].id, projection: "unprojected" },
+				],
+			});
+			expect(result.status).toBe("placed");
+			expect(storage.committedTransactions).toHaveLength(1);
+			expect(storage.committedTransactions[0].writes).toEqual([
+				expect.objectContaining({
+					kind: "entry",
+					entry: expect.objectContaining({ id: pending[0].id, parentId: before.mainLeaf.value }),
+				}),
+				expect.objectContaining({
+					kind: "entry",
+					entry: expect.objectContaining({ id: pending[1].id, parentId: pending[0].id }),
+				}),
+				{ kind: "register", op: "delete", namespace: "pending.entry", key: pending[0].id },
+				{ kind: "register", op: "delete", namespace: "pending.entry", key: pending[1].id },
+				{ kind: "register", op: "set", namespace: "lane.leaf", key: "main", value: pending[1].id },
+				expect.objectContaining({
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: before.runOperation!.value.operationId,
+				}),
+			]);
+			expect(result.attachment.runState!.value.inbox.writes).toEqual([pending[2].id]);
+			expect(result.attachment.pendingEntries.has(pending[0].id)).toBe(false);
+			expect(result.attachment.pendingEntries.get(pending[2].id)).toEqual({ type: "custom", customType: "later" });
+			expect(result.attachment.entries.get(pending[1].id)).toHaveProperty("data", null);
+			expect(result.attachment.runState!.value.phase).toMatchObject({
+				kind: "checkpoint",
+				continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+				triggerEntryId: pending[1].id,
+				skipInboxOnce: true,
+			});
+			expect(storage.attempts).toHaveLength(reads + 1);
+			await prepared.owner.close();
+		});
+
+		it("maps every returned entry, leaf, and state sequence to the single commit without postcommit reads", async () => {
+			vi.spyOn(Date, "now").mockReturnValue(8675309);
+			const fixture = await placementFixture([
+				jsonValue({ type: "custom", customType: "absent" }),
+				jsonValue({ type: "custom", customType: "null", payload: null }),
+			]);
+			const readNames = [
+				"getEntries",
+				"getUsageRows",
+				"getRegister",
+				"listRegisters",
+				"scanBranchStructure",
+			] as const;
+			const spies = readNames.map((name) => vi.spyOn(fixture.storage, name));
+			let readsAtCommit: number[] | undefined;
+			const commit = fixture.storage.commit.bind(fixture.storage);
+			fixture.storage.commit = (transaction) => {
+				readsAtCommit = spies.map((spy) => spy.mock.calls.length);
+				return commit(transaction);
+			};
+			const result = await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition);
+			const firstSeq = result.attachment.entries.get(fixture.pending[0].id)!.seq;
+			expect([...result.attachment.entries.values()].slice(-2)).toEqual([
+				expect.objectContaining({ id: fixture.pending[0].id, seq: firstSeq, timestamp: 8675309 }),
+				expect.objectContaining({ id: fixture.pending[1].id, seq: firstSeq + 1, timestamp: 8675309, data: null }),
+			]);
+			expect(result.attachment.entries.get(fixture.pending[0].id)).not.toHaveProperty("data");
+			expect(result.attachment.mainLeaf.seq).toBe(firstSeq + 4);
+			expect(result.attachment.runState!.seq).toBe(firstSeq + 5);
+			expect(spies.map((spy) => spy.mock.calls.length)).toEqual(readsAtCommit);
+			await fixture.prepared.owner.close();
+			vi.restoreAllMocks();
+		});
+
+		it.each(["checkpoint", "failure_drain"] as const)(
+			"reduces mixed projecting writes from running %s to the canonical checkpoint",
+			async (kind) => {
+				const fixture = await placementFixture(
+					[
+						jsonValue({ type: "custom", customType: "project" }),
+						jsonValue({ type: "custom", customType: "plain" }),
+					],
+					({ state, promptEntryId }) => {
+						if (kind === "failure_drain") {
+							const responseEntryId = id();
+							state.phase = {
+								kind,
+								error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+								provenance: { kind: "response", entryId: responseEntryId },
+							};
+							state.latestAssistantEntryId = responseEntryId;
+							return {
+								leafId: responseEntryId,
+								writes: [
+									{
+										kind: "entry",
+										entry: {
+											id: responseEntryId,
+											parentId: promptEntryId,
+											type: "message",
+											payload: jsonValue({
+												...assistant("error"),
+												content: [],
+												api: "harness",
+												errorMessage: "Provider outcome unknown after interruption",
+											}),
+										},
+									},
+								],
+							};
+						}
+					},
+				);
+				fixture.transition.classifications = [
+					{ entryId: fixture.pending[0].id, projection: "projecting" },
+					{ entryId: fixture.pending[1].id, projection: "unprojected" },
+				];
+				const result = await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition);
+				expect(result.attachment.runState!.value.phase).toEqual({
+					kind: "checkpoint",
+					continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+					triggerEntryId: fixture.pending[1].id,
+					skipInboxOnce: true,
+				});
+				await fixture.prepared.owner.close();
+			},
+		);
+
+		it("preserves the complete running phase for all-unprojected custom writes", async () => {
+			for (const kind of ["checkpoint", "failure_drain"] as const) {
+				let expected!: RunState["phase"];
+				const fixture = await placementFixture(
+					[jsonValue({ type: "custom", customType: "plain" })],
+					({ state, promptEntryId }) => {
+						if (kind === "checkpoint") {
+							if (state.phase.kind !== "checkpoint") throw new Error("checkpoint expected");
+						} else {
+							const responseEntryId = id();
+							state.phase = {
+								kind,
+								error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+								provenance: { kind: "response", entryId: responseEntryId },
+							};
+							state.latestAssistantEntryId = responseEntryId;
+							expected = structuredClone(state.phase);
+							return {
+								leafId: responseEntryId,
+								writes: [
+									{
+										kind: "entry",
+										entry: {
+											id: responseEntryId,
+											parentId: promptEntryId,
+											type: "message",
+											payload: jsonValue({
+												...assistant("error"),
+												content: [],
+												api: "harness",
+												errorMessage: "Provider outcome unknown after interruption",
+											}),
+										},
+									},
+								],
+							};
+						}
+						expected = structuredClone(state.phase);
+					},
+				);
+				const result = await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition);
+				expect(result.attachment.runState!.value.phase).toEqual(expected);
+				await fixture.prepared.owner.close();
+			}
+		});
+
+		const phaseCases = [
+			"checkpoint-skip",
+			"failure_drain",
+			"assistant-ready",
+			"assistant-retry_wait",
+			"assistant-effect_pending",
+			"tools-completed",
+			"tools-planned",
+			"tools-effect_pending",
+		] as const;
+
+		function installPhase(name: (typeof phaseCases)[number], bootstrap: ActiveBootstrap): ActiveBootstrapResult {
+			const { operationId, promptEntryId, state } = bootstrap;
+			if (name === "checkpoint-skip") {
+				if (state.phase.kind !== "checkpoint") throw new Error("checkpoint expected");
+				state.phase.skipInboxOnce = true;
+				return {};
+			}
+			if (name === "failure_drain") {
+				const responseEntryId = id();
+				state.phase = {
+					kind: "failure_drain",
+					error: { code: "provider_interrupted", message: "Provider outcome unknown after interruption" },
+					provenance: { kind: "response", entryId: responseEntryId },
+				};
+				state.latestAssistantEntryId = responseEntryId;
+				return {
+					leafId: responseEntryId,
+					writes: [
+						{
+							kind: "entry",
+							entry: {
+								id: responseEntryId,
+								parentId: promptEntryId,
+								type: "message",
+								payload: jsonValue({
+									...assistant("error"),
+									content: [],
+									api: "harness",
+									errorMessage: "Provider outcome unknown after interruption",
+								}),
+							},
+						},
+					],
+				};
+			}
+			const context = {
+				stepId: id(),
+				triggerEntryId: promptEntryId,
+				configuration,
+				streamOptions: {},
+				retryPolicy: { maxAttempts: 3, baseDelayMs: 10 },
+				overflowRecoveryUsed: false,
+			};
+			if (name.startsWith("assistant-")) {
+				const status = name.slice("assistant-".length);
+				state.phase = {
+					kind: "assistant",
+					generation:
+						status === "ready"
+							? { status, context, nextAttempt: 1 }
+							: status === "retry_wait"
+								? {
+										status,
+										context,
+										nextAttempt: 2,
+										notBefore: 100,
+										errorMessage: "Provider outcome unknown after interruption",
+									}
+								: {
+										status: "effect_pending",
+										context,
+										attempt: 1,
+										responseEntryId: id(),
+										usageId: id(),
+										intendedOutputLimit: 1,
+										contextWindow: 2,
+									},
+				};
+				return {};
+			}
+			const assistantEntryId = createIdGenerator().next(uuidV7Timestamp(promptEntryId) + 1);
+			const resultEntryId = createFollowerId(assistantEntryId);
+			const turnId = id();
+			const status = name.slice("tools-".length) as "completed" | "planned" | "effect_pending";
+			state.phase = {
+				kind: "tools",
+				batch: {
+					assistantEntryId,
+					configuration,
+					turnId,
+					calls: [
+						status === "completed"
+							? { status, sourceIndex: 0, resultEntryId, terminate: false }
+							: status === "effect_pending"
+								? { status, sourceIndex: 0, resultEntryId, replay: "safe" }
+								: { status, sourceIndex: 0, resultEntryId },
+					],
+				},
+			};
+			state.latestAssistantEntryId = assistantEntryId;
+			const writes: Write[] = [
+				{
+					kind: "entry",
+					entry: {
+						id: assistantEntryId,
+						parentId: promptEntryId,
+						type: "message",
+						payload: jsonValue({
+							...assistant("toolUse"),
+							content: [{ type: "toolCall", id: "call-1", name: "read", arguments: {} }],
+						}),
+					},
+				},
+			];
+			if (status === "completed")
+				writes.push({
+					kind: "entry",
+					entry: {
+						id: resultEntryId,
+						parentId: assistantEntryId,
+						type: "message",
+						payload: jsonValue(toolResult()),
+					},
+				});
+			if (status === "effect_pending")
+				writes.push({
+					kind: "register",
+					op: "set",
+					namespace: "op.tool_args",
+					key: `${operationId}:${turnId}:0`,
+					value: {},
+				});
+			return { writes, leafId: status === "completed" ? resultEntryId : assistantEntryId };
+		}
+
+		it.each([
+			"checkpoint-skip",
+			"failure_drain",
+			"assistant-ready",
+			"assistant-retry_wait",
+			"tools-completed",
+		] as const)("preserves exact cancelled %s phase and control", async (name) => {
+			let expectedPhase!: RunState["phase"];
+			let expectedControl!: RunState["control"];
+			const fixture = await placementFixture([jsonValue({ type: "custom", customType: "project" })], (bootstrap) => {
+				const prepared = installPhase(name, bootstrap);
+				const { state } = bootstrap;
+				state.control = { status: "cancel_requested", requestedAt: 7, drainedSteer: [], drainedFollowUp: [] };
+				expectedPhase = structuredClone(state.phase);
+				expectedControl = structuredClone(state.control);
+				return prepared;
+			});
+			fixture.transition.classifications = [{ entryId: fixture.pending[0].id, projection: "projecting" }];
+			const result = await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition);
+			expect(result.status).toBe("placed");
+			expect(result.attachment.runState!.value.phase).toEqual(expectedPhase);
+			expect(result.attachment.runState!.value.control).toEqual(expectedControl);
+			await fixture.prepared.owner.close();
+		});
+
+		it.each([
+			["running checkpoint skip", "checkpoint-skip", false],
+			["running assistant ready", "assistant-ready", false],
+			["running assistant effect_pending", "assistant-effect_pending", false],
+			["running tools planned", "tools-planned", false],
+			["running tools effect_pending", "tools-effect_pending", false],
+			["cancelled assistant effect_pending", "assistant-effect_pending", true],
+			["cancelled tools planned", "tools-planned", true],
+			["cancelled tools effect_pending", "tools-effect_pending", true],
+		] as const)("returns obsolete write-free for ineligible %s", async (_label, name, cancelled) => {
+			const fixture = await placementFixture([jsonValue({ type: "custom", customType: "plain" })], (bootstrap) => {
+				const prepared = installPhase(name, bootstrap);
+				if (cancelled)
+					bootstrap.state.control = {
+						status: "cancel_requested",
+						requestedAt: 7,
+						drainedSteer: [],
+						drainedFollowUp: [],
+					};
+				return prepared;
+			});
+			fixture.storage.committedTransactions.length = 0;
+			await expect(placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition)).resolves.toMatchObject({
+				status: "obsolete",
+			});
+			expect(fixture.storage.committedTransactions).toEqual([]);
+			await fixture.prepared.owner.close();
+		});
+
+		it.each([
+			[
+				"transition extra field",
+				(value: Record<string, unknown>) => {
+					value.extra = true;
+				},
+			],
+			["transition missing field", (value: Record<string, unknown>) => delete value.expectedLeafId],
+			[
+				"transition accessor field",
+				(value: Record<string, unknown>) =>
+					Object.defineProperty(value, "operationId", { enumerable: true, get: () => id() }),
+			],
+			[
+				"transition non-data object",
+				(value: Record<string, unknown>) => Object.setPrototypeOf(value, { inherited: true }),
+			],
+			[
+				"operation invalid UUID",
+				(value: Record<string, unknown>) => {
+					value.operationId = "not-a-uuid";
+				},
+			],
+			[
+				"expected state sequence non-safe",
+				(value: Record<string, unknown>) => {
+					value.expectedOperationStateSeq = 2 ** 53;
+				},
+			],
+			[
+				"expected state sequence negative",
+				(value: Record<string, unknown>) => {
+					value.expectedOperationStateSeq = -1;
+				},
+			],
+			[
+				"expected state sequence zero",
+				(value: Record<string, unknown>) => {
+					value.expectedOperationStateSeq = 0;
+				},
+			],
+			[
+				"expected leaf sequence non-safe",
+				(value: Record<string, unknown>) => {
+					value.expectedLeafSeq = 2 ** 53;
+				},
+			],
+			[
+				"expected leaf sequence negative",
+				(value: Record<string, unknown>) => {
+					value.expectedLeafSeq = -1;
+				},
+			],
+			[
+				"expected leaf sequence zero",
+				(value: Record<string, unknown>) => {
+					value.expectedLeafSeq = 0;
+				},
+			],
+			[
+				"expected leaf invalid UUID",
+				(value: Record<string, unknown>) => {
+					value.expectedLeafId = "not-a-uuid";
+				},
+			],
+			[
+				"entry invalid UUID",
+				(value: Record<string, unknown>) => {
+					value.entryIds = ["not-a-uuid"];
+					value.classifications = [{ entryId: "not-a-uuid", projection: "unprojected" }];
+				},
+			],
+			[
+				"entry sparse array",
+				(value: Record<string, unknown>) => {
+					value.entryIds = new Array(1);
+				},
+			],
+			[
+				"classification sparse array",
+				(value: Record<string, unknown>) => {
+					value.classifications = new Array(1);
+				},
+			],
+			[
+				"empty vectors",
+				(value: Record<string, unknown>) => Object.assign(value, { entryIds: [], classifications: [] }),
+			],
+			[
+				"duplicate entries",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.entryIds = [entryId, entryId];
+					value.classifications = [
+						{ entryId, projection: "unprojected" },
+						{ entryId, projection: "unprojected" },
+					];
+				},
+			],
+			[
+				"mismatched lengths",
+				(value: Record<string, unknown>) => {
+					value.classifications = [];
+				},
+			],
+			[
+				"mismatched classification entry",
+				(value: Record<string, unknown>) => {
+					value.classifications = [{ entryId: id(), projection: "unprojected" }];
+				},
+			],
+			[
+				"classification invalid UUID",
+				(value: Record<string, unknown>) => {
+					value.classifications = [{ entryId: "not-a-uuid", projection: "unprojected" }];
+				},
+			],
+			[
+				"classification extra field",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.classifications = [{ entryId, projection: "unprojected", extra: true }];
+				},
+			],
+			[
+				"classification missing field",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.classifications = [{ entryId }];
+				},
+			],
+			[
+				"classification accessor field",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.classifications = [
+						Object.defineProperty({ entryId }, "projection", { enumerable: true, get: () => "unprojected" }),
+					];
+				},
+			],
+			[
+				"classification non-data object",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.classifications = [
+						Object.assign(Object.create({ inherited: true }), { entryId, projection: "unprojected" }),
+					];
+				},
+			],
+			[
+				"invalid projection",
+				(value: Record<string, unknown>) => {
+					const entryId = (value.entryIds as string[])[0];
+					value.classifications = [{ entryId, projection: "invalid" }];
+				},
+			],
+		] as const)("rejects structurally invalid %s synchronously and write-free", async (_name, mutate) => {
+			const fixture = await placementFixture([jsonValue({ type: "custom", customType: "x" })]);
+			const transition: Record<string, unknown> = structuredClone(fixture.transition);
+			mutate(transition);
+			const reads = fixture.storage.attempts.length;
+			const placement = placeRuntimeWrites(
+				fixture.prepared.runtimeSession,
+				transition as unknown as Parameters<typeof placeRuntimeWrites>[1],
+			);
+			expect(fixture.storage.attempts).toHaveLength(reads);
+			await expect(placement).rejects.toMatchObject({ code: "invalid_query" });
+			expect(fixture.storage.committedTransactions).toEqual([]);
+			await fixture.prepared.owner.close();
+		});
+
+		it.each(["missing", "malformed", "entry", "usage"] as const)(
+			"rejects matching-authority pending %s read corruption without a placement commit",
+			async (kind) => {
+				const delegate = new MemoryStorage();
+				let armed = false;
+				let faultEntryId: string | undefined;
+				const faultingStorage = new Proxy(delegate, {
+					get(target, property) {
+						if (property === "getRegister")
+							return async (namespace: string, key: string) => {
+								const register = await target.getRegister(namespace, key);
+								if (!armed || namespace !== "pending.entry" || key !== faultEntryId) return register;
+								if (kind === "missing") return undefined;
+								return kind === "malformed" && register ? { ...register, value: { type: "custom" } } : register;
+							};
+						if (property === "getEntries")
+							return async (ids: string[]) => {
+								const entries = new Map(await target.getEntries(ids));
+								if (armed && kind === "entry" && faultEntryId && ids.includes(faultEntryId))
+									entries.set(faultEntryId, {
+										id: faultEntryId,
+										parentId: null,
+										seq: 1,
+										timestamp: 1,
+										type: "custom",
+										customType: "x",
+									});
+								return entries;
+							};
+						if (property === "getUsageRows")
+							return async (ids: string[]) => {
+								const rows = new Map(await target.getUsageRows(ids));
+								if (armed && kind === "usage" && faultEntryId && ids.includes(faultEntryId))
+									rows.set(faultEntryId, {
+										id: faultEntryId,
+										seq: 1,
+										adjustment: false,
+										usage: ZERO_USAGE,
+									});
+								return rows;
+							};
+						const value: unknown = Reflect.get(target, property);
+						return typeof value === "function" ? value.bind(target) : value;
+					},
+				}) as Storage;
+				const storage = instrumentStorage(faultingStorage);
+				const fixture = await placementFixture(
+					[jsonValue({ type: "custom", customType: "x" })],
+					undefined,
+					storage,
+				);
+				faultEntryId = fixture.pending[0].id;
+				armed = true;
+				await expect(placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition)).rejects.toMatchObject(
+					{
+						code: "corruption",
+					},
+				);
+				expect(fixture.storage.committedTransactions).toEqual([]);
+				await fixture.prepared.owner.close();
+			},
+		);
+
+		it("returns obsolete write-free for stale state authority and rejects unprojected messages", async () => {
+			const storage = instrumentStorage(new MemoryStorage());
+			const prepared = await claimedRuntime(storage);
+			const admission = await prepared.owner.appendMessage(user("x"));
+			const entryId = admission.entryId;
+			const before = admission.attachment;
+			storage.committedTransactions.length = 0;
+			const transition = {
+				operationId: before.runOperation!.value.operationId,
+				expectedOperationStateSeq: before.runState!.seq,
+				expectedLeafSeq: before.mainLeaf.seq,
+				expectedLeafId: before.mainLeaf.value,
+				entryIds: [entryId],
+				classifications: [{ entryId, projection: "projecting" as const }],
+			};
+			expect(
+				await placeRuntimeWrites(prepared.runtimeSession, {
+					...transition,
+					expectedOperationStateSeq: transition.expectedOperationStateSeq + 1,
+				}),
+			).toMatchObject({ status: "obsolete" });
+			await expect(
+				placeRuntimeWrites(prepared.runtimeSession, {
+					...transition,
+					classifications: [{ entryId, projection: "unprojected" }],
+				}),
+			).rejects.toMatchObject({ code: "invalid_query" });
+			expect(storage.committedTransactions).toHaveLength(0);
+			await prepared.owner.close();
+		});
+
+		it.each([
+			[
+				"owner",
+				(transition: Record<string, unknown>) => {
+					transition.operationId = id();
+				},
+			],
+			[
+				"state sequence",
+				(transition: Record<string, unknown>) => {
+					transition.expectedOperationStateSeq = (transition.expectedOperationStateSeq as number) + 1;
+				},
+			],
+			[
+				"leaf sequence",
+				(transition: Record<string, unknown>) => {
+					transition.expectedLeafSeq = (transition.expectedLeafSeq as number) + 1;
+				},
+			],
+			[
+				"leaf value",
+				(transition: Record<string, unknown>) => {
+					transition.expectedLeafId = id();
+				},
+			],
+			[
+				"FIFO non-prefix",
+				(transition: Record<string, unknown>) => {
+					const other = id();
+					transition.entryIds = [other];
+					transition.classifications = [{ entryId: other, projection: "unprojected" }];
+				},
+			],
+		] as const)("returns obsolete and writes nothing for stale %s", async (_name, mutate) => {
+			const storage = instrumentStorage(new MemoryStorage());
+			const prepared = await claimedRuntime(storage);
+			const admission = await prepared.owner.appendCustomEntry("x");
+			const entryId = admission.entryId;
+			const before = admission.attachment;
+			storage.committedTransactions.length = 0;
+			const transition: Record<string, unknown> = {
+				operationId: before.runOperation!.value.operationId,
+				expectedOperationStateSeq: before.runState!.seq,
+				expectedLeafSeq: before.mainLeaf.seq,
+				expectedLeafId: before.mainLeaf.value,
+				entryIds: [entryId],
+				classifications: [{ entryId, projection: "unprojected" }],
+			};
+			mutate(transition);
+			await expect(
+				placeRuntimeWrites(
+					prepared.runtimeSession,
+					transition as unknown as Parameters<typeof placeRuntimeWrites>[1],
+				),
+			).resolves.toMatchObject({ status: "obsolete" });
+			expect(storage.committedTransactions).toEqual([]);
+			await prepared.owner.close();
+		});
+
+		it("orders placement and cancellation in both histories", async () => {
+			for (const first of ["cancel", "place"] as const) {
+				const fixture = await placementFixture([jsonValue({ type: "message", payload: user(first) })]);
+				const entryId = fixture.pending[0].id;
+				fixture.transition.classifications = [{ entryId, projection: "projecting" }];
+				if (first === "cancel") {
+					expect((await fixture.prepared.runtimeSession.cancelQueued(entryId)).outcome).toBe("cancelled");
+					await expect(
+						placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition),
+					).resolves.toMatchObject({
+						status: "obsolete",
+					});
+				} else {
+					expect((await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition)).status).toBe(
+						"placed",
+					);
+					expect((await fixture.prepared.runtimeSession.cancelQueued(entryId)).outcome).toBe("already_consumed");
+				}
+				const current = await fixture.prepared.runtimeSession.refreshRuntimeAttachment();
+				expect(current.pendingEntries.has(entryId)).toBe(false);
+				expect(await fixture.storage.getRegister("pending.entry", entryId)).toBeUndefined();
+				await fixture.prepared.owner.close();
+			}
+		});
+
+		it("orders placement and abort in both histories", async () => {
+			for (const first of ["abort", "place"] as const) {
+				const fixture = await placementFixture([jsonValue({ type: "message", payload: user(first) })]);
+				const entryId = fixture.pending[0].id;
+				fixture.transition.classifications = [{ entryId, projection: "projecting" }];
+				if (first === "abort") {
+					expect((await fixture.prepared.runtimeSession.requestAbort(() => undefined)).status).toBe("committed");
+					await expect(
+						placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition),
+					).resolves.toMatchObject({
+						status: "obsolete",
+					});
+					const current = await fixture.prepared.runtimeSession.refreshRuntimeAttachment();
+					expect(current.runState!.value.inbox.writes).toEqual([entryId]);
+					expect(current.pendingEntries.has(entryId)).toBe(true);
+				} else {
+					expect((await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition)).status).toBe(
+						"placed",
+					);
+					await fixture.prepared.runtimeSession.requestAbort(() => undefined);
+					const current = await fixture.prepared.runtimeSession.refreshRuntimeAttachment();
+					expect(current.runState!.value.inbox.writes).toEqual([]);
+					expect(current.entries.has(entryId)).toBe(true);
+				}
+				await fixture.prepared.owner.close();
+			}
+		});
+
+		it("serializes placement with later active write admission", async () => {
+			for (const first of ["admission", "place"] as const) {
+				const { runtimeSession, owner, storage } = await claimedRuntime();
+				const prefix = await owner.appendMessage(user("prefix"));
+				const transition = {
+					operationId: prefix.attachment.runOperation!.value.operationId,
+					expectedOperationStateSeq: prefix.attachment.runState!.seq,
+					expectedLeafSeq: prefix.attachment.mainLeaf.seq,
+					expectedLeafId: prefix.attachment.mainLeaf.value,
+					entryIds: [prefix.entryId],
+					classifications: [{ entryId: prefix.entryId, projection: "projecting" as const }],
+				};
+				if (first === "admission") {
+					const laterId = (await owner.appendCustomEntry("later")).entryId;
+					await expect(placeRuntimeWrites(runtimeSession, transition)).resolves.toMatchObject({
+						status: "obsolete",
+					});
+					const current = await runtimeSession.refreshRuntimeAttachment();
+					const fresh = { ...transition, expectedOperationStateSeq: current.runState!.seq };
+					expect((await placeRuntimeWrites(runtimeSession, fresh)).status).toBe("placed");
+					const after = await runtimeSession.refreshRuntimeAttachment();
+					expect(after.runState!.value.inbox.writes).toEqual([laterId]);
+					expect(after.pendingEntries.has(laterId)).toBe(true);
+					expect(await storage.getRegister("pending.entry", laterId)).toBeDefined();
+				} else {
+					expect((await placeRuntimeWrites(runtimeSession, transition)).status).toBe("placed");
+					const laterId = (await owner.appendCustomEntry("later")).entryId;
+					const after = await runtimeSession.refreshRuntimeAttachment();
+					expect(after.entries.has(prefix.entryId)).toBe(true);
+					expect(after.runState!.value.inbox.writes).toEqual([laterId]);
+					expect(after.pendingEntries.has(laterId)).toBe(true);
+					expect(await storage.getRegister("pending.entry", laterId)).toBeDefined();
+				}
+				await owner.close();
+			}
+		});
+
+		it("lets an admitted placement finish before close and rejects placement after close", async () => {
+			for (const first of ["place", "close"] as const) {
+				const fixture = await placementFixture([jsonValue({ type: "custom", customType: first })]);
+				if (first === "place") {
+					let release!: () => void;
+					let entered!: () => void;
+					const blocked = new Promise<void>((resolve) => {
+						release = resolve;
+					});
+					const admitted = new Promise<void>((resolve) => {
+						entered = resolve;
+					});
+					const commit = fixture.storage.commit.bind(fixture.storage);
+					fixture.storage.commit = async (transaction) => {
+						entered();
+						await blocked;
+						return commit(transaction);
+					};
+					const placement = placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition);
+					await admitted;
+					const closing = fixture.prepared.owner.close();
+					release();
+					expect((await placement).status).toBe("placed");
+					await closing;
+				} else {
+					await fixture.prepared.owner.close();
+					await expect(
+						placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition),
+					).rejects.toMatchObject({
+						code: "closed",
+					});
+					expect(fixture.storage.committedTransactions).toEqual([]);
+				}
+			}
+		});
+
+		it("keeps placement authority durable when its commit fails", async () => {
+			const fixture = await placementFixture([jsonValue({ type: "custom", customType: "durable" })]);
+			const entryId = fixture.pending[0].id;
+			const cause = new Error("injected placement commit failure");
+			fixture.storage.commit = vi.fn().mockRejectedValueOnce(cause);
+			const failure = await placeRuntimeWrites(fixture.prepared.runtimeSession, fixture.transition).catch(
+				(error: unknown) => error,
+			);
+			expect(failure).toMatchObject({ code: "storage", cause });
+			const durable = await fixture.prepared.runtimeSession.refreshRuntimeAttachment();
+			expect(durable.runState).toEqual(fixture.before.runState);
+			expect(durable.mainLeaf).toEqual(fixture.before.mainLeaf);
+			expect(durable.runState!.value.inbox.writes).toEqual([entryId]);
+			expect(durable.pendingEntries.get(entryId)).toEqual({ type: "custom", customType: "durable" });
+			expect(durable.entries.has(entryId)).toBe(false);
+			await fixture.prepared.owner.close();
+		});
+
+		it("captures placement vectors synchronously before waiting on the mutation line", async () => {
+			const storage = instrumentStorage(new MemoryStorage());
+			const prepared = await claimedRuntime(storage);
+			const first = await prepared.owner.appendCustomEntry("first");
+			const second = await prepared.owner.appendCustomEntry("second");
+			const ids = [first.entryId, second.entryId];
+			const before = second.attachment;
+			storage.committedTransactions.length = 0;
+			let release!: () => void;
+			let entered!: () => void;
+			const blocked = new Promise<void>((resolve) => {
+				release = resolve;
+			});
+			const admitted = new Promise<void>((resolve) => {
+				entered = resolve;
+			});
+			const commit = storage.commit.bind(storage);
+			let gate = true;
+			storage.commit = async (transaction) => {
+				if (gate) {
+					gate = false;
+					entered();
+					await blocked;
+				}
+				return commit(transaction);
+			};
+			const prior = prepared.runtimeSession.nextRun(user("mutation-line gate"));
+			await admitted;
+			const entryIds = [ids[0]];
+			const classifications = [{ entryId: ids[0], projection: "unprojected" as const }];
+			const placement = placeRuntimeWrites(prepared.runtimeSession, {
+				operationId: before.runOperation!.value.operationId,
+				expectedOperationStateSeq: before.runState!.seq,
+				expectedLeafSeq: before.mainLeaf.seq,
+				expectedLeafId: before.mainLeaf.value,
+				entryIds,
+				classifications,
+			});
+			entryIds[0] = ids[1];
+			classifications[0] = { entryId: ids[1], projection: "unprojected" };
+			release();
+			await prior;
+			const result = await placement;
+			expect(result).toMatchObject({ status: "placed", attachment: { mainLeaf: { value: ids[0] } } });
+			await prepared.owner.close();
+		});
 	});
 
 	it("cancels exactly one custom write with total state first and preserves FIFO survivors", async () => {

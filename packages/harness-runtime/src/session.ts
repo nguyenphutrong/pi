@@ -78,6 +78,18 @@ function isExactDataObject(value: unknown, allowedFields: ReadonlySet<string>): 
 	return true;
 }
 
+function isDenseDataArray(value: unknown): value is unknown[] {
+	if (!Array.isArray(value) || Object.getPrototypeOf(value) !== Array.prototype) return false;
+	if (Object.getOwnPropertySymbols(value).length > 0) return false;
+	const names = Object.getOwnPropertyNames(value);
+	if (names.length !== value.length + 1 || !names.includes("length")) return false;
+	for (let index = 0; index < value.length; index++) {
+		const descriptor = Object.getOwnPropertyDescriptor(value, String(index));
+		if (!descriptor || !("value" in descriptor) || !descriptor.enumerable) return false;
+	}
+	return true;
+}
+
 const GLOBAL_QUERY_FIELDS = new Set(["type", "customType", "order", "limit", "cursor"]);
 const BRANCH_QUERY_FIELDS = new Set([...GLOBAL_QUERY_FIELDS, "start", "stopAtType", "stopAtId"]);
 const CURSOR_FIELDS = new Set(["seq"]);
@@ -986,6 +998,7 @@ export interface RuntimeOwner {
 }
 
 export interface RuntimeAppendResult {
+	readonly status: "placed" | "pending";
 	readonly entryId: string;
 	readonly attachment: RuntimeAttachment;
 }
@@ -3535,15 +3548,76 @@ export class StoredSession implements Session {
 			| { readonly type: "custom"; readonly pending: Extract<PendingEntry, { type: "custom" }> },
 	): Promise<RuntimeAppendResult> {
 		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
-		const id = this.idGenerator.next();
 		const operation = this.#mutationLine.then(async () => {
 			const attachment = await this.#loadRuntimeAttachment();
-			decodeIdleMainStateRegister({
-				namespace: STATE_NAMESPACE,
-				key: MAIN,
-				seq: attachment.laneState.seq,
-				value: attachment.laneState.value as unknown as JsonValue,
-			});
+			const id = this.idGenerator.next();
+			const logicalIds = collectCurrentLogicalIds(
+				attachment.laneState.value,
+				attachment.runOperation?.value,
+				attachment.runState?.value,
+			);
+			const [occupiedEntries, occupiedUsage, occupiedMeta, occupiedState, occupiedPending] = await Promise.all([
+				this.#storage.getEntries([id]),
+				this.#storage.getUsageRows([id]),
+				this.#storage.getRegister("op.meta", id),
+				this.#storage.getRegister("op.state", id),
+				this.#storage.getRegister("pending.entry", id),
+			]);
+			if (
+				logicalIds.nonQueue.has(id) ||
+				logicalIds.queue.has(id) ||
+				occupiedEntries.size > 0 ||
+				occupiedUsage.size > 0 ||
+				occupiedMeta ||
+				occupiedState ||
+				occupiedPending
+			)
+				throw new SessionError("storage", "Generated runtime append ID is already occupied");
+			const active = attachment.laneState.value.currentOperationId !== null;
+			if (active) {
+				if (!attachment.runOperation || !attachment.runState)
+					throw new SessionError("corruption", "Active runtime append has no run authority");
+				const pending =
+					entry.type === "message"
+						? decodePendingEntry(encodePendingEntry({ type: "message", payload: entry.captured }))
+						: entry.pending;
+				const nextState: RunState = {
+					...attachment.runState.value,
+					inbox: {
+						...attachment.runState.value.inbox,
+						writes: [...attachment.runState.value.inbox.writes, id],
+					},
+				};
+				const committed = await this.#storage.commit({
+					writes: [
+						{
+							kind: "register",
+							op: "set",
+							namespace: "pending.entry",
+							key: id,
+							value: encodePendingEntry(pending),
+						},
+						{
+							kind: "register",
+							op: "set",
+							namespace: "op.state",
+							key: attachment.runOperation.value.operationId,
+							value: encodeRunState(nextState, attachment.runOperation.value.operationId),
+						},
+					],
+				});
+				const pendingEntries = new Map(attachment.pendingEntries);
+				pendingEntries.set(id, pending);
+				return Object.freeze({
+					status: "pending" as const,
+					entryId: id,
+					attachment: Object.freeze({
+						...attachment,
+						runState: Object.freeze({ seq: committed.seqs[1], value: structuredClone(nextState) }),
+						pendingEntries: new ImmutableMap(pendingEntries),
+					}),
+				});
+			}
 			const parentId = attachment.mainLeaf.value;
 			const committed = await this.#storage.commit({
 				writes: [
@@ -3589,11 +3663,205 @@ export class StoredSession implements Session {
 						}),
 			);
 			return Object.freeze({
+				status: "placed" as const,
 				entryId: id,
 				attachment: Object.freeze({
 					...attachment,
 					mainLeaf: Object.freeze({ seq: committed.seqs[1], value: id }),
 					entries: new ImmutableMap(entries),
+				}),
+			});
+		});
+		this.#mutationLine = operation.then(
+			() => undefined,
+			() => undefined,
+		);
+		return operation.catch((error) => {
+			throw storageFailure(error);
+		});
+	}
+
+	placeRuntimeWrites(transition: {
+		readonly operationId: string;
+		readonly expectedOperationStateSeq: number;
+		readonly expectedLeafSeq: number;
+		readonly expectedLeafId: string | null;
+		readonly entryIds: readonly string[];
+		readonly classifications: readonly {
+			readonly entryId: string;
+			readonly projection: "projecting" | "unprojected";
+		}[];
+	}): Promise<{ readonly status: "placed" | "obsolete"; readonly attachment: RuntimeAttachment }> {
+		if (this.#sealed) return Promise.reject(new SessionError("closed", "Session is closed"));
+		const transitionFields = new Set([
+			"operationId",
+			"expectedOperationStateSeq",
+			"expectedLeafSeq",
+			"expectedLeafId",
+			"entryIds",
+			"classifications",
+		]);
+		const classificationFields = new Set(["entryId", "projection"]);
+		if (
+			!isExactDataObject(transition, transitionFields) ||
+			!isDenseDataArray(transition.entryIds) ||
+			!isDenseDataArray(transition.classifications)
+		)
+			return Promise.reject(new SessionError("invalid_query", "Invalid runtime write placement transition"));
+		const ids = transition.entryIds;
+		const classifications = transition.classifications;
+		if (
+			typeof transition.operationId !== "string" ||
+			!isUuidV7(transition.operationId) ||
+			!Number.isSafeInteger(transition.expectedOperationStateSeq) ||
+			transition.expectedOperationStateSeq <= 0 ||
+			!Number.isSafeInteger(transition.expectedLeafSeq) ||
+			transition.expectedLeafSeq <= 0 ||
+			(transition.expectedLeafId !== null && !isUuidV7(transition.expectedLeafId)) ||
+			ids.length === 0 ||
+			ids.length !== classifications.length ||
+			new Set(ids).size !== ids.length ||
+			ids.some(
+				(id, index) =>
+					!isUuidV7(id) ||
+					!isExactDataObject(classifications[index], classificationFields) ||
+					classifications[index]?.entryId !== id ||
+					(classifications[index]?.projection !== "projecting" &&
+						classifications[index]?.projection !== "unprojected"),
+			)
+		)
+			return Promise.reject(new SessionError("invalid_query", "Invalid runtime write placement transition"));
+		const operationId = transition.operationId;
+		const expectedOperationStateSeq = transition.expectedOperationStateSeq;
+		const expectedLeafSeq = transition.expectedLeafSeq;
+		const expectedLeafId = transition.expectedLeafId;
+		const capturedIds = Object.freeze([...ids]);
+		const capturedClassifications = Object.freeze(
+			classifications.map(({ entryId, projection }) => Object.freeze({ entryId, projection })),
+		);
+		const operation = this.#mutationLine.then(async () => {
+			const attachment = await this.#loadRuntimeAttachment();
+			const state = attachment.runState;
+			if (
+				attachment.laneState.value.currentOperationId !== operationId ||
+				attachment.runOperation?.value.operationId !== operationId ||
+				state?.seq !== expectedOperationStateSeq ||
+				attachment.mainLeaf.seq !== expectedLeafSeq ||
+				attachment.mainLeaf.value !== expectedLeafId ||
+				!isDeepStrictEqual(state?.value.inbox.writes.slice(0, capturedIds.length), capturedIds)
+			)
+				return Object.freeze({ status: "obsolete" as const, attachment });
+			if (!state) throw new SessionError("corruption", "Matched placement authority has no run state");
+			const phase = state.value.phase;
+			const cancelled = state.value.control.status === "cancel_requested";
+			const eligible = cancelled
+				? phase.kind === "checkpoint" ||
+					phase.kind === "failure_drain" ||
+					(phase.kind === "assistant" &&
+						(phase.generation.status === "ready" || phase.generation.status === "retry_wait")) ||
+					(phase.kind === "tools" && phase.batch.calls.every((call) => call.status === "completed"))
+				: phase.kind === "failure_drain" || (phase.kind === "checkpoint" && phase.skipInboxOnce !== true);
+			if (!eligible) return Object.freeze({ status: "obsolete" as const, attachment });
+			for (let index = 0; index < capturedIds.length; index++) {
+				const pending = attachment.pendingEntries.get(capturedIds[index]);
+				if (!pending) throw new SessionError("corruption", "Placed runtime write payload is missing");
+				if (pending.type === "message" && capturedClassifications[index].projection !== "projecting")
+					throw new SessionError("invalid_query", "Message runtime writes must project");
+			}
+			let parentId = attachment.mainLeaf.value;
+			const entryWrites: Write[] = capturedIds.map((id) => {
+				const pending = attachment.pendingEntries.get(id)!;
+				const write: Write =
+					pending.type === "message"
+						? { kind: "entry", entry: { id, parentId, type: "message", payload: encodeMessage(pending.payload) } }
+						: {
+								kind: "entry",
+								entry: {
+									id,
+									parentId,
+									type: "custom",
+									customType: pending.customType,
+									...(Object.hasOwn(pending, "payload") ? { payload: structuredClone(pending.payload) } : {}),
+								},
+							};
+				parentId = id;
+				return write;
+			});
+			const projecting = capturedClassifications.some(({ projection }) => projection === "projecting");
+			const nextState: RunState = {
+				...state.value,
+				inbox: { ...state.value.inbox, writes: state.value.inbox.writes.slice(capturedIds.length) },
+				phase:
+					!cancelled && projecting
+						? {
+								kind: "checkpoint",
+								continuation: { kind: "need_assistant", overflowRecoveryUsed: false },
+								triggerEntryId: capturedIds.at(-1)!,
+								skipInboxOnce: true,
+							}
+						: state.value.phase,
+			};
+			const writes: Write[] = [
+				...entryWrites,
+				...capturedIds.map((key) => ({
+					kind: "register" as const,
+					op: "delete" as const,
+					namespace: "pending.entry",
+					key,
+				})),
+				{ kind: "register", op: "set", namespace: LEAF_NAMESPACE, key: MAIN, value: capturedIds.at(-1)! },
+				{
+					kind: "register",
+					op: "set",
+					namespace: "op.state",
+					key: operationId,
+					value: encodeRunState(nextState, operationId),
+				},
+			];
+			const committed = await this.#storage.commit({ writes });
+			const entries = new Map(attachment.entries);
+			const pendingEntries = new Map(attachment.pendingEntries);
+			for (let index = 0; index < capturedIds.length; index++) {
+				const id = capturedIds[index];
+				const pending = attachment.pendingEntries.get(id)!;
+				const entryParent = index === 0 ? attachment.mainLeaf.value : capturedIds[index - 1];
+				entries.set(
+					id,
+					pending.type === "message"
+						? Object.freeze({
+								id,
+								parentId: entryParent,
+								seq: committed.seqs[index],
+								timestamp: committed.timestamp,
+								type: "message" as const,
+								message: structuredClone(pending.payload),
+							})
+						: Object.freeze({
+								id,
+								parentId: entryParent,
+								seq: committed.seqs[index],
+								timestamp: committed.timestamp,
+								type: "custom" as const,
+								customType: pending.customType,
+								...(Object.hasOwn(pending, "payload") ? { data: structuredClone(pending.payload) } : {}),
+							}),
+				);
+				pendingEntries.delete(id);
+			}
+			return Object.freeze({
+				status: "placed" as const,
+				attachment: Object.freeze({
+					...attachment,
+					mainLeaf: Object.freeze({
+						seq: committed.seqs[capturedIds.length * 2],
+						value: capturedIds.at(-1)!,
+					}),
+					runState: Object.freeze({
+						seq: committed.seqs[capturedIds.length * 2 + 1],
+						value: structuredClone(nextState),
+					}),
+					entries: new ImmutableMap(entries),
+					pendingEntries: new ImmutableMap(pendingEntries),
 				}),
 			});
 		});

@@ -95,11 +95,11 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		await shell.close();
 	});
 
-	it("resolves a durable façade append without any postcommit storage read", async () => {
+	it("performs only attachment and collision reads before an active append commit, then resolves without reads", async () => {
 		const state = new MemoryStorageState();
-		const fixture = await rooted("idle", state.createStorage());
+		const fixture = await rooted("need", state.createStorage());
 		const backing = fixture.storage;
-		const readNames = new Set<PropertyKey>([
+		const readNames = [
 			"getEntries",
 			"getUsageRows",
 			"getRegister",
@@ -107,33 +107,52 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 			"scanEntries",
 			"scanBranch",
 			"getStats",
-		]);
+		] as const;
+		const events: string[] = [];
 		let armed = false;
-		let committed = false;
 		const storage = new Proxy(backing, {
 			get(target, property) {
 				const value: unknown = Reflect.get(target, property);
 				if (property === "commit")
 					return async (transaction: Parameters<Storage["commit"]>[0]) => {
+						events.push("commit:start");
 						const result = await target.commit(transaction);
-						if (armed) committed = true;
+						events.push("commit:end");
 						return result;
 					};
 				if (typeof value !== "function") return value;
 				return (...args: unknown[]) => {
-					if (readNames.has(property) && committed) return Promise.reject(new Error("read after commit"));
+					if (armed && readNames.includes(property as (typeof readNames)[number]))
+						events.push(`${String(property)}:${args.map(String).join("/")}`);
 					return Reflect.apply(value, target, args);
 				};
 			},
 		}) as Storage;
-		const { models } = availableModels();
-		const shell = await createRuntimeShell(session(storage), config(), { models });
+		const shell = await createRuntimeShell(session(storage), config());
+		events.length = 0;
 		armed = true;
 		const entryId = await shell.session.appendMessage(user("durable once"));
-		expect((await state.createStorage().getEntries([entryId])).has(entryId)).toBe(true);
-		committed = false;
-		const prompted = await shell.prompt(user("after durable append"));
-		expect(prompted.runOperation?.value.sourceLeafId).toBe(entryId);
+		const commitEnd = events.indexOf("commit:end");
+		expect(events.slice(commitEnd + 1)).toEqual([]);
+		expect(events.slice(0, commitEnd + 1)).toEqual([
+			"getRegister:lane.config/main",
+			"getRegister:lane.state/main",
+			"getRegister:lane.leaf/main",
+			`getRegister:op.meta/${fixture.operationId}`,
+			`getRegister:op.state/${fixture.operationId}`,
+			`getEntries:${[fixture.prompt, fixture.source].join(",")}`,
+			"getUsageRows:",
+			`getEntries:${entryId}`,
+			`getUsageRows:${entryId}`,
+			`getRegister:op.meta/${entryId}`,
+			`getRegister:op.state/${entryId}`,
+			`getRegister:pending.entry/${entryId}`,
+			"commit:start",
+			"commit:end",
+		]);
+		events.length = 0;
+		await expect(shell.session.getLeafId()).resolves.toBe(fixture.prompt);
+		expect(events).toEqual(["getRegister:lane.leaf/main"]);
 		await shell.close();
 	});
 
@@ -248,26 +267,289 @@ describe("D-050 RuntimeShell SessionTree façade", () => {
 		await shell.close();
 	});
 
-	it("rejects active-run façade writes busy and retained raw bypasses active without minting or writing", async () => {
+	it.each(["need", "ready", "pending", "finish"] as const)(
+		"admits façade writes during the active %s phase in FIFO order",
+		async (position) => {
+			const state = new MemoryStorageState();
+			const fixture = await rooted(position, state.createStorage());
+			const storage = instrumentStorage(fixture.storage);
+			const raw = session(storage);
+			const shell = await createRuntimeShell(raw, config());
+			storage.committedTransactions.length = 0;
+			const mutable = user("captured");
+			const calls = [
+				shell.session.appendMessage(mutable),
+				shell.session.appendCustomEntry("absent"),
+				shell.session.appendCustomEntry("null", null),
+			];
+			mutable.content = [{ type: "text", text: "mutated" }];
+			const ids = await Promise.all(calls);
+			expect(new Set(ids).size).toBe(3);
+			expect(storage.committedTransactions).toHaveLength(3);
+			for (const [index, entryId] of ids.entries()) {
+				expect(storage.committedTransactions[index].writes).toEqual([
+					expect.objectContaining({ kind: "register", op: "set", namespace: "pending.entry", key: entryId }),
+					expect.objectContaining({
+						kind: "register",
+						op: "set",
+						namespace: "op.state",
+						key: fixture.operationId,
+					}),
+				]);
+			}
+			const attachment = await raw.refreshRuntimeAttachment();
+			const originalLeaf = position === "finish" ? fixture.response : fixture.prompt;
+			expect(attachment.runState!.value.inbox.writes).toEqual(ids);
+			expect(attachment.pendingEntries.get(ids[0])).toEqual({ type: "message", payload: user("captured") });
+			expect(attachment.pendingEntries.get(ids[1])).not.toHaveProperty("payload");
+			expect(attachment.pendingEntries.get(ids[2])).toHaveProperty("payload", null);
+			expect(attachment.mainLeaf.value).toBe(originalLeaf);
+			expect([...attachment.entries.keys()]).not.toEqual(expect.arrayContaining(ids));
+			await expect(shell.session.getLeafId()).resolves.toBe(originalLeaf);
+			await shell.close();
+			const reopenedRaw = session(state.createStorage());
+			const reopened = await createRuntimeShell(reopenedRaw, config());
+			const restored = await reopenedRaw.refreshRuntimeAttachment();
+			expect(restored.runState!.value.inbox.writes).toEqual(ids);
+			expect([...restored.pendingEntries.keys()]).toEqual(ids);
+			await reopened.close();
+		},
+	);
+
+	it.each([
+		["tools", "tools"],
+		["failure drain", "failure_drain"],
+		["cancelled checkpoint", "cancelled-checkpoint"],
+		["cancelled assistant", "cancelled-assistant"],
+		["cancelled tools", "cancelled-tools"],
+	] as const)("preserves exact %s phase, control, and leaf while admitting FIFO writes", async (_label, shape) => {
+		const failure = {
+			code: "provider_interrupted",
+			message: "Provider outcome unknown after interruption",
+		};
+		const fixture = await rooted(
+			shape === "tools" || shape === "cancelled-tools" || shape === "failure_drain" ? "finish" : "need",
+			new MemoryStorage(),
+			{},
+			shape === "tools" || shape === "cancelled-tools"
+				? json(toolMessage([{ id: "call-a" }]))
+				: shape === "failure_drain"
+					? json({
+							role: "assistant",
+							api: "harness",
+							provider: "test",
+							model: "current",
+							content: [],
+							usage: ZERO_USAGE,
+							stopReason: "error",
+							errorMessage: failure.message,
+							timestamp: 1,
+						})
+					: undefined,
+		);
+		const current = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const value = structuredClone(current.value) as unknown as RunState;
+		const completedTools = {
+			kind: "tools" as const,
+			batch: {
+				assistantEntryId: fixture.response,
+				configuration: config(),
+				turnId: id(),
+				calls: [
+					{
+						status: "planned" as const,
+						sourceIndex: 0,
+						resultEntryId: createIdGenerator().next(uuidV7Timestamp(fixture.response)),
+					},
+				],
+			},
+		};
+		if (shape === "tools" || shape === "cancelled-tools") value.phase = completedTools;
+		else if (shape === "failure_drain")
+			value.phase = {
+				kind: "failure_drain",
+				error: failure,
+				provenance: { kind: "response", entryId: fixture.response },
+			};
+		else if (shape === "cancelled-assistant") {
+			value.phase = {
+				kind: "assistant",
+				generation: {
+					status: "ready",
+					context: {
+						stepId: fixture.stepId,
+						triggerEntryId: fixture.prompt,
+						configuration: config(),
+						streamOptions: {},
+						retryPolicy: { maxAttempts: 1, baseDelayMs: 1 },
+						overflowRecoveryUsed: false,
+					},
+					nextAttempt: 1,
+				},
+			};
+		}
+		if (shape.startsWith("cancelled"))
+			value.control = { status: "cancel_requested", requestedAt: 7, drainedSteer: [], drainedFollowUp: [] };
+		await fixture.storage.commit({
+			writes: [{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: json(value) }],
+		});
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		storage.committedTransactions.length = 0;
+		const before = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		const ids = await Promise.all([
+			shell.session.appendMessage(user("first")),
+			shell.session.appendCustomEntry("second", { order: 2 }),
+		]);
+		expect(storage.committedTransactions).toHaveLength(2);
+		for (const transaction of storage.committedTransactions)
+			expect(
+				transaction.writes.map((write) =>
+					write.kind === "register" && write.op === "set" ? write.namespace : write.kind,
+				),
+			).toEqual(["pending.entry", "op.state"]);
+		const after = (await fixture.storage.getRegister("op.state", fixture.operationId))!.value as unknown as RunState;
+		expect(after.phase).toEqual(before.phase);
+		expect(after.control).toEqual(before.control);
+		expect(after.inbox.writes).toEqual(ids);
+		expect(await fixture.storage.getRegister("lane.leaf", "main")).toMatchObject({
+			value:
+				shape === "tools" || shape === "cancelled-tools" || shape === "failure_drain"
+					? fixture.response
+					: fixture.prompt,
+		});
+		await shell.close();
+	});
+
+	it("retains raw attached-session ownership while façade writes are admitted active", async () => {
 		const fixture = await rooted("need");
 		const storage = instrumentStorage(fixture.storage);
 		const raw = session(storage);
 		const ids = vi.spyOn(raw.idGenerator, "next");
 		const shell = await createRuntimeShell(raw, config());
 		const beforeIds = ids.mock.calls.length;
-		const beforeWrites = storage.attempts.length;
-		await expect(shell.session.appendMessage(user("busy"))).rejects.toMatchObject({ code: "busy" });
-		await expect(shell.session.appendCustomEntry("busy")).rejects.toMatchObject({ code: "busy" });
-		await Promise.all(
-			Array.from({ length: 4 }, async (_, index) => {
-				await expect(raw.appendMessage(user(`raw-${index}`))).rejects.toMatchObject({ code: "active" });
-				await expect(raw.appendCustomEntry(`raw-${index}`)).rejects.toMatchObject({ code: "active" });
-			}),
-		);
+		const beforeWrites = storage.committedTransactions.length;
+		await expect(raw.appendMessage(user("raw"))).rejects.toMatchObject({ code: "active" });
+		await expect(raw.appendCustomEntry("raw")).rejects.toMatchObject({ code: "active" });
 		await expect(raw.close()).rejects.toMatchObject({ code: "active" });
 		expect(ids).toHaveBeenCalledTimes(beforeIds);
-		expect(storage.attempts).toHaveLength(beforeWrites);
-		await expect(shell.session.getLeafId()).resolves.toBe(fixture.prompt);
+		expect(storage.committedTransactions).toHaveLength(beforeWrites);
+		await expect(shell.session.appendMessage(user("facade"))).resolves.toEqual(expect.any(String));
+		await shell.close();
+	});
+
+	it("admits an already-started active façade append before close and rejects close-first admission", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		const commit = storage.commit.bind(storage);
+		let release!: () => void;
+		let entered!: () => void;
+		const blocked = new Promise<void>((resolve) => {
+			release = resolve;
+		});
+		const admitted = new Promise<void>((resolve) => {
+			entered = resolve;
+		});
+		storage.commit = async (transaction) => {
+			entered();
+			await blocked;
+			return commit(transaction);
+		};
+		const append = shell.session.appendCustomEntry("admitted");
+		await admitted;
+		const close = shell.close();
+		release();
+		await expect(append).resolves.toEqual(expect.any(String));
+		await close;
+		await expect(shell.session.appendCustomEntry("late")).rejects.toMatchObject({ code: "closed" });
+	});
+
+	it.each([
+		"queue logical id",
+		"nonqueue logical id",
+		"entry",
+		"usage",
+		"op.meta",
+		"op.state",
+		"pending.entry",
+	] as const)("faults without publication or remint when an active append id collides with %s", async (collision) => {
+		const fixture = await rooted("need");
+		const collisionId = collision === "nonqueue logical id" ? fixture.operationId : id();
+		if (collision === "queue logical id") {
+			const lane = (await fixture.storage.getRegister("lane.state", "main"))!;
+			await fixture.storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: "lane.state",
+						key: "main",
+						value: { ...(lane.value as object), pendingNextRun: [collisionId] },
+					},
+					{
+						kind: "register",
+						op: "set",
+						namespace: "pending.entry",
+						key: collisionId,
+						value: json({ type: "message", payload: user("queued") }),
+					},
+				],
+			});
+		} else if (collision === "entry")
+			await fixture.storage.commit({
+				writes: [
+					{
+						kind: "entry",
+						entry: { id: collisionId, parentId: fixture.prompt, type: "custom", customType: "occupied" },
+					},
+				],
+			});
+		else if (collision === "usage")
+			await fixture.storage.commit({
+				writes: [{ kind: "usage", row: { id: collisionId, usage: ZERO_USAGE, adjustment: true } }],
+			});
+		else if (collision !== "nonqueue logical id")
+			await fixture.storage.commit({
+				writes: [
+					{
+						kind: "register",
+						op: "set",
+						namespace: collision,
+						key: collisionId,
+						value: collision === "pending.entry" ? { type: "custom", customType: "occupied" } : {},
+					},
+				],
+			});
+		const storage = instrumentStorage(fixture.storage);
+		const raw = session(storage);
+		const next = vi.spyOn(raw.idGenerator, "next").mockReturnValue(collisionId);
+		const shell = await createRuntimeShell(raw, config());
+		const before = storage.committedTransactions.length;
+		const beforeAttachment = await raw.refreshRuntimeAttachment();
+		const fault = await shell.session.appendMessage(user("collision")).catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault", cause: { code: "storage" } });
+		expect(next).toHaveBeenCalledTimes(1);
+		expect(storage.committedTransactions).toHaveLength(before);
+		expect(beforeAttachment.runState!.value.inbox.writes).toEqual([]);
+		await expect(shell.peekAction()).rejects.toBe(fault);
+		await shell.close();
+	});
+
+	it("faults with the original storage cause when an active append commit fails without publication", async () => {
+		const fixture = await rooted("need");
+		const storage = instrumentStorage(fixture.storage);
+		const raw = session(storage);
+		const shell = await createRuntimeShell(raw, config());
+		const before = await raw.refreshRuntimeAttachment();
+		const cause = new Error("injected active append commit failure");
+		storage.commit = vi.fn().mockRejectedValueOnce(cause);
+		const fault = await shell.session.appendCustomEntry("failed").catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault", cause: { code: "storage", cause } });
+		const durable = await raw.refreshRuntimeAttachment();
+		expect(durable.runState).toEqual(before.runState);
+		expect(durable.pendingEntries).toEqual(before.pendingEntries);
+		await expect(shell.peekAction()).rejects.toBe(fault);
 		await shell.close();
 	});
 

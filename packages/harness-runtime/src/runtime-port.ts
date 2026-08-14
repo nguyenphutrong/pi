@@ -30,6 +30,25 @@ import {
 import type { Session } from "./types.ts";
 import { SessionError } from "./types.ts";
 
+export interface RuntimeWritePlacement {
+	readonly entryId: string;
+	readonly projection: "projecting" | "unprojected";
+}
+
+export interface RuntimeWritePlacementTransition {
+	readonly operationId: string;
+	readonly expectedOperationStateSeq: number;
+	readonly expectedLeafSeq: number;
+	readonly expectedLeafId: string | null;
+	readonly entryIds: readonly string[];
+	readonly classifications: readonly RuntimeWritePlacement[];
+}
+
+export type RuntimeWritePlacementResult = {
+	readonly status: "placed" | "obsolete";
+	readonly attachment: RuntimeAttachment;
+};
+
 const runtimeOwners = new WeakMap<StoredSession, RuntimeOwner>();
 
 export function attachRuntime(session: Session, seed: LaneConfiguration): Promise<RuntimeAttachment> {
@@ -138,6 +157,15 @@ export function consumeOperationQueue(
 	if (!(session instanceof StoredSession))
 		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
 	return session.consumeOperationQueue(transition);
+}
+
+export function placeRuntimeWrites(
+	session: Session,
+	transition: RuntimeWritePlacementTransition,
+): Promise<RuntimeWritePlacementResult> {
+	if (!(session instanceof StoredSession))
+		return Promise.reject(new SessionError("storage", "Session does not support internal runtime transitions"));
+	return session.placeRuntimeWrites(transition);
 }
 
 export function prepareAssistantEffect(

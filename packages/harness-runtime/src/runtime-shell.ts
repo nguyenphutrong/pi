@@ -282,7 +282,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 			appendMessage: (message) =>
 				this.#captureThenAdmit(
 					() => encodeMessage(message) as unknown as Message,
-					(captured) => this.#appendIdle(() => owner.appendMessage(captured)),
+					(captured) => this.#append(() => owner.appendMessage(captured)),
 				),
 			appendCustomEntry: (customType, data) =>
 				this.#captureThenAdmit(
@@ -300,7 +300,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 							data: Object.hasOwn(captured, "payload") ? captured.payload : undefined,
 						};
 					},
-					(captured) => this.#appendIdle(() => owner.appendCustomEntry(captured.customType, captured.data)),
+					(captured) => this.#append(() => owner.appendCustomEntry(captured.customType, captured.data)),
 				),
 		};
 		this.session = Object.freeze(facade);
@@ -382,9 +382,7 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		return this.#faultShell(undefined, cause, "Runtime transition failed");
 	}
 
-	async #appendIdle(append: () => Promise<RuntimeAppendResult>): Promise<string> {
-		if (this.#current.laneState.value.currentOperationId !== null)
-			throw new RuntimeShellError("busy", "Main lane is busy");
+	async #append(append: () => Promise<RuntimeAppendResult>): Promise<string> {
 		try {
 			const result = await append();
 			this.#publish(result.attachment);
