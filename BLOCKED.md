@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Phase 4.3 was completed by `26791c55f` and passed fresh independent review; resume at the Phase 4 whole-phase Recovery/QA and conformance gates.
+No active blockers. Phase 4 final acceptance passed independent Recovery/QA and whole-phase review; resume at Phase 5.1 hook pipeline foundation design.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 

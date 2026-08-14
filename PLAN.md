@@ -2,19 +2,19 @@
 
 ## Current checkpoint
 
-- Phase: 4 — Queues and interactive control
-- Work item: Phase 4 final acceptance
-- Status: Phase 4.3 is complete at `26791c55f`; run an independent whole-phase conformance review and Recovery/QA gate before advancing to Phase 5
-- Done bar: every Phase 4 queue, deferred-write, idle-waiter, abort, close, and SQLite process-death history satisfies the spec with no forbidden durable or package-boundary regression
+- Phase: 5 — Hooks, events, and snapshots
+- Work item: 5.1 — Hook pipeline foundation
+- Status: Phase 4 final acceptance passed independent whole-phase review and Recovery/QA; re-read the Phase 5 hook/event/watch contracts and design the smallest complete hook slice
+- Done bar: the approved first slice has one explicit owner, exact hook ordering and failure semantics, deterministic close/abort behavior, and no speculative event or snapshot surface
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the Phase 4 queue, deferred-write, abort, idle-control, race-catalog, and testing-tier sections as one acceptance contract.
-2. Run Recovery/QA across the complete Harness suite and the real SQLite queue/deferred-write process-death matrices.
-3. Run a fresh independent whole-phase review against D-047 through D-056 and the Phase 4 done bar.
-4. Record and commit Phase 4 final acceptance if both gates pass.
-5. Begin Phase 5 with a narrow hooks/events/snapshots design slice; do not combine all three surfaces in one increment.
+1. Re-read `harness-v3.md` hook pipeline, callback failure, effect start/settlement, abort, close, event, watch, and testing-tier sections.
+2. Produce 2–3 concrete ownership/ordering options for the smallest complete hook pipeline foundation.
+3. Run an independent design review against package boundaries and later passive-event/watch requirements.
+4. Implement one atomic hook slice only after the design gate passes.
+5. Add Tier B/C hook ordering, abort, close, callback-failure, and reopen evidence before expanding to passive events.
 
 ## Phase order
 
