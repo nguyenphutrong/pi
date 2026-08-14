@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 4 — Queues and interactive control
-- Work item: 4.2f — Representative SQLite deferred-write process-crash evidence
-- Status: D-055 four-case projecting/unprojected × pre/post-placement design passed independent review; implement the dedicated real-SIGKILL matrix without a production seam
-- Done bar: real SQLite subprocess deaths before and after deferred-write placement reopen deterministically with exact pending/entry/state/leaf/lease evidence, no duplicate projection or write, lawful fence takeover, and a final fresh no-op without adding a production seam
+- Work item: 4.3 — `waitForIdle` and `runWhenIdle`
+- Status: Phase 4.2 is complete at `d89d1875d`; re-read the waiter public API and settlement semantics, then design the smallest process-local lifecycle over the durable lane state
+- Done bar: waiters and idle callbacks settle exactly once across prompt, queue, abort, terminal, fault, and close histories; callbacks never become durable work or run while the lane is active; fresh reopen derives only current durable state
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement the dedicated subprocess support, child protocol, and four-case parent oracle.
-2. Run the focused process matrix and correct every exact durable/effect mismatch.
-3. Run complete Harness/SQLite verification, fresh independent review, and commit Phase 4.2f.
-4. Design `waitForIdle` and `runWhenIdle` settlement behavior against the Phase 4 queue state machine.
-5. Implement waiter/idle-callback lifecycle, abort, close, and recovery coverage.
+1. Re-read `harness-v3.md` public API, terminal, restore, and queue sections for waiter ownership and exact idle definition.
+2. Produce and independently review concrete `waitForIdle`/`runWhenIdle` lifecycle options.
+3. Implement the approved process-local waiter and callback behavior without changing Storage or durable state.
+4. Add deterministic settlement, abort, close, fault, reentrancy, and fresh-reopen coverage.
+5. Run complete Harness verification, fresh independent review, and commit Phase 4.3.
 
 ## Phase order
 

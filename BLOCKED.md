@@ -2,7 +2,7 @@
 
 ## Current status
 
-No active blockers. Phase 4.2e was implemented by `4643c85cf` and passed fresh independent review.
+No active blockers. Phase 4.2 was completed by `d89d1875d` and passed fresh independent review; resume at Phase 4.3 waiter and idle-callback design.
 
 ## B-017 — Choose how to replace the unlawful D-052 placement fixture
 
