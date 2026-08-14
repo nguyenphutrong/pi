@@ -4,16 +4,16 @@
 
 - Phase: 5 — Hooks, events, and snapshots
 - Work item: 5.3 — First public event-catalog increment
-- Status: Phase 5.2 passive events foundation is committed and independently accepted; design the next smallest event set around explicit durable commit owners before adding snapshots or `watch()`
-- Done bar: every selected event has one explicit publication owner and durable visibility boundary, remains passive and content-safe, and introduces no durable event log or premature snapshot/watch contract
+- Status: corrected D-059 passed fresh independent design review; implement the paired private finish result, exact public type, and sole postcommit publication
+- Done bar: each successful authoritative RuntimeShell finish action publishes one complete v3 `run_end` after attachment publication and before action resolution; direct Session calls, replay, and process failure after commit are not delivery guarantees, while obsolete/failed/idle-reopen paths publish none
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read the event catalog and current RuntimeShell commit owners; design the smallest coherent public increment.
-2. Obtain an independent design review before exposing additional event names or payloads.
-3. Implement only the approved publications and public type additions.
-4. Add independent ordering, failure, lifecycle, and zero-extra-write evidence; run full verification and fresh review.
+1. Implement only the approved private finish-result completion, public type, and postcommit publication.
+2. Add independent ordering, outcome, lifecycle, and zero-extra-write evidence.
+3. Run focused and complete Harness verification plus root checks.
+4. Obtain a fresh independent implementation review and correct any finding before commit.
 5. Checkpoint Phase 5.3, then design gap-free snapshots/subscriptions before exposing `watch()`.
 
 ## Phase order

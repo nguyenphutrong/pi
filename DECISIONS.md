@@ -1718,3 +1718,54 @@ Each listener invocation crosses `pi.harness.event_handler` with only canonical 
 Telemetry calls one private idempotent `invokeOnce` closure that captures the listener's own promise and attaches failure reporting to that promise only. If `TelemetryContext.startSpan` throws, rejects, omits, delays, or repeats its callback, the registry invokes or returns the same listener promise exactly once; adapter failure is swallowed independently and never causes fallback reinvocation or `handler_error`. This keeps adapter faults isolated while still making an ordinary listener rejection visible once.
 
 The narrower event map is deliberate. `entry_added`/`usage`, queue, abort/end, tool/message/turn/retry, fact/config, structural, fault, and lane events remain absent until their exact procedure owners and complete payload/order contracts are implemented. This keeps the module deep: callers learn one stable typed `on` seam while registration snapshots, detachment, isolation, recursion control, and telemetry remain local inside the registry. Adding later map members and explicit publisher calls is additive. Corrected independent review reports PASS. No §6 ambiguity or retention obligation is activated.
+
+## D-059 — Close the visible run lifecycle at the terminal commit
+
+- Date: 2026-08-14
+- Phase: 5
+- Status: accepted after corrected independent design review
+- References: D-017, D-025–D-030, D-058; `packages/agent/docs/harness-v3.md` §§3.13, 4.1–4.8, 5.1, 5.4–5.5, 5.8, 9.1–9.3
+
+### Options
+
+1. Add only `run_end`, completing D-058's visible run lifecycle through the one existing terminal-transaction owner.
+2. Add `run_abort` and `run_end` together, which also requires distinguishing the first durable abort marker from later idempotent observations before publishing once.
+3. Add `entry_added` and `usage` for assistant settlement, even though those names would be incomplete until prompt, queue, tool, direct-write, and recorded-usage commit owners also publish them.
+
+### Choice
+
+Option 1. `run_end` has one authoritative owner: `RuntimeShell.executeAction()` receives a committed `finishRun()` result only after the terminal transaction has deleted operation-owned registers, written `lane.lastResult`, and cleared `lane.state.currentOperationId`. RuntimeShell first publishes the committed attachment, then publishes exactly one detached `run_end`, then resolves the manual action. Obsolete authority, commit failure, close-before-admission, and an idle reopen publish nothing. A terminal job admitted before close may complete its postcommit publication after sealing under D-058's existing rule. No attachment diff, register readback, historical replay, durable event row, or extra transaction is allowed.
+
+The public event exactly follows the v3 catalog:
+
+```ts
+type OptionalFinalAssistant =
+  | { readonly finalEntryId: string; readonly finalMessage: AssistantMessage }
+  | { readonly finalEntryId?: never; readonly finalMessage?: never };
+
+type RunEndEvent = {
+  readonly type: "run_end";
+  readonly lane: "main";
+  readonly runId: string;
+  readonly leafId: string | null;
+  readonly recovery?: true;
+} & (
+  | ({ readonly outcome: "completed" } & OptionalFinalAssistant)
+  | ({ readonly outcome: "aborted" } & OptionalFinalAssistant)
+  | ({ readonly outcome: "failed";
+       readonly error: { readonly code: string; readonly message: string;
+                         readonly details?: JsonValue } } & OptionalFinalAssistant)
+);
+```
+
+All three outcomes permit both final-assistant fields or neither and never one alone. The currently reachable completed-assistant and failed paths carry both; an all-terminating tool completion carries neither; aborted runs follow whether a latest settled assistant exists. The current private `FailedRunResult` mandates only `finalEntryId`, while `AbortedRunResult` models the two fields independently. This slice replaces those shapes with the same paired internal union already used by completed results and adds the failed final message from the assistant entry already hydrated by `finishRun()`. The public error type includes optional JSON `details`; current durable run failures omit it, while registry contract tests cover the present and absent public shapes. No Storage, durable, public Session, or `pi-ai` contract changes and no new read are required.
+
+`recovery?: true` remains in the exact public lane-event type, but this increment does not emit it. The spec reserves that marker for process-local lifecycle re-emitted by `resume()`; `run_end` here reports a newly committed terminal fact. Reopening an already idle lane never replays it, while reopening an open operation and later committing its terminal transaction emits the same ordinary postcommit `run_end`. A later `run_resume` slice may add only its own exact recovery lifecycle once that public procedure exists.
+
+D-058's registry remains the sole delivery mechanism: FIFO-start snapshot, deep detachment/freezing, idempotent unsubscribe, nonblocking listener promises, bounded `handler_error`, and hostile telemetry isolation apply unchanged. Listener telemetry remains `pi.harness.event_handler` with only `pi.event.type` and `pi.lane.name`; outcome, errors, ids, and message content never enter span attributes.
+
+The delivery guarantee is intentionally process-local: one successful authoritative RuntimeShell finish action publishes one detached `run_end` after attachment publication and before resolving that action. It does not cover direct internal Session calls, process failure after the terminal commit, replay, or durable/global delivery.
+
+Required evidence covers completed and aborted results with and without the final-assistant pair; reachable failed projection with the pair plus public type/registry coverage of an absent pair; error `details` present/absent detachment and deep freezing; exact counterpart-field absence; postcommit listener start before action resolution; unchanged terminal transaction count and write list; listener throw/rejection and hostile-telemetry isolation; stale/obsolete and failed commits; both finish/close orders; idle reopen without replay; open-operation reopen followed by one ordinary event without `recovery`; and unchanged terminal durable state. `run_abort`, entry/usage, message/turn/tool/retry, queue/fact/config, structural, fault, snapshots, buffering, and `watch()` remain deferred to explicit owner designs.
+
+The corrected independent design review reports PASS with no remaining finding and no §6 escalation.
