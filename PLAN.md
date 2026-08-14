@@ -4,17 +4,17 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.2e — Projector/context and planner integration
-- Status: Phase 4.2d committed and independently accepted; start the D-050 4.2e design slice from the authoritative spec
+- Status: D-054 design independently accepted; implement RuntimeShell-owned projection and the pure deferred-write planner action
 - Done bar: RuntimeShell projects the selected FIFO write prefix sequentially outside the mutation line, invokes atomic placement with exact authority, makes stale/fault/close behavior deterministic, projects committed custom entries identically into provider context, and planner order obeys writes-before-queues plus cancellation reconciliation without changing Storage or durable codecs
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Design projector/context and planner integration against D-050 and `harness-v3.md`.
-2. Implement committed custom-entry context projection and the deferred-write planner action.
+1. Add the pure `apply_deferred_writes` planner action with exact running/cancelled order.
+2. Implement one RuntimeShell projection path for pending classification and committed provider context.
 3. Add stale projector, fault, abort, admission, and close interleaving coverage.
-4. Add representative SQLite deferred-write crash evidence.
-5. Add `waitForIdle` and `runWhenIdle`.
+4. Obtain fresh independent Phase 4.2e review and commit.
+5. Add representative SQLite deferred-write crash evidence.
 
 ## Phase order
 

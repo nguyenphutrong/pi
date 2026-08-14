@@ -1583,3 +1583,26 @@ This replaces only invalid test ownership. The independently reviewed production
 ### Outcome
 
 Commit `7b2266f0d` implements D-052 under the D-053 ownership rule. Every D-052 history bootstraps its valid structural state before creating its sole `StoredSession`, retains one `RuntimeOwner`, and performs every post-claim admission, placement, cancellation, abort, later admission, and close through that Session's mutation line. Matching-authority corruption tests use isolated read-fault injection rather than a competing durable mutation. Focused placement passes 99/99, complete Harness passes 695/695, root check and diff check pass, and a fresh independent review reports PASS with no production, spec, or package-boundary finding.
+
+## D-054 — Keep deferred-write projection in RuntimeShell
+
+- Date: 2026-08-14
+- Phase: 4
+- Status: accepted after independent design review
+- References: D-050–D-053; `packages/agent/docs/harness-v3.md` §§2.2, 2.5, 3.11–3.12, 4.1–4.8, 5.2–5.3, 9.1–9.3
+
+### Options
+
+1. RuntimeShell captures the projector registry, projects both prospective pending entries and committed branch entries, and invokes the unchanged private D-052 placement transition.
+2. Pass application projector callbacks into StoredSession so Session owns pending classification and context projection.
+3. Add a new projection module even though RuntimeShell remains its only orchestration owner.
+
+### Choice
+
+Option 1. RuntimeShell captures one immutable custom-type-to-function mapping at construction. One private projection path receives a stable `ProjectableCustomEntry`: pending writes construct it from the exact selected id and prospective FIFO parent; committed context reconstructs it by omitting exactly `seq` and `timestamp`. Both preserve absent `data` versus explicit JSON `null`, invoke projectors sequentially in entry order, and validate and detach every returned Message. The callback function's own closed-over state remains the application's deterministic/idempotent responsibility.
+
+The pure planner adds `apply_deferred_writes` carrying the exact FIFO id snapshot. A running checkpoint without `skipInboxOnce` applies writes before steer; failure drain applies writes before steer and follow-up. Cancelled control first reconciles any intended assistant or tool effect, then applies writes from every D-052-eligible phase before aborted finish. The action never includes admissions that happen after planning.
+
+RuntimeShell runs projectors outside the StoredSession mutation line and calls the unchanged D-052 transition with exact operation-state and leaf authority plus one classification per id. Messages are always projecting. A custom write is projecting only when its projector returns at least one valid message; no projector, `undefined`, or `[]` is unprojected. Placement `obsolete` publishes the fresh attachment, discards all computed output, and leaves the next manual action or automatic loop to replan and reproject. Projector throw/rejection or malformed output faults the shell before any placement write. An admitted job finishes before close; close that seals first prevents projector execution.
+
+Provider context remains RuntimeShell-owned: scan the currently implemented message/custom branch oldest-first, preserve built-in assistant filtering, and run custom entries through the same projector path before preparing a provider intent. Compaction-bounded scanning is added only when compaction entries exist in their ordered phase; this increment adds no placeholder type or schema. No Session callback capability, Storage/schema change, `pi-ai` change, package-root export, hooks/events, or SQLite process-crash evidence belongs to 4.2e. Independent design review reports PASS with no §6 escalation.
