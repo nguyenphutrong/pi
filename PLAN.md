@@ -3,18 +3,18 @@
 ## Current checkpoint
 
 - Phase: 5 — Hooks, events, and snapshots
-- Work item: 5.3 — First public event-catalog increment
-- Status: corrected D-059 passed fresh independent design review; implement the paired private finish result, exact public type, and sole postcommit publication
-- Done bar: each successful authoritative RuntimeShell finish action publishes one complete v3 `run_end` after attachment publication and before action resolution; direct Session calls, replay, and process failure after commit are not delivery guarantees, while obsolete/failed/idle-reopen paths publish none
+- Work item: 5.4 — Gap-free snapshot/subscription prerequisites
+- Status: D-059 `run_end` is committed and independently accepted; design the smallest complete mutation-to-event coverage required before a spec-faithful `watch()` can buffer across snapshot delivery
+- Done bar: every currently reachable snapshot field has an explicit authoritative source and every mutation during the snapshot/start gap has an owned event, or the design names the prerequisite catalog increments that must land before `watch()`
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Implement only the approved private finish-result completion, public type, and postcommit publication.
-2. Add independent ordering, outcome, lifecycle, and zero-extra-write evidence.
-3. Run focused and complete Harness verification plus root checks.
-4. Obtain a fresh independent implementation review and correct any finding before commit.
-5. Checkpoint Phase 5.3, then design gap-free snapshots/subscriptions before exposing `watch()`.
+1. Map every current `LaneSnapshot` field to durable/process-local ownership and every mutation procedure.
+2. Compare implementing `watch()` now against first completing the required entry/queue/write event owners.
+3. Record the smallest spec-faithful sequence and obtain an independent design review.
+4. Implement and independently test/review only the first approved prerequisite increment.
+5. Repeat until the snapshot/buffer/start contract can be exposed without gaps or replay inference.
 
 ## Phase order
 

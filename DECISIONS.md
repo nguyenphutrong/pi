@@ -1769,3 +1769,7 @@ The delivery guarantee is intentionally process-local: one successful authoritat
 Required evidence covers completed and aborted results with and without the final-assistant pair; reachable failed projection with the pair plus public type/registry coverage of an absent pair; error `details` present/absent detachment and deep freezing; exact counterpart-field absence; postcommit listener start before action resolution; unchanged terminal transaction count and write list; listener throw/rejection and hostile-telemetry isolation; stale/obsolete and failed commits; both finish/close orders; idle reopen without replay; open-operation reopen followed by one ordinary event without `recovery`; and unchanged terminal durable state. `run_abort`, entry/usage, message/turn/tool/retry, queue/fact/config, structural, fault, snapshots, buffering, and `watch()` remain deferred to explicit owner designs.
 
 The corrected independent design review reports PASS with no remaining finding and no §6 escalation.
+
+### Outcome
+
+Commit `ee3fee2ee` implements D-059. RuntimeShell now publishes one exact detached `run_end` after an authoritative terminal attachment and before action resolution; all outcomes preserve the paired final-assistant contract, failed results include the hydrated detached final message, and reopen/close/stale paths follow the approved process-local boundary. Focused event/RuntimeShell tests pass 309/309, complete Harness passes 786/786, root check and diff check pass, and fresh independent final review reports PASS with no blocking finding.
