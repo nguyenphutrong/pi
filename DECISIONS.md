@@ -1639,3 +1639,26 @@ The bounded versioned protocol carries only public S/O/P/W identities and exact 
 Commit `d89d1875d` implements D-055. Four isolated real-SQLite subprocess cases self-terminate with `SIGKILL` before or after placement, reopen at exact lease expiry with fence 2, prove exact sequence/register/branch/stat/lease state, and finish aborted with one admission, one placement, one projector invocation, no provider/tool start, and a byte-identical fresh idle snapshot. Focused D-055 passes 4/4; complete Harness passes 723/723; root check and diff check pass; fresh independent final review reports PASS.
 
 The unprojected post-placement case exposed a bounded-closure defect: `triggerEntryId` is the correlation source and remains P, while `lane.leaf` is the provider-context cursor and response parent W. Assistant normal and synthetic recovery settlement now append to the exact current leaf; terminal results retain that leaf separately from `latestAssistantEntryId`. A FIFO custom tail may contain unnamed intermediate entries, so restore follows D-048: it rejects contradictions expressible from directly hydrated identities and does not walk or infer unnamed ancestry. No durable field, register shape, Storage/schema, public API, or `pi-ai` contract changed.
+
+## D-056 — Coordinate idle waiters and callbacks inside RuntimeShell
+
+- Date: 2026-08-14
+- Phase: 4
+- Status: accepted after corrected independent design review
+- References: D-047–D-055; `packages/agent/docs/harness-v3.md` §§4.3, 4.7–4.8, 5.1, 9.1–9.3
+
+### Options
+
+1. Add a private Session/runtime-port idle-registration seam even though Session cannot own process-local callback lifecycle.
+2. Replace RuntimeShell admission with a unified read/progress/surface/callback scheduler.
+3. Keep the existing admission line and add a RuntimeShell-local idle coordinator with authoritative refresh, tracked reads, and one process-local mutation reservation.
+
+### Choice
+
+Option 3. `waitForIdle` and `runWhenIdle` create process-local records, then a short admission-line job calls the existing `refreshRuntimeAttachment()`. That refresh crosses the authoritative StoredSession mutation line, publishes the latest attachment, and parks without holding either line when the lane remains active. No new Session/runtime-port capability, durable field, register, Storage/schema, package-root export, or `pi-ai` change is required.
+
+An idle pump runs after registration refresh, every authoritative publication, and reservation release. With durable `currentOperationId === null` and no reservation, it first resolves every eligible waiter at the same idle point, snapshots the current FIFO callback batch, synchronously installs one reservation, then runs only that batch asynchronously and sequentially. Callback throw/rejection settles only that callback's promise and does not fault the shell or stop later callbacks. Records registered during a running batch cross their own admission-line marker and wait for the next batch. Reservation release synchronously pumps again: a callback marker ordered before a waiting mutation takes the next reservation first; a mutation ordered before the marker runs first and the later refresh observes its resulting state.
+
+All state mutations and operation progress—including prompt, tree writes, queues, cancellation, abort, and manual actions—serialize on the admission line and wait for a running idle reservation there. SessionTree reads and `peekAction` use a separate tracked read admission that bypasses the line and reservation, so a callback may read the lane while holding its reservation; close seals and waits those reads. A callback that awaits a same-lane state mutation deadlocks behind its own reservation exactly as documented; fire-and-forget mutation proceeds after release. While the lane remains durably active no pending reservation is installed, so later active-operation jobs may lawfully commit; the exact terminal publication installs the reservation synchronously before a queued post-terminal mutation can start a new operation.
+
+Close and fault reject waiters and callbacks not yet started. Close waits the running callback batch, tracked reads, and every already-admitted line job before owner close; a running callback is never forcibly interrupted. Fresh reopen reconstructs nothing because records and reservations are process-local. Required Tier B/C coverage includes authoritative zero-write registration, active-to-terminal settlement, simultaneous waiters, FIFO/batch cutoff, both callback-marker-versus-mutation orders, callback reads and mutation reentrancy, sync/async rejection, abort/manual progress, close/fault in both orders, tracked-read drain, and fresh reopen isolation. Two corrected design reviews closed admission-line read deadlock and missing release-time reevaluation; the final independent review reports PASS.

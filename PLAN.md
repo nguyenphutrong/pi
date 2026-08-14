@@ -4,16 +4,16 @@
 
 - Phase: 4 — Queues and interactive control
 - Work item: 4.3 — `waitForIdle` and `runWhenIdle`
-- Status: Phase 4.2 is complete at `d89d1875d`; re-read the waiter public API and settlement semantics, then design the smallest process-local lifecycle over the durable lane state
+- Status: D-056 RuntimeShell-local idle coordinator design passed independent review; implement its authoritative registration, tracked reads, callback batch cutoff, reservation, release pump, and lifecycle settlement
 - Done bar: waiters and idle callbacks settle exactly once across prompt, queue, abort, terminal, fault, and close histories; callbacks never become durable work or run while the lane is active; fresh reopen derives only current durable state
 - Escalation policy: proceed automatically with the evidence-backed recommendation; ask only when available evidence cannot distinguish materially different outcomes
 
 ## Queue
 
-1. Re-read `harness-v3.md` public API, terminal, restore, and queue sections for waiter ownership and exact idle definition.
-2. Produce and independently review concrete `waitForIdle`/`runWhenIdle` lifecycle options.
-3. Implement the approved process-local waiter and callback behavior without changing Storage or durable state.
-4. Add deterministic settlement, abort, close, fault, reentrancy, and fresh-reopen coverage.
+1. Implement authoritative waiter/callback registration and the process-local idle pump in RuntimeShell.
+2. Split tracked read admission from reservation-aware state-mutation admission, including abort and manual drive.
+3. Add deterministic batch-cutoff, FIFO, callback-error, reentrancy, and terminal-order coverage.
+4. Add close/fault, tracked-read drain, and fresh-reopen coverage.
 5. Run complete Harness verification, fresh independent review, and commit Phase 4.3.
 
 ## Phase order
