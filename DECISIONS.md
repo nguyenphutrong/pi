@@ -1612,3 +1612,24 @@ Provider context remains RuntimeShell-owned: scan the currently implemented mess
 Commit `4643c85cf` implements D-054. The planner emits an exact frozen deferred-write snapshot before checkpoint queues and failure drains, while cancelled reconciliation preserves intended-effect precedence. RuntimeShell captures the projector registry, classifies prospective writes sequentially outside the mutation line, validates and detaches projector output, handles stale/fault/close outcomes deterministically, and projects committed custom entries through the same callback path into provider context. Hydration now accepts a custom trigger only for `need_assistant` checkpoints and their assistant phase, preserving message-only failure, tool, and finishing closures.
 
 Focused planner/queue/runtime coverage passes 386/386; the custom-trigger and attachment subset passes 474/474; complete Harness passes 714/714; root check and diff check pass. A fresh independent final review reports PASS with no blocking finding. Representative SQLite deferred-write process-death evidence remains the next isolated slice.
+
+## D-055 — Prove deferred-write SQLite recovery with four semantic process-death cases
+
+- Date: 2026-08-14
+- Phase: 4
+- Status: accepted after independent design review
+- References: D-045, D-049–D-054; `packages/agent/docs/harness-v3.md` §§2.2, 2.5, 3.3–3.5, 3.11–3.13, 5.2–5.3, 9.1–9.3
+
+### Options
+
+1. Use one mixed projecting/unprojected batch at the pre- and post-placement cuts. This proves FIFO placement but cannot independently prove that an unprojected write preserves the prior checkpoint.
+2. Use four independent cases: projecting or unprojected custom write crossed with process death before or after placement.
+3. Use the mixed batch plus one unprojected-only case. This reduces one process pair but leaves pre-placement unprojected recovery asymmetric.
+
+### Choice
+
+Option 2. Each case owns a separate real SQLite file and runs one initial child terminated by `SIGKILL`, one lawful recovery child at the exact lease-expiry boundary, and one fresh idle lifecycle. Projecting uses explicit JSON `null` and a registered projector returning one fixed valid message; unprojected omits data and uses a registered projector returning `[]`. The pre-placement cut dies after public active admission; the post-placement cut executes exactly one `apply_deferred_writes` action first. Mixed FIFO behavior remains with D-052/D-054 and is not duplicated here.
+
+The initial durable prefix has prompt P and operation O through sequence 8, then `pending.entry/W` at 9 and total operation state at 10. Placement writes W at 11, deletes its pending register at 12, advances the leaf at 13, and writes total operation state at 14. Recovery opens with fence 2 and exact all-nine-table evidence. Pre-placement recovery first projects and places W; post-placement recovery first observes `start_assistant_step`, with trigger W for projecting and P for unprojected, but aborts before executing it. Both paths then commit abort at 15 and the four-write terminal transaction at 16–19, ending with `next_seq = 20`, leaf W, exact aborted `lane.lastResult`, no operation or pending registers, and entries P then W in one branch segment.
+
+The bounded versioned protocol carries only public S/O/P/W identities and exact semantic events. The parent requires one custom admission and one placement action across both processes, one projector invocation across both process-local counters, no provider or tool start, initial-only model identity lookup, register/entry exclusivity, exact absent-versus-null payloads, exact sequence/timestamp/stats/branch-cache/register/lease rows, and a byte-identical all-nine-table snapshot across the final idle reopen. Projector output is never durable. D-045 and D-049 remain the broader transaction and queue crash authorities; no production seam, Storage/schema, `pi-ai`, mixed-batch, race, or SQL-internal cut belongs to this slice. Independent design review reports PASS with no §6 blocker.
