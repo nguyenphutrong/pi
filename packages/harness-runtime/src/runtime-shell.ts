@@ -10,12 +10,11 @@ import type {
 	Static,
 	TSchema,
 } from "@earendil-works/pi-ai";
+import { NOOP_TELEMETRY_CONTEXT, type TelemetryContext } from "@earendil-works/pi-telemetry";
 import {
-	type AfterToolCallCallback,
 	type AgentTool,
 	type AgentToolResult,
 	type AgentToolUpdateCallback,
-	type BeforeToolCallCallback,
 	type ExecutedToolCallOutcome,
 	executeToolCall,
 	type FinalizedToolCallOutcome,
@@ -26,6 +25,7 @@ import {
 import { isUuidV7, type JsonValue } from "@nguyenphutrong/pi-session-storage";
 import { decodePendingEntry, encodeMessage, encodePendingEntry } from "./codec.ts";
 import type { LaneConfiguration, StreamOptions } from "./durable.ts";
+import { ToolHookRegistry, type ToolHooks } from "./hooks.ts";
 import { type ActionInfo, assistantEffectKey, type PlannedAction, planAction, toolEffectKey } from "./planner.ts";
 import {
 	acceptPrompt,
@@ -98,8 +98,7 @@ export interface RuntimeShellOptions<TContext extends object | undefined = objec
 	readonly models?: Models;
 	readonly tools?: readonly RuntimeToolDefinition<TContext>[];
 	readonly toolContext?: RuntimeToolContextSource<TContext>;
-	readonly beforeToolCall?: BeforeToolCallCallback;
-	readonly afterToolCall?: AfterToolCallCallback;
+	readonly telemetryContext?: TelemetryContext;
 	readonly entryProjectors?: Record<string, EntryProjector>;
 }
 
@@ -251,8 +250,8 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 	readonly #entryProjectors: ReadonlyMap<string, EntryProjector>;
 	readonly #toolDefinitions: ReadonlyMap<string, RuntimeToolDefinition<TContext>>;
 	readonly #toolContext: RuntimeToolContextSource<TContext> | undefined;
-	readonly #beforeToolCall: BeforeToolCallCallback | undefined;
-	readonly #afterToolCall: AfterToolCallCallback | undefined;
+	readonly #hookRegistry: ToolHookRegistry;
+	readonly hooks: ToolHooks;
 	readonly #toolBatches = new Map<string, ReadonlyMap<string, AgentTool>>();
 	readonly #preparedTools = new Map<string, PreparedToolCall>();
 	readonly #toolEffects = new Map<string, ToolEffectState>();
@@ -346,8 +345,16 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 		this.#entryProjectors = captureEntryProjectors(options.entryProjectors ?? {});
 		this.#toolDefinitions = captureToolDefinitions(options.tools ?? []);
 		this.#toolContext = options.toolContext;
-		this.#beforeToolCall = options.beforeToolCall;
-		this.#afterToolCall = options.afterToolCall;
+		this.#hookRegistry = new ToolHookRegistry(
+			() => {
+				const lifecycleError = this.#lifecycleError();
+				if (lifecycleError) throw lifecycleError;
+			},
+			options.telemetryContext ?? NOOP_TELEMETRY_CONTEXT,
+			() => {},
+		);
+		const on = Object.freeze(this.#hookRegistry.on.bind(this.#hookRegistry));
+		this.hooks = Object.freeze({ on });
 		let notifyShutdown!: () => void;
 		this.#shutdownNotice = new Promise((resolve) => {
 			notifyShutdown = resolve;
@@ -797,7 +804,26 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				const source = sourceCalls[info.sourceIndex];
 				if (!source)
 					throw this.#faultShell(undefined, undefined, "Tool source call is missing from its assistant entry");
-				const outcome = await prepareToolCall(source, [...leases.values()], this.#beforeToolCall);
+				const retainedTool = leases.get(source.name);
+				const signal = this.#current.runState?.value.control.status === "running" ? undefined : AbortSignal.abort();
+				const outcome = await prepareToolCall(
+					source,
+					[...leases.values()],
+					retainedTool
+						? (context) => {
+								if (this.#current.runState?.value.control.status !== "running")
+									return { block: { reason: "Operation aborted" } };
+								return this.#hookRegistry.invokeBefore(
+									info.operationId,
+									context.toolCall.id,
+									context.toolCall.name,
+									context.args,
+									retainedTool,
+								);
+							}
+						: undefined,
+					signal,
+				);
 				let detachedOutcome: ClearToolCallOutcome;
 				try {
 					detachedOutcome =
@@ -1058,7 +1084,20 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 						finalizing = finalizeToolCall(
 							effect.plan.prepared,
 							effect.outcome,
-							this.#afterToolCall,
+							(context) =>
+								this.#hookRegistry.invokeAfter({
+									lane: "main",
+									runId: effect.plan.operationId,
+									toolCallId: context.toolCall.id,
+									toolName: context.toolCall.name,
+									args: context.args as Record<string, JsonValue>,
+									content: context.result.content,
+									...(context.result.details === undefined
+										? {}
+										: { details: context.result.details as JsonValue }),
+									isError: context.isError,
+									...(context.result.usage === undefined ? {} : { usage: context.result.usage }),
+								}),
 							effect.controller.signal,
 						);
 						this.#toolEffects.set(effectKey, { status: "finalizing", plan: effect.plan, finalizing });

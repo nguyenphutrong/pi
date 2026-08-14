@@ -13,6 +13,7 @@ import {
 import { type InstrumentedStorage, instrumentStorage } from "@nguyenphutrong/pi-session-storage/testing";
 import { describe, expect, it, vi } from "vitest";
 import type { LaneConfiguration, RunOperation, RunState } from "../src/durable.ts";
+import type { ToolHookHandler, ToolHooks } from "../src/hooks.ts";
 import { MemorySessionRepo } from "../src/repo.ts";
 import { createRuntimeShell, type RuntimeShellOptions, type RuntimeToolDefinition } from "../src/runtime-shell.ts";
 import { StoredSession } from "../src/session.ts";
@@ -23,6 +24,31 @@ const config = (activeToolNames: string[] = []): LaneConfiguration => ({
 	model: { provider: "test", modelId: "current" },
 	thinkingLevel: "medium",
 	activeToolNames,
+});
+
+describe("D-057 RuntimeShell hook surface", () => {
+	it("exposes only a frozen registry surface and rejects registration synchronously after close", async () => {
+		const fixture = await rooted("idle");
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		expect(Object.isFrozen(shell.hooks)).toBe(true);
+		expect(Object.isFrozen(shell.hooks.on)).toBe(true);
+		expect(Object.keys(shell.hooks)).toEqual(["on"]);
+		await shell.close();
+		expect(() => shell.hooks.on("before_tool", () => undefined)).toThrow(
+			expect.objectContaining({ code: "closed", message: "Runtime shell is closed" }),
+		);
+	});
+
+	it("rejects hook registration synchronously after a storage fault seals the shell", async () => {
+		const fixture = await rooted("finish");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		storage.commit = vi.fn().mockRejectedValueOnce(new Error("registration fault"));
+		const fault = await shell.executeAction().catch((error: unknown) => error);
+		expect(fault).toMatchObject({ code: "fault" });
+		expect(() => shell.hooks.on("before_tool", () => undefined)).toThrow(fault);
+		await shell.close();
+	});
 });
 
 describe("D-050 RuntimeShell SessionTree façade", () => {
@@ -1174,13 +1200,31 @@ function toolMessage(
 
 async function settledToolBatch<TContext extends object | undefined>(
 	message: AssistantMessage,
-	options: Omit<RuntimeShellOptions<TContext>, "models">,
+	options: TestRuntimeShellOptions<TContext>,
 	activeToolNames: string[],
 ) {
 	const prepared = await preparedShell(() => message, options, activeToolNames);
 	await settlePrepared(prepared);
 	return prepared;
 }
+
+type TestRuntimeShellOptions<TContext extends object | undefined> = Omit<RuntimeShellOptions<TContext>, "models"> & {
+	readonly registerHooks?: (hooks: ToolHooks) => void;
+};
+
+const registerBefore = (handler: ToolHookHandler<"before_tool"> | undefined) => (hooks: ToolHooks) => {
+	if (handler) hooks.on("before_tool", handler);
+};
+
+const registerAfter = (handler: ToolHookHandler<"after_tool"> | undefined) => (hooks: ToolHooks) => {
+	if (handler) hooks.on("after_tool", handler);
+};
+
+const registerBoth =
+	(before: ToolHookHandler<"before_tool">, after: ToolHookHandler<"after_tool">) => (hooks: ToolHooks) => {
+		hooks.on("before_tool", before);
+		hooks.on("after_tool", after);
+	};
 
 async function settlePrepared(prepared: Awaited<ReturnType<typeof preparedShell>>) {
 	await prepared.shell.executeAction();
@@ -1191,9 +1235,10 @@ async function settlePrepared(prepared: Awaited<ReturnType<typeof preparedShell>
 
 async function preparedShell<TContext extends object | undefined = object | undefined>(
 	result: () => Promise<AssistantMessage> | AssistantMessage,
-	options: Omit<RuntimeShellOptions<TContext>, "models"> = {},
+	options: TestRuntimeShellOptions<TContext> = {},
 	activeToolNames: string[] = [],
 ) {
+	const { registerHooks, ...runtimeOptions } = options;
 	const state = new MemoryStorageState();
 	const durableOptions = { headers: { retained: "yes" }, metadata: { nested: [1] } };
 	const fixture = await rooted(
@@ -1213,8 +1258,9 @@ async function preparedShell<TContext extends object | undefined = object | unde
 	streamSimple.mockReturnValue({ result } as ReturnType<ModelRequestLease["streamSimple"]>);
 	const shell = await createRuntimeShell(runtimeSession, config(), {
 		models,
-		...options,
+		...runtimeOptions,
 	});
+	registerHooks?.(shell.hooks);
 	await shell.executeAction();
 	return {
 		state,
@@ -3910,8 +3956,8 @@ describe("Phase 1 runtime shell", () => {
 				models,
 				tools: [runtimeTool()],
 				toolContext: context,
-				beforeToolCall,
 			});
+			shell.hooks.on("before_tool", beforeToolCall);
 			const before = instrumented.committedTransactions.length;
 			await expect(shell.prompt(user("blocked"))).rejects.toMatchObject({ code: "unavailable" });
 			expect(leaseSpy).toHaveBeenCalledExactlyOnceWith("test", "current");
@@ -3945,8 +3991,8 @@ describe("Phase 1 runtime shell", () => {
 			const beforeToolCall = vi.fn();
 			const reopened = await createRuntimeShell(session(storage), config(), {
 				toolContext: context,
-				beforeToolCall,
 			});
+			reopened.hooks.on("before_tool", beforeToolCall);
 			const before = storage.committedTransactions.length;
 			await expect(reopened.executeAction()).rejects.toMatchObject({ code: "unavailable" });
 			expect(context).not.toHaveBeenCalled();
@@ -3978,7 +4024,7 @@ describe("Phase 1 runtime shell", () => {
 				});
 				const prepared = await settledToolBatch(
 					toolMessage([{ id: "call-a" }]),
-					{ tools: [source], toolContext: context, beforeToolCall },
+					{ tools: [source], toolContext: context, registerHooks: registerBefore(beforeToolCall) },
 					["echo"],
 				);
 				const commit = prepared.instrumented.commit.bind(prepared.instrumented);
@@ -4048,7 +4094,7 @@ describe("Phase 1 runtime shell", () => {
 			const execute = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
-				{ tools: [runtimeTool({ execute })], toolContext: context, beforeToolCall },
+				{ tools: [runtimeTool({ execute })], toolContext: context, registerHooks: registerBefore(beforeToolCall) },
 				["echo"],
 			);
 			const state = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!;
@@ -4095,7 +4141,7 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool()],
 					toolContext: { batch: "static" },
-					beforeToolCall: () => ({ block: { reason: "continue" } }),
+					registerHooks: registerBefore(() => ({ block: { reason: "continue" } })),
 				},
 				["echo"],
 			);
@@ -4197,7 +4243,7 @@ describe("Phase 1 runtime shell", () => {
 					{
 						tools: [runtimeTool()],
 						toolContext: { batch: "static" },
-						beforeToolCall: () => ({ block: { reason: "continue" } }),
+						registerHooks: registerBefore(() => ({ block: { reason: "continue" } })),
 					},
 					["echo"],
 				);
@@ -4243,7 +4289,7 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool({ replay: "safe", prepareArguments: () => ({ value: "prepared" }), execute })],
 					toolContext: { batch: "static" },
-					beforeToolCall: () => ({ args: { value: "effective" } }),
+					registerHooks: registerBefore(() => ({ args: { value: "effective" } })),
 				},
 				["echo"],
 			);
@@ -4316,7 +4362,7 @@ describe("Phase 1 runtime shell", () => {
 									throw cause;
 								}
 							: () => Promise.reject(cause),
-					beforeToolCall,
+					registerHooks: registerBefore(beforeToolCall),
 				},
 				["echo"],
 			);
@@ -4364,7 +4410,7 @@ describe("Phase 1 runtime shell", () => {
 				{ name: "echo", arguments: { value: "x" } },
 				runtimeTool(),
 				() => 1 as never,
-				"Invalid before tool callback output",
+				"Invalid before tool hook output",
 				false,
 			],
 			[
@@ -4399,7 +4445,7 @@ describe("Phase 1 runtime shell", () => {
 				const execute = vi.spyOn(tool, "execute");
 				const prepared = await settledToolBatch(
 					toolMessage([{ id: "reserved-call", name: call.name, arguments: call.arguments }]),
-					{ tools: [tool], toolContext: { batch: "static" }, beforeToolCall },
+					{ tools: [tool], toolContext: { batch: "static" }, registerHooks: registerBefore(beforeToolCall) },
 					["echo"],
 				);
 				const phase = (
@@ -4454,7 +4500,11 @@ describe("Phase 1 runtime shell", () => {
 			const execute = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }]),
-				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" }, beforeToolCall },
+				{
+					tools: [runtimeTool({ execute })],
+					toolContext: { batch: "static" },
+					registerHooks: registerBefore(beforeToolCall),
+				},
 				["echo"],
 			);
 			const clearance = prepared.shell.executeAction();
@@ -4504,11 +4554,11 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools,
 					toolContext: { batch: "static" },
-					beforeToolCall: async () => {
+					registerHooks: registerBefore(async () => {
 						entered();
 						await blocked;
 						return undefined;
-					},
+					}),
 				},
 				["echo"],
 			);
@@ -4537,7 +4587,7 @@ describe("Phase 1 runtime shell", () => {
 			const beforeToolCall = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }]),
-				{ tools: [runtimeTool()], toolContext: context, beforeToolCall },
+				{ tools: [runtimeTool()], toolContext: context, registerHooks: registerBefore(beforeToolCall) },
 				["echo"],
 			);
 			const before = prepared.instrumented.committedTransactions.length;
@@ -4563,11 +4613,11 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool({ execute })],
 					toolContext: { batch: "static" },
-					beforeToolCall: async () => {
+					registerHooks: registerBefore(async () => {
 						entered();
 						await blocked;
 						return undefined;
-					},
+					}),
 				},
 				["echo"],
 			);
@@ -4594,7 +4644,7 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool()],
 					toolContext: { batch: "static" },
-					beforeToolCall: () => ({ block: { reason: "done", terminate: true } }),
+					registerHooks: registerBefore(() => ({ block: { reason: "done", terminate: true } })),
 				},
 				["echo"],
 			);
@@ -4687,18 +4737,17 @@ describe("Phase 1 runtime shell", () => {
 					addedToolNames: ["added"],
 				};
 			});
-			const afterToolCall = vi.fn((input, signal) => {
+			const afterToolCall = vi.fn((input) => {
 				order.push("after");
-				expect(signal).toBeInstanceOf(AbortSignal);
 				expect(input).toEqual({
-					toolCall: { type: "toolCall", id: "call-a", name: "echo", arguments: { value: "raw" } },
+					lane: "main",
+					runId: prepared.fixture.operationId,
+					toolCallId: "call-a",
+					toolName: "echo",
 					args: { value: "effective" },
-					result: {
-						content: [{ type: "text", text: "raw" }],
-						details: { raw: true },
-						usage,
-						addedToolNames: ["added"],
-					},
+					content: [{ type: "text", text: "raw" }],
+					details: { raw: true },
+					usage,
 					isError: false,
 				});
 				return { content: [{ type: "text" as const, text: "final" }], details: { final: true } };
@@ -4708,8 +4757,7 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool({ replay: "safe", execute })],
 					toolContext: context,
-					beforeToolCall: () => ({ args: { value: "effective" } }),
-					afterToolCall,
+					registerHooks: registerBoth(() => ({ args: { value: "effective" } }), afterToolCall),
 				},
 				["echo"],
 			);
@@ -5131,12 +5179,14 @@ describe("Phase 1 runtime shell", () => {
 				}),
 				undefined,
 				"tool failed",
+				true,
 			],
 			[
 				"invalid raw",
 				runtimeTool({ execute: async () => ({ content: "bad", details: null }) as never }),
 				undefined,
 				"Invalid tool result",
+				true,
 			],
 			[
 				"after throw",
@@ -5144,15 +5194,16 @@ describe("Phase 1 runtime shell", () => {
 				() => {
 					throw new Error("after failed");
 				},
-				"after failed",
+				"call-a",
+				false,
 			],
-			["invalid after", runtimeTool(), () => 1 as never, "Invalid after tool callback output"],
+			["invalid after", runtimeTool(), () => 1 as never, "call-a", false],
 		] as const)(
 			"settles expected %s normalization in-band without fault",
-			async (_label, tool, afterToolCall, text) => {
+			async (_label, tool, afterToolCall, text, isError) => {
 				const prepared = await settledToolBatch(
 					toolMessage([{ id: "call-a" }]),
-					{ tools: [tool], toolContext: { batch: "static" }, afterToolCall },
+					{ tools: [tool], toolContext: { batch: "static" }, registerHooks: registerAfter(afterToolCall) },
 					["echo"],
 				);
 				await prepared.shell.executeAction();
@@ -5163,7 +5214,7 @@ describe("Phase 1 runtime shell", () => {
 				const result = (await prepared.fixture.storage.getEntries([state.phase.triggerEntryId])).get(
 					state.phase.triggerEntryId,
 				);
-				expect(result?.payload).toMatchObject({ isError: true });
+				expect(result?.payload).toMatchObject({ isError });
 				expect((result?.payload as { content: Array<{ text: string }> }).content[0].text).toContain(text);
 				expect(await prepared.shell.peekAction()).toMatchObject({ kind: "start_assistant_step" });
 				await prepared.shell.close();
@@ -5195,7 +5246,11 @@ describe("Phase 1 runtime shell", () => {
 			const afterToolCall = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }]),
-				{ tools: [runtimeTool({ replay: "safe" })], toolContext: { batch: "static" }, afterToolCall },
+				{
+					tools: [runtimeTool({ replay: "safe" })],
+					toolContext: { batch: "static" },
+					registerHooks: registerAfter(afterToolCall),
+				},
 				["echo"],
 			);
 			await prepared.shell.executeAction();
@@ -5382,7 +5437,7 @@ describe("Phase 1 runtime shell", () => {
 				{
 					tools: [runtimeTool({ replay, prepareArguments })],
 					toolContext: { batch: "initial" },
-					beforeToolCall,
+					registerHooks: registerBefore(beforeToolCall),
 				},
 				["echo"],
 			);
@@ -5416,9 +5471,9 @@ describe("Phase 1 runtime shell", () => {
 			const shell = await createRuntimeShell(session(storage), config(), {
 				tools: [runtimeTool({ replay: "safe", prepareArguments: pending.prepareArguments, execute })],
 				toolContext: context,
-				beforeToolCall: pending.beforeToolCall,
-				afterToolCall,
 			});
+			shell.hooks.on("before_tool", pending.beforeToolCall);
+			shell.hooks.on("after_tool", afterToolCall);
 			const durable = (await storage.getRegister("op.state", pending.fixture.operationId))!
 				.value as unknown as RunState;
 			if (durable.phase.kind !== "tools") throw new Error("tool batch missing");
@@ -6601,7 +6656,11 @@ describe("Phase 1 runtime shell", () => {
 			const afterToolCall = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
-				{ tools: [runtimeTool({ execute })], toolContext: context, beforeToolCall, afterToolCall },
+				{
+					tools: [runtimeTool({ execute })],
+					toolContext: context,
+					registerHooks: registerBoth(beforeToolCall, afterToolCall),
+				},
 				["echo"],
 			);
 			const durable = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
@@ -6685,12 +6744,81 @@ describe("Phase 1 runtime shell", () => {
 			await reopened.close();
 		});
 
+		it("uses a pre-aborted prepare signal when cancellation commits while tool context is delayed", async () => {
+			let releaseContext!: () => void;
+			let contextEntered!: () => void;
+			const release = new Promise<void>((resolve) => {
+				releaseContext = resolve;
+			});
+			const entered = new Promise<void>((resolve) => {
+				contextEntered = resolve;
+			});
+			const beforeToolCall = vi.fn();
+			const execute = vi.fn();
+			const prepared = await settledToolBatch(
+				toolMessage([{ id: "call-a" }]),
+				{
+					tools: [runtimeTool({ execute })],
+					toolContext: async () => {
+						contextEntered();
+						await release;
+						return { batch: "delayed" };
+					},
+					registerHooks: registerBefore(beforeToolCall),
+				},
+				["echo"],
+			);
+			const planned = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
+				.value as unknown as RunState;
+			if (planned.phase.kind !== "tools") throw new Error("tool batch missing");
+			const reservedId = planned.phase.batch.calls[0].resultEntryId;
+			const before = prepared.instrumented.committedTransactions.length;
+			const preparation = prepared.shell.executeAction();
+			await entered;
+			await prepared.shell.abort();
+			releaseContext();
+			await expect(preparation).rejects.toMatchObject({ code: "stale" });
+			expect(beforeToolCall).not.toHaveBeenCalled();
+			expect(execute).not.toHaveBeenCalled();
+			const writes = prepared.instrumented.committedTransactions.slice(before).flatMap(({ writes }) => writes);
+			expect(
+				writes.filter(
+					(write) =>
+						write.kind === "register" &&
+						(write.namespace === "op.tool_args" || write.namespace === "op.preparation"),
+				),
+			).toEqual([]);
+			expect((await prepared.fixture.storage.getEntries([reservedId])).get(reservedId)).toBeUndefined();
+			expect(await prepared.shell.peekAction()).toMatchObject({
+				kind: "cancel_planned_tool",
+				sourceIndex: 0,
+				resultEntryId: reservedId,
+			});
+			await prepared.shell.executeAction();
+			expect((await prepared.fixture.storage.getEntries([reservedId])).get(reservedId)).toMatchObject({
+				id: reservedId,
+				payload: {
+					role: "toolResult",
+					toolCallId: "call-a",
+					toolName: "echo",
+					content: [{ type: "text", text: "Operation aborted" }],
+					details: {},
+					isError: true,
+				},
+			});
+			await prepared.shell.close();
+		});
+
 		it("cancels a prepared tool before dispatch without executing either hook", async () => {
 			const execute = vi.fn();
 			const afterToolCall = vi.fn();
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
-				{ tools: [runtimeTool({ execute })], toolContext: { batch: "static" }, afterToolCall },
+				{
+					tools: [runtimeTool({ execute })],
+					toolContext: { batch: "static" },
+					registerHooks: registerAfter(afterToolCall),
+				},
 				["echo"],
 			);
 			await prepared.shell.executeAction();
@@ -6737,7 +6865,7 @@ describe("Phase 1 runtime shell", () => {
 						}),
 					],
 					toolContext: { batch: "static" },
-					afterToolCall,
+					registerHooks: registerAfter(afterToolCall),
 				},
 				["echo"],
 			);
@@ -6775,7 +6903,7 @@ describe("Phase 1 runtime shell", () => {
 			}));
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }, { id: "call-b" }]),
-				{ tools: [runtimeTool()], toolContext: { batch: "static" }, afterToolCall },
+				{ tools: [runtimeTool()], toolContext: { batch: "static" }, registerHooks: registerAfter(afterToolCall) },
 				["echo"],
 			);
 			for (const kind of [
@@ -6815,12 +6943,7 @@ describe("Phase 1 runtime shell", () => {
 			const blocked = new Promise<void>((resolve) => {
 				releaseAfter = resolve;
 			});
-			let callbackSignal!: AbortSignal;
-			let abortEvents = 0;
-			const afterToolCall = vi.fn(async (_input, signal) => {
-				callbackSignal = signal!;
-				expect(callbackSignal.aborted).toBe(false);
-				callbackSignal.addEventListener("abort", () => abortEvents++);
+			const afterToolCall = vi.fn(async () => {
 				enteredAfter();
 				await blocked;
 				return {
@@ -6832,7 +6955,7 @@ describe("Phase 1 runtime shell", () => {
 			});
 			const prepared = await settledToolBatch(
 				toolMessage([{ id: "call-a" }]),
-				{ tools: [runtimeTool()], toolContext: { batch: "static" }, afterToolCall },
+				{ tools: [runtimeTool()], toolContext: { batch: "static" }, registerHooks: registerAfter(afterToolCall) },
 				["echo"],
 			);
 			const planned = (await prepared.fixture.storage.getRegister("op.state", prepared.fixture.operationId))!
@@ -6847,8 +6970,6 @@ describe("Phase 1 runtime shell", () => {
 			await entered;
 			const cancellation = await prepared.shell.abort();
 			expect(cancellation.operationId).toBe(prepared.fixture.operationId);
-			expect(callbackSignal.aborted).toBe(false);
-			expect(abortEvents).toBe(0);
 			releaseAfter();
 			await expect(finalization).resolves.toMatchObject({ kind: "finalize_tool_effect" });
 			expect(await prepared.shell.peekAction()).toMatchObject({ kind: "settle_tool_effect" });
@@ -7041,10 +7162,11 @@ describe("Phase 1 runtime shell", () => {
 				terminate: true,
 			}));
 			const beforeToolCall = vi.fn();
-			const afterToolCall = vi.fn((input) => ({
-				...input.result,
+			const afterToolCall = vi.fn((input: Parameters<ToolHookHandler<"after_tool">>[0]) => ({
 				content: [{ type: "text" as const, text: "transformed" }],
 				details: { transformed: true },
+				isError: input.isError,
+				usage: input.usage,
 				terminate: true,
 			}));
 			let state: MemoryStorageState;
@@ -7089,8 +7211,7 @@ describe("Phase 1 runtime shell", () => {
 					{
 						tools: [runtimeTool({ execute, replay: "safe" })],
 						toolContext: { batch: "static" },
-						beforeToolCall,
-						afterToolCall,
+						registerHooks: registerBoth(beforeToolCall, afterToolCall),
 					},
 					["echo"],
 				);
@@ -7125,9 +7246,9 @@ describe("Phase 1 runtime shell", () => {
 					active = await createRuntimeShell(session(restoredStorage), config(["echo"]), {
 						tools: [runtimeTool({ execute, replay: "safe" })],
 						toolContext: { batch: "restored" },
-						beforeToolCall,
-						afterToolCall,
 					});
+					active.hooks.on("before_tool", beforeToolCall);
+					active.hooks.on("after_tool", afterToolCall);
 					expect(await active.peekAction()).toMatchObject({
 						kind: "recover_tool_effect",
 						sourceIndex: 0,
@@ -7178,9 +7299,9 @@ describe("Phase 1 runtime shell", () => {
 				models,
 				tools: [runtimeTool({ execute, replay: "safe" })],
 				toolContext: { batch: "reopened" },
-				beforeToolCall,
-				afterToolCall,
 			});
+			reopened.hooks.on("before_tool", beforeToolCall);
+			reopened.hooks.on("after_tool", afterToolCall);
 			for (const action of expectedActions) {
 				expect(await reopened.peekAction()).toMatchObject(action);
 				await reopened.executeAction();

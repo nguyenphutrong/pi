@@ -5,6 +5,7 @@
 		"rootDir": "./src",
 		"paths": {
 			"@earendil-works/pi-ai": ["../ai/dist/index.d.ts"],
+			"@earendil-works/pi-telemetry": ["../telemetry/dist/index.d.ts"],
 			"@nguyenphutrong/pi-agent-loop": ["../agent-loop/dist/index.d.ts"],
 			"@nguyenphutrong/pi-session-sqlite": ["../session-backends/sqlite-node/dist/index.d.ts"],
 			"@nguyenphutrong/pi-session-storage": ["../session-storage/dist/index.d.ts"]
