@@ -1,6 +1,8 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { InMemoryTelemetryContext, type TelemetryContext, type TelemetrySpan } from "@earendil-works/pi-telemetry";
 import { describe, expect, it, vi } from "vitest";
-import { type HarnessEvent, RuntimeEventRegistry } from "../src/events.ts";
+import { type HarnessEvent, type RunEndEvent, RuntimeEventRegistry } from "../src/events.ts";
+import { ZERO_USAGE } from "./fixtures.ts";
 
 const flush = async (): Promise<void> => {
 	await new Promise<void>((resolve) => setTimeout(resolve, 0));
@@ -12,7 +14,121 @@ function registry(telemetryContext: TelemetryContext = new InMemoryTelemetryCont
 
 const runStart = (runId = "run"): HarnessEvent => ({ type: "run_start", lane: "main", runId });
 
+const assistant = (
+	stopReason: AssistantMessage["stopReason"],
+	content: AssistantMessage["content"] = [],
+): AssistantMessage => ({
+	role: "assistant",
+	content,
+	api: "harness",
+	provider: "test",
+	model: "test",
+	usage: ZERO_USAGE,
+	stopReason,
+	timestamp: 1,
+});
+
+const runEndShapes = [
+	{ type: "run_end", lane: "main", runId: "completed-empty", leafId: null, outcome: "completed" },
+	{
+		type: "run_end",
+		lane: "main",
+		runId: "completed-paired",
+		leafId: "leaf",
+		outcome: "completed",
+		finalEntryId: "assistant",
+		finalMessage: assistant("stop"),
+	},
+	{ type: "run_end", lane: "main", runId: "aborted-empty", leafId: "leaf", outcome: "aborted" },
+	{
+		type: "run_end",
+		lane: "main",
+		runId: "aborted-paired",
+		leafId: "leaf",
+		outcome: "aborted",
+		finalEntryId: "assistant",
+		finalMessage: assistant("aborted"),
+	},
+	{
+		type: "run_end",
+		lane: "main",
+		runId: "failed-empty",
+		leafId: "leaf",
+		outcome: "failed",
+		error: { code: "failed", message: "failure" },
+	},
+	{
+		type: "run_end",
+		lane: "main",
+		runId: "failed-paired-details-recovery",
+		leafId: "leaf",
+		outcome: "failed",
+		error: { code: "failed", message: "failure", details: { nested: { value: "original" } } },
+		finalEntryId: "assistant",
+		finalMessage: assistant("error", [{ type: "text", text: "original" }]),
+		recovery: true,
+	},
+] satisfies RunEndEvent[];
+
 describe("D-058 runtime event registry", () => {
+	it("accepts every public run_end outcome shape and deeply detaches and freezes nested payloads", () => {
+		const events = registry();
+		const seen: RunEndEvent[] = [];
+		events.on("run_end", (event) => {
+			seen.push(event);
+		});
+		for (const shape of runEndShapes) events.publish(shape);
+		expect(seen).toHaveLength(runEndShapes.length);
+		for (const event of seen) {
+			expect(Object.isFrozen(event)).toBe(true);
+			expect("finalEntryId" in event).toBe("finalMessage" in event);
+		}
+		const source = runEndShapes.at(-1)!;
+		const published = seen.at(-1)!;
+		expect(published).toEqual(source);
+		expect(published).not.toBe(source);
+		if (published.outcome !== "failed" || source.outcome !== "failed") throw new Error("failed shape missing");
+		expect(Object.isFrozen(published.error)).toBe(true);
+		expect(Object.isFrozen(published.error.details)).toBe(true);
+		expect(published.error.details).not.toBe(source.error.details);
+		(source.error.details as { nested: { value: string } }).nested.value = "mutated";
+		expect(published.error.details).toEqual({ nested: { value: "original" } });
+		if (published.finalMessage === undefined || source.finalMessage === undefined)
+			throw new Error("paired shape missing");
+		expect(Object.isFrozen(published.finalMessage)).toBe(true);
+		expect(Object.isFrozen(published.finalMessage.content)).toBe(true);
+		expect(published.finalMessage).not.toBe(source.finalMessage);
+	});
+
+	it.each(["throw", "reject"] as const)(
+		"keeps run_end listener %s nonblocking, starts the next listener, and reports once",
+		async (kind) => {
+			const events = registry();
+			const errors: HarnessEvent[] = [];
+			const later = vi.fn();
+			events.on("handler_error", (event) => {
+				errors.push(event);
+			});
+			events.on("run_end", () => {
+				if (kind === "throw") throw new Error("run_end failed");
+				return Promise.reject(new Error("run_end failed"));
+			});
+			events.on("run_end", later);
+			events.publish(runEndShapes[0]);
+			expect(later).toHaveBeenCalledTimes(1);
+			await flush();
+			expect(errors).toEqual([
+				{
+					type: "handler_error",
+					kind: "event",
+					event: "run_end",
+					lane: "main",
+					error: "run_end failed",
+					stack: expect.any(String),
+				},
+			]);
+		},
+	);
 	it("validates synchronously and makes duplicate registrations and unsubscribe independent", async () => {
 		const events = registry();
 		expect(() => events.on("future" as never, () => undefined)).toThrow(TypeError);

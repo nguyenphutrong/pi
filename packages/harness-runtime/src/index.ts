@@ -5,6 +5,7 @@ export type {
 	HarnessEvent,
 	HarnessEventType,
 	HookHandlerErrorEvent,
+	RunEndEvent,
 	RunStartEvent,
 	RuntimeEvents,
 } from "./events.ts";

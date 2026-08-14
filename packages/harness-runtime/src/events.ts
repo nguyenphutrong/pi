@@ -1,10 +1,31 @@
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import type { TelemetryContext } from "@earendil-works/pi-telemetry";
+import type { JsonValue } from "@nguyenphutrong/pi-session-storage";
 
 export interface RunStartEvent {
 	readonly type: "run_start";
 	readonly lane: "main";
 	readonly runId: string;
 }
+
+type OptionalFinalAssistant =
+	| { readonly finalEntryId: string; readonly finalMessage: AssistantMessage }
+	| { readonly finalEntryId?: never; readonly finalMessage?: never };
+
+export type RunEndEvent = {
+	readonly type: "run_end";
+	readonly lane: "main";
+	readonly runId: string;
+	readonly leafId: string | null;
+	readonly recovery?: true;
+} & (
+	| ({ readonly outcome: "completed" } & OptionalFinalAssistant)
+	| ({ readonly outcome: "aborted" } & OptionalFinalAssistant)
+	| ({
+			readonly outcome: "failed";
+			readonly error: { readonly code: string; readonly message: string; readonly details?: JsonValue };
+	  } & OptionalFinalAssistant)
+);
 
 export interface HookHandlerErrorEvent {
 	readonly type: "handler_error";
@@ -25,7 +46,7 @@ export interface EventHandlerErrorEvent {
 }
 
 export type HandlerErrorEvent = HookHandlerErrorEvent | EventHandlerErrorEvent;
-export type HarnessEvent = RunStartEvent | HandlerErrorEvent;
+export type HarnessEvent = RunStartEvent | RunEndEvent | HandlerErrorEvent;
 export type HarnessEventType = HarnessEvent["type"];
 export type EventListener<Event extends HarnessEvent = HarnessEvent> = (event: Event) => void | Promise<void>;
 
@@ -96,7 +117,8 @@ export class RuntimeEventRegistry implements RuntimeEvents {
 		listener: EventListener<Extract<HarnessEvent, { type: Type }>>,
 	): () => void {
 		this.#assertRegistrationOpen();
-		if (type !== "run_start" && type !== "handler_error") throw new TypeError("Unsupported runtime event name");
+		if (type !== "run_start" && type !== "run_end" && type !== "handler_error")
+			throw new TypeError("Unsupported runtime event name");
 		if (typeof listener !== "function") throw new TypeError("Runtime event listener must be a function");
 		const registration: EventRegistration = {
 			type,

@@ -735,22 +735,22 @@ export type RecoveryTransitionResult = {
 	readonly attachment: RuntimeAttachment;
 };
 
+type OptionalFinalAssistant =
+	| { readonly finalEntryId: string; readonly finalMessage: AssistantMessage }
+	| { readonly finalEntryId?: never; readonly finalMessage?: never };
+
 export type FinishedRunResult = {
 	readonly operationId: string;
 	readonly kind: "completed";
 	readonly leafId: string;
-} & (
-	| { readonly finalEntryId: string; readonly finalMessage: AssistantMessage }
-	| { readonly finalEntryId?: never; readonly finalMessage?: never }
-);
+} & OptionalFinalAssistant;
 
-export interface FailedRunResult {
+export type FailedRunResult = {
 	readonly operationId: string;
 	readonly kind: "failed";
 	readonly leafId: string;
-	readonly finalEntryId: string;
-	readonly error: { readonly code: string; readonly message: string };
-}
+	readonly error: { readonly code: string; readonly message: string; readonly details?: JsonValue };
+} & OptionalFinalAssistant;
 
 export type FinishRunResult =
 	| {
@@ -760,13 +760,11 @@ export type FinishRunResult =
 	  }
 	| { readonly status: "obsolete"; readonly attachment: RuntimeAttachment; readonly result?: undefined };
 
-export interface AbortedRunResult {
+export type AbortedRunResult = {
 	readonly operationId: string;
 	readonly kind: "aborted";
 	readonly leafId: string;
-	readonly finalEntryId?: string;
-	readonly finalMessage?: AssistantMessage;
-}
+} & OptionalFinalAssistant;
 
 export type AbortRequestResult =
 	| {
@@ -3024,14 +3022,21 @@ export class StoredSession implements Session {
 						? {}
 						: { finalAssistantEntryId: runState.value.latestAssistantEntryId }),
 				});
-				result = Object.freeze({
-					operationId: transition.operationId,
-					kind: "aborted",
-					leafId: mainLeaf.value,
-					...(latestEntry?.type === "message" && latestEntry.message.role === "assistant"
-						? { finalEntryId: latestEntry.id, finalMessage: structuredClone(latestEntry.message) }
-						: {}),
-				});
+				result = Object.freeze(
+					latestEntry?.type === "message" && latestEntry.message.role === "assistant"
+						? {
+								operationId: transition.operationId,
+								kind: "aborted" as const,
+								leafId: mainLeaf.value,
+								finalEntryId: latestEntry.id,
+								finalMessage: structuredClone(latestEntry.message),
+							}
+						: {
+								operationId: transition.operationId,
+								kind: "aborted" as const,
+								leafId: mainLeaf.value,
+							},
+				);
 			} else if (phase.kind === "failure_drain") {
 				durableResult = encodeLaneLastResult({
 					operationId: transition.operationId,
@@ -3046,6 +3051,9 @@ export class StoredSession implements Session {
 					kind: "failed",
 					leafId: mainLeaf.value,
 					finalEntryId: runState.value.latestAssistantEntryId!,
+					finalMessage: structuredClone(
+						requireStoredMessage(latestEntry, "Final assistant").message,
+					) as AssistantMessage,
 					error: structuredClone(phase.error),
 				});
 			} else {

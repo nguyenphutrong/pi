@@ -290,6 +290,185 @@ describe("D-058 RuntimeShell event surface", () => {
 	});
 });
 
+describe("D-059 RuntimeShell run_end", () => {
+	it("publishes the exact completed pair after terminal attachment and before action resolution without changing writes", async () => {
+		const fixture = await rooted("finish");
+		const storage = instrumentStorage(fixture.storage);
+		const shell = await createRuntimeShell(session(storage), config());
+		const persisted = (await storage.getEntries([fixture.response])).get(fixture.response)!;
+		let resolved = false;
+		let listenerObservation!: Promise<unknown>;
+		const seen: unknown[] = [];
+		shell.events.on("run_end", (event) => {
+			seen.push(event);
+			expect(resolved).toBe(false);
+			expect(storage.committedTransactions).toHaveLength(1);
+			expect(event).not.toHaveProperty("recovery");
+			expect(event).not.toHaveProperty("error");
+			listenerObservation = shell.peekAction();
+		});
+		const action = shell.executeAction().then((value) => {
+			resolved = true;
+			return value;
+		});
+		await expect(action).resolves.toMatchObject({ kind: "finish_run" });
+		await expect(listenerObservation).resolves.toBeUndefined();
+		expect(seen).toEqual([
+			{
+				type: "run_end",
+				lane: "main",
+				runId: fixture.operationId,
+				leafId: fixture.response,
+				outcome: "completed",
+				finalEntryId: fixture.response,
+				finalMessage: persisted.payload,
+			},
+		]);
+		expect(storage.committedTransactions[0].writes).toEqual([
+			{ kind: "register", op: "delete", namespace: "op.meta", key: fixture.operationId },
+			{ kind: "register", op: "delete", namespace: "op.state", key: fixture.operationId },
+			expect.objectContaining({ kind: "register", op: "set", namespace: "lane.lastResult", key: "main" }),
+			{
+				kind: "register",
+				op: "set",
+				namespace: "lane.state",
+				key: "main",
+				value: { currentOperationId: null, pendingNextRun: [] },
+			},
+		]);
+		await shell.close();
+	});
+
+	it.each([
+		["aborted before assistant", "need", false],
+		["aborted after settled assistant", "finish", true],
+	] as const)("publishes %s with the final pair present exactly when settled", async (_label, position, paired) => {
+		const fixture = await rooted(position);
+		const current = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const value = structuredClone(current.value) as unknown as RunState;
+		value.control = { status: "cancel_requested", requestedAt: 1, drainedSteer: [], drainedFollowUp: [] };
+		await fixture.storage.commit({
+			writes: [{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: json(value) }],
+		});
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		const seen = vi.fn();
+		shell.events.on("run_end", seen);
+		await shell.executeAction();
+		const event = seen.mock.calls[0][0];
+		expect(event).toMatchObject({
+			type: "run_end",
+			lane: "main",
+			runId: fixture.operationId,
+			leafId: paired ? fixture.response : fixture.prompt,
+			outcome: "aborted",
+		});
+		expect("finalEntryId" in event).toBe(paired);
+		expect("finalMessage" in event).toBe(paired);
+		expect(event).not.toHaveProperty("recovery");
+		await shell.close();
+	});
+
+	it("publishes a reachable failed pair with detached error and final message", async () => {
+		const failure = { code: "provider_interrupted", message: "Provider outcome unknown after interruption" };
+		const fixture = await rooted(
+			"finish",
+			new MemoryStorage(),
+			{},
+			json({
+				role: "assistant",
+				content: [],
+				api: "harness",
+				provider: "test",
+				model: "current",
+				usage: ZERO_USAGE,
+				stopReason: "error",
+				errorMessage: failure.message,
+				timestamp: 1,
+			}),
+		);
+		const current = (await fixture.storage.getRegister("op.state", fixture.operationId))!;
+		const value = structuredClone(current.value) as unknown as RunState;
+		value.phase = {
+			kind: "failure_drain",
+			error: failure,
+			provenance: { kind: "response", entryId: fixture.response },
+		};
+		await fixture.storage.commit({
+			writes: [{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: json(value) }],
+		});
+		const shell = await createRuntimeShell(session(fixture.storage), config());
+		const seen = vi.fn();
+		shell.events.on("run_end", seen);
+		await shell.executeAction();
+		expect(seen).toHaveBeenCalledTimes(1);
+		expect(seen.mock.calls[0][0]).toMatchObject({
+			type: "run_end",
+			runId: fixture.operationId,
+			outcome: "failed",
+			error: failure,
+			finalEntryId: fixture.response,
+			finalMessage: { role: "assistant", stopReason: "error" },
+		});
+		expect(seen.mock.calls[0][0].finalMessage).not.toBe(
+			(await fixture.storage.getEntries([fixture.response])).get(fixture.response)?.payload,
+		);
+		await shell.close();
+	});
+
+	it("does not replay idle history and emits one ordinary event when an open boundary is reopened and finished", async () => {
+		const idleState = new MemoryStorageState();
+		const idleFixture = await rooted("finish", idleState.createStorage());
+		const first = await createRuntimeShell(session(idleFixture.storage), config());
+		await first.executeAction();
+		await first.close();
+		const idle = await createRuntimeShell(session(idleState.createStorage()), config());
+		const idleEvents = vi.fn();
+		idle.events.on("run_end", idleEvents);
+		expect(await idle.peekAction()).toBeUndefined();
+		expect(idleEvents).not.toHaveBeenCalled();
+		await idle.close();
+
+		const openState = new MemoryStorageState();
+		const openFixture = await rooted("finish", openState.createStorage());
+		const opener = await createRuntimeShell(session(openFixture.storage), config());
+		await opener.close();
+		const reopened = await createRuntimeShell(session(openState.createStorage()), config());
+		const events = vi.fn();
+		reopened.events.on("run_end", events);
+		await reopened.executeAction();
+		expect(events).toHaveBeenCalledTimes(1);
+		expect(events.mock.calls[0][0]).not.toHaveProperty("recovery");
+		await reopened.close();
+	});
+
+	it("emits nothing for obsolete authority, terminal commit failure, or close-first execution", async () => {
+		for (const mode of ["obsolete", "commit", "close"] as const) {
+			const fixture = await rooted("finish");
+			const storage = instrumentStorage(fixture.storage);
+			const shell = await createRuntimeShell(session(storage), config());
+			const events = vi.fn();
+			shell.events.on("run_end", events);
+			if (mode === "obsolete") {
+				const state = (await storage.getRegister("op.state", fixture.operationId))!;
+				await fixture.storage.commit({
+					writes: [
+						{ kind: "register", op: "set", namespace: "op.state", key: fixture.operationId, value: state.value },
+					],
+				});
+				await expect(shell.executeAction()).rejects.toMatchObject({ code: "stale" });
+			} else if (mode === "commit") {
+				storage.commit = vi.fn().mockRejectedValueOnce(new Error("terminal failure"));
+				await expect(shell.executeAction()).rejects.toMatchObject({ code: "fault" });
+			} else {
+				await shell.close();
+				await expect(shell.executeAction()).rejects.toMatchObject({ code: "closed" });
+			}
+			expect(events).not.toHaveBeenCalled();
+			await shell.close();
+		}
+	});
+});
+
 describe("D-050 RuntimeShell SessionTree façade", () => {
 	it("is frozen and exposes exactly the SessionTree surface", async () => {
 		const fixture = await rooted("idle");
@@ -4922,12 +5101,21 @@ describe("Phase 1 runtime shell", () => {
 
 			const storage = instrumentStorage(prepared.state.createStorage());
 			const reopened = await createRuntimeShell(session(storage), config());
+			const runEnds = vi.fn();
+			reopened.events.on("run_end", runEnds);
 			expect(await reopened.peekAction()).toMatchObject({
 				kind: "finish_run",
 				triggerEntryId: calls[1].resultEntryId,
 			});
 			const action = await reopened.executeAction();
 			expect(action).toMatchObject({ kind: "finish_run" });
+			expect(runEnds).toHaveBeenCalledExactlyOnceWith({
+				type: "run_end",
+				lane: "main",
+				runId: prepared.fixture.operationId,
+				leafId: calls[1].resultEntryId,
+				outcome: "completed",
+			});
 			expect(storage.committedTransactions.at(-1)!.writes).toEqual([
 				{ kind: "register", op: "delete", namespace: "op.meta", key: prepared.fixture.operationId },
 				{ kind: "register", op: "delete", namespace: "op.state", key: prepared.fixture.operationId },
@@ -6718,6 +6906,8 @@ describe("Phase 1 runtime shell", () => {
 		const fixture = await rooted("finish");
 		const instrumented = instrumentStorage(fixture.storage);
 		const shell = await createRuntimeShell(session(instrumented), config());
+		const runEnds = vi.fn();
+		shell.events.on("run_end", runEnds);
 		const commit = instrumented.commit.bind(instrumented);
 		let release!: () => void;
 		let entered!: () => void;
@@ -6740,6 +6930,15 @@ describe("Phase 1 runtime shell", () => {
 		await expect(finish).resolves.toMatchObject({ kind: "finish_run" });
 		await close;
 		expect(instrumented.committedTransactions).toHaveLength(1);
+		expect(runEnds).toHaveBeenCalledExactlyOnceWith({
+			type: "run_end",
+			lane: "main",
+			runId: fixture.operationId,
+			leafId: fixture.response,
+			outcome: "completed",
+			finalEntryId: fixture.response,
+			finalMessage: expect.objectContaining({ role: "assistant" }),
+		});
 	});
 
 	it("preserves a production next-run committed after finish authority was captured", async () => {

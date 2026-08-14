@@ -1338,6 +1338,33 @@ export class RuntimeShell<TContext extends object | undefined = object | undefin
 				this.#publish(result.attachment);
 				if (result.status === "obsolete")
 					throw new RuntimeShellError("stale", "Run finish is no longer authoritative");
+				const finished = result.result;
+				const common = {
+					type: "run_end" as const,
+					lane: "main" as const,
+					runId: finished.operationId,
+					leafId: finished.leafId,
+				};
+				const finalAssistant =
+					finished.finalEntryId === undefined
+						? {}
+						: { finalEntryId: finished.finalEntryId, finalMessage: finished.finalMessage };
+				switch (finished.kind) {
+					case "completed":
+						this.#eventRegistry.publish({ ...common, outcome: "completed", ...finalAssistant });
+						break;
+					case "failed":
+						this.#eventRegistry.publish({
+							...common,
+							outcome: "failed",
+							error: finished.error,
+							...finalAssistant,
+						});
+						break;
+					case "aborted":
+						this.#eventRegistry.publish({ ...common, outcome: "aborted", ...finalAssistant });
+						break;
+				}
 				return action.info;
 			}
 			if (action.info.kind !== "start_assistant_step" && action.info.kind !== "prepare_assistant_effect")
